@@ -1,6 +1,9 @@
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from uuid import uuid4
 
+import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
@@ -8,10 +11,35 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from douyin_downloader.domain import AppError
+from douyin_downloader.f2_adapter import F2VideoParser
+from douyin_downloader.parse_service import ParseService
 from douyin_downloader.session import COOKIE_NAME, SessionManager
+from douyin_downloader.store import ParseStore
+from douyin_downloader.url_resolver import ShareResolver
 from douyin_downloader.web.routes import AppServices, build_router
 
 STATIC_DIR = Path(__file__).with_name("static")
+
+
+@asynccontextmanager
+async def _application_lifespan(app: FastAPI) -> AsyncIterator[None]:
+    if app.state.services is not None:
+        yield
+        return
+
+    client = httpx.AsyncClient(timeout=20)
+    app.state.http_client = client
+    app.state.services = AppServices(
+        parse_service=ParseService(
+            ShareResolver(client),
+            F2VideoParser(),
+            ParseStore(),
+        )
+    )
+    try:
+        yield
+    finally:
+        await client.aclose()
 
 
 def create_app(
@@ -21,6 +49,7 @@ def create_app(
     testing: bool = False,
 ) -> FastAPI:
     app = FastAPI(title="抖音视频下载", docs_url=None, redoc_url=None)
+    app.router.lifespan_context = _application_lifespan
     sessions = session_manager if isinstance(session_manager, SessionManager) else SessionManager()
     app.state.services = services
     app.state.session_manager = sessions
