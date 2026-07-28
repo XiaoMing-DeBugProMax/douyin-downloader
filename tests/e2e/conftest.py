@@ -13,7 +13,7 @@ from playwright.sync_api import Page, sync_playwright
 
 from douyin_downloader.domain import AppError, ParsedVideo, ResolvedShare
 from douyin_downloader.parse_service import ParseService
-from douyin_downloader.session import SessionManager
+from douyin_downloader.session import COOKIE_NAME, SessionManager
 from douyin_downloader.store import ParseStore
 from douyin_downloader.web.app import create_app
 from douyin_downloader.web.routes import AppServices
@@ -22,11 +22,6 @@ PNG_BYTES = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
     "YAAAAAYAAjCB0C8AAAAASUVORK5CYII="
 )
-
-
-class RedactedLaunchURL(str):
-    def __repr__(self) -> str:
-        return "'<local-app-launch-url>'"
 
 
 class DeterministicResolver:
@@ -118,23 +113,39 @@ def _local_app_server() -> Iterator[tuple[str, SessionManager]]:
     assert not thread.is_alive(), "local E2E server did not stop"
 
 
-@pytest.fixture
+@pytest.fixture(scope="session")
 def local_app_url(_local_app_server: tuple[str, SessionManager]) -> str:
-    base_url, sessions = _local_app_server
-    launch_token = sessions.issue_launch_token()
-    return RedactedLaunchURL(f"{base_url}/?launch_token={launch_token}")
+    base_url, _ = _local_app_server
+    return f"{base_url}/"
 
 
 @pytest.fixture
-def page() -> Iterator[Page]:
+def page(_local_app_server: tuple[str, SessionManager]) -> Iterator[Page]:
+    base_url, sessions = _local_app_server
     with sync_playwright() as playwright:
         if Path(playwright.chromium.executable_path).is_file():
             browser = playwright.chromium.launch()
         else:
             browser = playwright.chromium.launch(channel="msedge")
+        context = None
         try:
-            page = browser.new_page(accept_downloads=True)
+            context = browser.new_context(accept_downloads=True)
+            context.add_cookies(
+                [
+                    {
+                        "name": COOKIE_NAME,
+                        "value": sessions.cookie_token,
+                        "url": f"{base_url}/",
+                        "httpOnly": True,
+                        "sameSite": "Strict",
+                        "secure": False,
+                    }
+                ]
+            )
+            page = context.new_page()
             page.set_default_timeout(5_000)
             yield page
         finally:
+            if context is not None:
+                context.close()
             browser.close()

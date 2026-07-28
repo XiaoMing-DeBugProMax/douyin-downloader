@@ -1,5 +1,8 @@
 from pathlib import Path
+from urllib.parse import urlsplit
 
+import pytest
+from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Page, expect
 
 UNKNOWN_ERROR = "解析服务暂时不可用，请稍后重试。"
@@ -51,6 +54,24 @@ def parse_video(page: Page, local_app_url: str) -> None:
     page.locator("#share-text").fill("https://v.douyin.com/example/")
     page.locator("#parse-button").click()
     page.locator("#result").wait_for(state="visible")
+
+
+def test_navigation_failures_never_expose_launch_tokens(page: Page, local_app_url: str) -> None:
+    sentinel = "SENTINEL-LAUNCH-TOKEN-MUST-NOT-LEAK"
+    parsed = urlsplit(local_app_url)
+    navigation_url = local_app_url
+    if parsed.query:
+        navigation_url = f"{parsed.scheme}://{parsed.netloc}/?launch_token={sentinel}"
+
+    requested_urls: list[str] = []
+    page.on("request", lambda request: requested_urls.append(request.url))
+    page.route(navigation_url, lambda route: route.abort("failed"))
+    with pytest.raises(PlaywrightError) as caught:
+        page.goto(navigation_url)
+
+    observed = "\n".join((navigation_url, *requested_urls, str(caught.value)))
+    assert "launch_token" not in observed
+    assert sentinel not in observed
 
 
 def test_parse_preview_theme_and_default_download(page: Page, local_app_url: str) -> None:
@@ -176,6 +197,7 @@ def test_keyboard_focus_theme_menu_and_skip_link(page: Page, local_app_url: str)
     ) != "none"
 
     page.locator("#theme-button").focus()
+    expect(page.locator("#theme-button")).to_have_attribute("aria-haspopup", "menu")
     page.keyboard.press("Enter")
     expect(page.locator("#theme-menu")).to_be_visible()
     light_choice = page.locator('#theme-menu [data-theme="light"]')
@@ -258,9 +280,14 @@ def test_static_assets_are_local_and_avoid_unsafe_rendering() -> None:
     )
     page_markup = (static_dir / "index.html").read_text(encoding="utf-8")
     script = (static_dir / "app.js").read_text(encoding="utf-8")
+    e2e_fixtures = (Path(__file__).parent / "conftest.py").read_text(encoding="utf-8")
 
     assert "innerHTML" not in script
     assert "document.cookie" not in script
     assert "new Blob" not in script
     assert 'src="http' not in page_markup
     assert 'href="http' not in page_markup
+    assert "RedactedLaunchURL" not in e2e_fixtures
+    assert "issue_launch_token" not in e2e_fixtures
+    assert "launch_token" not in e2e_fixtures
+    assert "add_cookies" in e2e_fixtures
