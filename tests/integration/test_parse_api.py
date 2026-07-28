@@ -1,3 +1,4 @@
+import httpx
 import pytest
 from httpx import ASGITransport, AsyncClient
 
@@ -30,21 +31,28 @@ class FakeParser:
         )
 
 
-def make_app() -> tuple[object, SessionManager]:
+@pytest.fixture
+async def app_and_sessions() -> tuple[object, SessionManager]:
     sessions = SessionManager()
-    app = create_app(
-        services=AppServices(
-            parse_service=ParseService(FakeResolver(), FakeParser(), ParseStore())
-        ),
-        session_manager=sessions,
-        testing=True,
-    )
-    return app, sessions
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(404))
+    ) as media_client:
+        app = create_app(
+            services=AppServices(
+                parse_service=ParseService(FakeResolver(), FakeParser(), ParseStore()),
+                media_client=media_client,
+            ),
+            session_manager=sessions,
+            testing=True,
+        )
+        yield app, sessions
 
 
 @pytest.mark.asyncio
-async def test_parse_returns_public_projection_not_media_urls() -> None:
-    app, sessions = make_app()
+async def test_parse_returns_public_projection_not_media_urls(
+    app_and_sessions: tuple[object, SessionManager],
+) -> None:
+    app, sessions = app_and_sessions
     async with AsyncClient(
         transport=ASGITransport(app=app),
         base_url="http://testserver",
@@ -60,14 +68,19 @@ async def test_parse_returns_public_projection_not_media_urls() -> None:
     payload = response.json()
     assert payload["video"]["author"] == "钟哥!!"
     assert payload["video"]["cover_url"].startswith("/api/cover/")
+    assert payload["video"]["suggested_filename"].endswith(".mp4")
+    assert not any(char in payload["video"]["suggested_filename"] for char in '<>:"/\\|?*')
     assert "media_urls" not in response.text
     assert "douyinvod.com" not in response.text
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("share_text", ["", "x" * 2001])
-async def test_parse_validation_returns_approved_400_contract(share_text: str) -> None:
-    app, sessions = make_app()
+async def test_parse_validation_returns_approved_400_contract(
+    share_text: str,
+    app_and_sessions: tuple[object, SessionManager],
+) -> None:
+    app, sessions = app_and_sessions
     async with AsyncClient(
         transport=ASGITransport(app=app),
         base_url="http://testserver",
@@ -84,8 +97,10 @@ async def test_parse_validation_returns_approved_400_contract(share_text: str) -
 
 
 @pytest.mark.asyncio
-async def test_parse_requires_local_session_and_same_origin() -> None:
-    app, sessions = make_app()
+async def test_parse_requires_local_session_and_same_origin(
+    app_and_sessions: tuple[object, SessionManager],
+) -> None:
+    app, sessions = app_and_sessions
     async with AsyncClient(
         transport=ASGITransport(app=app),
         base_url="http://testserver",

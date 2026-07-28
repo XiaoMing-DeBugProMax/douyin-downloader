@@ -34,7 +34,8 @@ async def _application_lifespan(app: FastAPI) -> AsyncIterator[None]:
             ShareResolver(client),
             F2VideoParser(),
             ParseStore(),
-        )
+        ),
+        media_client=client,
     )
     try:
         yield
