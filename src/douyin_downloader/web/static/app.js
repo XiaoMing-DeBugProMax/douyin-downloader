@@ -1,63 +1,215 @@
+const THEME_STORAGE_KEY = "douyin-local-theme";
+const THEMES = new Set(["light", "dark", "calm"]);
+const UNKNOWN_ERROR = "解析服务暂时不可用，请稍后重试。";
+
+const root = document.documentElement;
+const form = document.querySelector("#parse-form");
+const shareText = document.querySelector("#share-text");
+const parseButton = document.querySelector("#parse-button");
+const parseButtonLabel = parseButton.querySelector(".button-label");
+const status = document.querySelector("#status");
+const errorAlert = document.querySelector("#error");
+const result = document.querySelector("#result");
+const cover = document.querySelector("#cover");
+const author = document.querySelector("#author");
+const description = document.querySelector("#description");
+const duration = document.querySelector("#duration");
+const downloadDefault = document.querySelector("#download-default");
+const downloadCustom = document.querySelector("#download-custom");
+const parseAnother = document.querySelector("#parse-another");
+const themeButton = document.querySelector("#theme-button");
+const themeMenu = document.querySelector("#theme-menu");
+const themeChoices = Array.from(themeMenu.querySelectorAll("[data-theme]"));
+
+let currentParse = null;
+let isParsing = false;
+
+function storedTheme() {
+  try {
+    const value = window.localStorage.getItem(THEME_STORAGE_KEY);
+    return THEMES.has(value) ? value : "light";
+  } catch (_) {
+    return "light";
+  }
+}
+
+function applyTheme(theme, persist = false) {
+  const selectedTheme = THEMES.has(theme) ? theme : "light";
+  root.dataset.theme = selectedTheme;
+  for (const choice of themeChoices) {
+    choice.setAttribute("aria-checked", String(choice.dataset.theme === selectedTheme));
+  }
+  if (persist) {
+    try {
+      window.localStorage.setItem(THEME_STORAGE_KEY, selectedTheme);
+    } catch (_) {
+      // The theme still applies for this page when storage is unavailable.
+    }
+  }
+}
+
+function setThemeMenu(open) {
+  themeMenu.hidden = !open;
+  themeButton.setAttribute("aria-expanded", String(open));
+}
+
+function focusedThemeIndex() {
+  const index = themeChoices.indexOf(document.activeElement);
+  return index >= 0 ? index : 0;
+}
+
+function selectedThemeIndex() {
+  const index = themeChoices.findIndex((choice) => choice.getAttribute("aria-checked") === "true");
+  return index >= 0 ? index : 0;
+}
+
+function focusThemeChoice(index) {
+  const normalizedIndex = (index + themeChoices.length) % themeChoices.length;
+  themeChoices[normalizedIndex].focus();
+}
+
+applyTheme(storedTheme());
+
+themeButton.addEventListener("click", (event) => {
+  const opening = themeButton.getAttribute("aria-expanded") !== "true";
+  setThemeMenu(opening);
+  if (opening && event.detail === 0) {
+    focusThemeChoice(selectedThemeIndex());
+  }
+});
+
+themeButton.addEventListener("keydown", (event) => {
+  if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+  event.preventDefault();
+  setThemeMenu(true);
+  const selectedIndex = selectedThemeIndex();
+  focusThemeChoice(event.key === "ArrowDown" ? selectedIndex : selectedIndex - 1);
+});
+
+for (const choice of themeChoices) {
+  choice.addEventListener("click", () => {
+    applyTheme(choice.dataset.theme, true);
+    setThemeMenu(false);
+    themeButton.focus();
+  });
+}
+
+themeMenu.addEventListener("keydown", (event) => {
+  if (event.key === "Tab") {
+    setThemeMenu(false);
+    return;
+  }
+
+  let nextIndex = null;
+  if (event.key === "ArrowDown") {
+    nextIndex = focusedThemeIndex() + 1;
+  } else if (event.key === "ArrowUp") {
+    nextIndex = focusedThemeIndex() - 1;
+  } else if (event.key === "Home") {
+    nextIndex = 0;
+  } else if (event.key === "End") {
+    nextIndex = themeChoices.length - 1;
+  }
+
+  if (nextIndex !== null) {
+    event.preventDefault();
+    focusThemeChoice(nextIndex);
+  }
+});
+
+document.addEventListener("click", (event) => {
+  if (!themeMenu.hidden && !event.target.closest(".theme-picker")) {
+    setThemeMenu(false);
+  }
+});
+
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && !themeMenu.hidden) {
+    setThemeMenu(false);
+    themeButton.focus();
+  }
+});
+
 function showNotice(message) {
-  document.querySelector("#status").textContent = message;
-  document.querySelector("#error").textContent = "";
+  status.textContent = message;
+  errorAlert.textContent = "";
 }
 
 function showError(message) {
-  document.querySelector("#error").textContent = message;
-  document.querySelector("#status").textContent = "";
+  errorAlert.textContent = message;
+  status.textContent = "";
 }
 
-async function toAppError(response) {
-  let payload = null;
+async function responseErrorMessage(response) {
   try {
-    payload = await response.json();
+    const payload = await response.json();
+    if (typeof payload?.error?.message === "string" && payload.error.message.trim()) {
+      return payload.error.message;
+    }
   } catch (_) {
-    payload = null;
+    // Fall through to the stable unknown-error copy.
   }
-  const error = new Error(payload?.error?.message || "解析服务暂时不可用，请稍后重试。");
-  error.code = payload?.error?.code || "UNKNOWN";
-  return error;
+  return UNKNOWN_ERROR;
 }
-
-function normalizeError(error) {
-  return error instanceof Error && error.message ? error.message : "解析服务暂时不可用，请稍后重试。";
-}
-
-let currentParse = null;
 
 function renderPreview(video, parseToken) {
-  currentParse = { token: parseToken, suggestedName: video.suggested_filename };
-  document.querySelector("#video-cover").src = video.cover_url;
-  document.querySelector("#video-author").textContent = video.author;
-  document.querySelector("#video-description").textContent = video.description;
-  document.querySelector("#video-duration").textContent = `${Math.round(video.duration_ms / 1000)} 秒`;
-  document.querySelector("#result").hidden = false;
+  currentParse = {
+    token: parseToken,
+    suggestedName:
+      typeof video.suggested_filename === "string" ? video.suggested_filename : "video.mp4",
+  };
+  cover.src = video.cover_url;
+  author.textContent = video.author;
+  description.textContent = video.description || "暂无文案";
+  duration.textContent = `${Math.round(video.duration_ms / 1000)} 秒`;
+  result.hidden = false;
 }
 
-document.querySelector("#parse-form").addEventListener("submit", async (event) => {
+function setParsingState(parsing) {
+  isParsing = parsing;
+  if (parsing) {
+    parseButton.disabled = true;
+    parseButtonLabel.textContent = "正在解析";
+  } else {
+    parseButton.disabled = false;
+    parseButtonLabel.textContent = "开始解析";
+  }
+}
+
+form.addEventListener("submit", async (event) => {
   event.preventDefault();
-  const button = document.querySelector("#parse-button");
-  const shareText = document.querySelector("#share-text").value;
-  button.disabled = true;
-  document.querySelector("#result").hidden = true;
-  showNotice("正在解析…");
+  if (isParsing) return;
+
+  const input = shareText.value.trim();
+  if (!input) {
+    showError("请输入抖音分享文案或链接。");
+    shareText.focus();
+    return;
+  }
+
+  setParsingState(true);
+  currentParse = null;
+  result.hidden = true;
+  showNotice("正在解析，请稍候…");
+
   try {
     const response = await fetch("/api/parse", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ share_text: shareText }),
+      body: JSON.stringify({ share_text: input }),
     });
     if (!response.ok) {
-      throw await toAppError(response);
+      showError(await responseErrorMessage(response));
+      return;
     }
+
     const payload = await response.json();
     renderPreview(payload.video, payload.parse_token);
-    showNotice("解析完成。");
-  } catch (error) {
-    showError(normalizeError(error));
+    showNotice("解析完成，可以下载了。");
+  } catch (_) {
+    showError(UNKNOWN_ERROR);
   } finally {
-    button.disabled = false;
+    setParsingState(false);
   }
 });
 
@@ -65,32 +217,54 @@ function downloadUrl(token) {
   return `/api/download/${encodeURIComponent(token)}`;
 }
 
+function startDefaultDownload(token) {
+  window.location.assign(downloadUrl(token));
+}
+
 async function saveToChosenLocation(token, suggestedName) {
-  if (!window.showSaveFilePicker) {
+  if (typeof window.showSaveFilePicker !== "function") {
     showNotice("当前浏览器不支持选择保存位置，将使用默认下载方式。");
-    window.location.assign(downloadUrl(token));
+    startDefaultDownload(token);
     return;
   }
+
   try {
     const handle = await window.showSaveFilePicker({
       suggestedName,
       types: [{ description: "MP4 视频", accept: { "video/mp4": [".mp4"] } }],
     });
     const response = await fetch(downloadUrl(token));
-    if (!response.ok || !response.body) throw await toAppError(response);
+    if (!response.ok || !response.body) {
+      showError(await responseErrorMessage(response));
+      return;
+    }
     const writable = await handle.createWritable();
     await response.body.pipeTo(writable);
     showNotice("视频已保存。");
   } catch (error) {
-    if (error && error.name === "AbortError") return;
-    showError(normalizeError(error));
+    if (error?.name === "AbortError") return;
+    showError(UNKNOWN_ERROR);
   }
 }
 
-document.querySelector("#default-download").addEventListener("click", () => {
-  if (currentParse) window.location.assign(downloadUrl(currentParse.token));
+downloadDefault.addEventListener("click", () => {
+  if (currentParse) startDefaultDownload(currentParse.token);
 });
 
-document.querySelector("#save-to-location").addEventListener("click", () => {
-  if (currentParse) saveToChosenLocation(currentParse.token, currentParse.suggestedName);
+downloadCustom.addEventListener("click", () => {
+  if (currentParse) {
+    saveToChosenLocation(currentParse.token, currentParse.suggestedName);
+  }
+});
+
+parseAnother.addEventListener("click", () => {
+  currentParse = null;
+  form.reset();
+  result.hidden = true;
+  cover.removeAttribute("src");
+  author.textContent = "";
+  description.textContent = "";
+  duration.textContent = "";
+  showNotice("");
+  shareText.focus();
 });

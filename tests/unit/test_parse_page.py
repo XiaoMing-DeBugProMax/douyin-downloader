@@ -13,14 +13,21 @@ def test_parse_page_uses_safe_text_rendering_and_required_controls() -> None:
         "status",
         "error",
         "result",
-        "default-download",
-        "save-to-location",
+        "cover",
+        "author",
+        "description",
+        "duration",
+        "download-default",
+        "download-custom",
+        "parse-another",
+        "theme-button",
+        "theme-menu",
     ):
         assert f'id="{element_id}"' in page
     assert "innerHTML" not in script
     assert "document.cookie" not in script
     assert "textContent" in script
-    assert "button.disabled = true" in script
+    assert "parseButton.disabled = true" in script
     assert "window.location.assign" in script
     assert "response.body.pipeTo" in script
     assert "new Blob" not in script
