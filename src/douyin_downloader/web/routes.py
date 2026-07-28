@@ -1,15 +1,16 @@
+import secrets
 from dataclasses import dataclass
 from urllib.parse import quote
 
 import httpx
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from starlette.responses import StreamingResponse
 
 from douyin_downloader.domain import AppError
 from douyin_downloader.media import UpstreamStream, open_first_available, safe_video_filename
 from douyin_downloader.parse_service import ParseService
-from douyin_downloader.session import require_local_session, require_same_origin
+from douyin_downloader.session import SessionManager, require_local_session, require_same_origin
 
 
 @dataclass(slots=True)
@@ -60,6 +61,14 @@ def streaming_cover_response(upstream: UpstreamStream) -> StreamingResponse:
 
 def build_router() -> APIRouter:
     router = APIRouter()
+
+    @router.post("/api/internal/launch-token")
+    async def issue_launch_token(request: Request) -> dict[str, str]:
+        supplied = request.headers.get("x-management-token")
+        sessions: SessionManager = request.app.state.session_manager
+        if supplied is None or not secrets.compare_digest(supplied, sessions.management_token):
+            raise HTTPException(status_code=403)
+        return {"launch_token": sessions.issue_launch_token()}
 
     @router.post(
         "/api/parse",
