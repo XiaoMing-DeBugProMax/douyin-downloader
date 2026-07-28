@@ -9,7 +9,7 @@ from douyin_downloader.web.app import create_app
 async def test_launch_sets_http_only_cookie_and_redirects_clean_url() -> None:
     sessions = SessionManager()
     token = sessions.issue_launch_token()
-    app = create_app(session_manager=sessions)
+    app = create_app(session_manager=sessions, testing=True)
     async with AsyncClient(
         transport=ASGITransport(app=app),
         base_url="http://testserver",
@@ -27,7 +27,7 @@ async def test_launch_sets_http_only_cookie_and_redirects_clean_url() -> None:
 
 @pytest.mark.asyncio
 async def test_invalid_launch_token_cannot_establish_a_session() -> None:
-    app = create_app(session_manager=SessionManager())
+    app = create_app(session_manager=SessionManager(), testing=True)
     async with AsyncClient(
         transport=ASGITransport(app=app),
         base_url="http://testserver",

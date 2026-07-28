@@ -7,7 +7,7 @@ from douyin_downloader.web.app import create_app
 
 @pytest.mark.asyncio
 async def test_health_contract() -> None:
-    app = create_app()
+    app = create_app(testing=True)
     async with AsyncClient(
         transport=ASGITransport(app=app),
         base_url="http://testserver",
@@ -22,7 +22,7 @@ async def test_health_contract() -> None:
 
 @pytest.mark.asyncio
 async def test_home_serves_local_static_page() -> None:
-    app = create_app()
+    app = create_app(testing=True)
     async with AsyncClient(
         transport=ASGITransport(app=app),
         base_url="http://testserver",
@@ -37,3 +37,15 @@ async def test_home_serves_local_static_page() -> None:
 
 def test_launcher_entry_point_is_callable() -> None:
     assert callable(main)
+
+
+@pytest.mark.asyncio
+async def test_production_app_rejects_test_only_host() -> None:
+    app = create_app()
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://testserver",
+    ) as client:
+        response = await client.get("/api/health")
+
+    assert response.status_code == 400
