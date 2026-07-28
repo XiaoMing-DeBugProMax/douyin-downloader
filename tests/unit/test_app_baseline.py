@@ -1,6 +1,7 @@
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from douyin_downloader.launcher import main
 from douyin_downloader.web.app import create_app
 
 
@@ -29,6 +30,10 @@ async def test_home_serves_local_static_page() -> None:
         response = await client.get("/")
 
     assert response.status_code == 200
-    assert "鎶栭煶瑙嗛涓嬭浇" in response.text
+    assert "抖音视频下载" in response.text
     assert "http://" not in response.text
     assert "https://" not in response.text
+
+
+def test_launcher_entry_point_is_callable() -> None:
+    assert callable(main)

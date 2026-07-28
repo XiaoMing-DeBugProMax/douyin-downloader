@@ -8,7 +8,7 @@ STATIC_DIR = Path(__file__).with_name("static")
 
 
 def create_app(*, services: object | None = None, session_manager: object | None = None) -> FastAPI:
-    app = FastAPI(title="鎶栭煶瑙嗛涓嬭浇", docs_url=None, redoc_url=None)
+    app = FastAPI(title="抖音视频下载", docs_url=None, redoc_url=None)
     app.state.services = services
     app.state.session_manager = session_manager
     app.state.instance_id = uuid4().hex
