@@ -6,6 +6,8 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from types import CodeType
+from typing import Protocol
 
 _RULES = (
     (
@@ -40,6 +42,12 @@ class Finding:
         return f"{self.path}:{self.line}: {self.rule}"
 
 
+class _PyzArchive(Protocol):
+    toc: dict[str, object]
+
+    def extract(self, name: str) -> object: ...
+
+
 def scan_text(path: str, text: str) -> list[Finding]:
     findings: list[Finding] = []
     normalized_path = path.replace("\\", "/")
@@ -66,6 +74,33 @@ def scan_artifact_entry(name: str, content: bytes) -> list[Finding]:
     except UnicodeDecodeError:
         return findings
     findings.extend(scan_text(f"artifact/{normalized_name}", text))
+    return findings
+
+
+def _scan_code_constants(path: str, code: CodeType) -> list[Finding]:
+    findings: list[Finding] = []
+    for constant in code.co_consts:
+        if isinstance(constant, CodeType):
+            findings.extend(_scan_code_constants(path, constant))
+        elif isinstance(constant, str):
+            findings.extend(scan_text(path, constant))
+        elif isinstance(constant, bytes):
+            findings.extend(scan_text(path, constant.decode("utf-8", errors="replace")))
+    return findings
+
+
+def _scan_pyz_archive(name: str, archive: _PyzArchive) -> list[Finding]:
+    findings: list[Finding] = []
+    normalized_name = name.replace("\\", "/")
+    for module_name in sorted(archive.toc):
+        module_path = f"artifact/{normalized_name}/{module_name}"
+        try:
+            code = archive.extract(module_name)
+        except Exception:
+            findings.append(Finding(module_path, 0, "artifact_pyz_entry_unreadable"))
+            continue
+        if isinstance(code, CodeType):
+            findings.extend(_scan_code_constants(module_path, code))
     return findings
 
 
@@ -106,7 +141,7 @@ def scan_repository(project_root: Path) -> list[Finding]:
 
 
 def scan_artifact(path: Path) -> list[Finding]:
-    from PyInstaller.archive.readers import CArchiveReader
+    from PyInstaller.archive.readers import CArchiveReader, ZlibArchiveReader
 
     if not path.is_file():
         return [Finding(path.name, 0, "artifact_missing")]
@@ -117,6 +152,14 @@ def scan_artifact(path: Path) -> list[Finding]:
 
     findings: list[Finding] = []
     for name in sorted(archive.toc):
+        if archive.toc[name][-1] == "z":
+            try:
+                pyz_archive: ZlibArchiveReader = archive.open_embedded_archive(name)
+            except Exception:
+                findings.append(Finding(f"artifact/{name}", 0, "artifact_pyz_unreadable"))
+                continue
+            findings.extend(_scan_pyz_archive(name, pyz_archive))
+            continue
         try:
             content = archive.extract(name)
         except Exception:

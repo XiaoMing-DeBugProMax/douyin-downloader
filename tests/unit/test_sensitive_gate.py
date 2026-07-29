@@ -1,4 +1,26 @@
-from scripts.check_sensitive import scan_artifact_entry, scan_text
+from pathlib import Path
+
+import pytest
+from PyInstaller.archive.writers import CArchiveWriter, ZlibArchiveWriter
+
+from scripts.check_sensitive import scan_artifact, scan_artifact_entry, scan_text
+
+
+def _write_pyz_artifact(tmp_path: Path, source: str) -> Path:
+    pyz_path = tmp_path / "modules.pyz"
+    module_name = "embedded_module"
+    ZlibArchiveWriter(
+        str(pyz_path),
+        [(module_name, "embedded_module.py", "PYMODULE")],
+        {module_name: compile(source, "embedded_module.py", "exec")},
+    )
+    artifact_path = tmp_path / "artifact.exe"
+    CArchiveWriter(
+        str(artifact_path),
+        [("PYZ.pyz", str(pyz_path), False, "z")],
+        "python312.dll",
+    )
+    return artifact_path
 
 
 def test_sensitive_gate_detects_concrete_values_without_echoing_them() -> None:
@@ -76,3 +98,42 @@ def test_artifact_gate_allows_required_code_and_sanitized_assets() -> None:
         "douyin_downloader/web/static/app.js",
         b"const launch_token = sessions.issue_launch_token();",
     ) == []
+
+
+def test_artifact_gate_detects_sensitive_constants_in_embedded_pyz(tmp_path: Path) -> None:
+    long_value = "ABCDEFGHIJKLMNOPQRSTUVWXYZ123456"
+    artifact = _write_pyz_artifact(
+        tmp_path,
+        "def nested():\n"
+        f"    cookie = b'ttwid={long_value}'\n"
+        f"    verify = 's_v_web_id={long_value}'\n",
+    )
+
+    findings = scan_artifact(artifact)
+
+    assert [finding.rule for finding in findings] == [
+        "concrete_ttwid",
+        "concrete_verify_fp",
+    ]
+    assert all(finding.path.startswith("artifact/PYZ.pyz/") for finding in findings)
+    rendered = "\n".join(finding.safe_summary() for finding in findings)
+    assert long_value not in rendered
+
+
+def test_artifact_gate_allows_sanitized_constants_in_embedded_pyz(tmp_path: Path) -> None:
+    artifact = _write_pyz_artifact(
+        tmp_path,
+        "def nested():\n"
+        "    cookie = b'ttwid=guest'\n"
+        "    token = 'launch_token: generated-at-runtime'\n",
+    )
+
+    assert scan_artifact(artifact) == []
+
+
+def test_artifact_gate_scans_current_executable_when_available() -> None:
+    artifact = Path(__file__).resolve().parents[2] / "dist" / "抖音视频下载.exe"
+    if not artifact.is_file():
+        pytest.skip("current packaged executable is not available")
+
+    assert scan_artifact(artifact) == []

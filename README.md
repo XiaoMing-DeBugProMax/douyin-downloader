@@ -18,6 +18,11 @@
 
 需要 Windows 10/11 x64 和 Python 3.12。
 
+项目为 `f2==0.0.1.7` 固定了兼容依赖：`httpx==0.27.2`、
+`pydantic==2.9.2`、`pytest==8.3.4` 和 `pytest-asyncio==0.25.0`。
+这些版本用于保持已验证的 f2 请求签名/数据模型兼容性，并让异步测试结果可复现；
+升级 f2 或这些依赖前需要重新执行真实作品验证和打包验收。
+
 ```powershell
 py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e ".[dev]"

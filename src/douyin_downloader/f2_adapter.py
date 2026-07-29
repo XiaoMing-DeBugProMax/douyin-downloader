@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import secrets
@@ -28,6 +27,9 @@ TTWID_REGISTER_PAYLOAD = {
     "cbUrlProtocol": "https",
     "union": True,
 }
+_MISSING_APPLICATION_STATUSES = frozenset({4, 10204})
+_BLOCKED_MESSAGE = "解析服务暂时不可用，请稍后重试。"
+_NOT_FOUND_MESSAGE = "没有找到公开视频，请检查作品是否存在。"
 
 
 def _prevent_f2_default_file_logging() -> None:
@@ -171,36 +173,58 @@ def _sign_post_detail(params: dict[str, object]) -> str:
     return f"{POST_DETAIL_ENDPOINT}?{param_str}&a_bogus={ab_value[1]}"
 
 
-def _load_f2_runtime_and_guest(aweme_id: str) -> _F2Runtime:
+def _raise_for_upstream_status(
+    response: httpx.Response,
+    *,
+    not_found_is_video: bool,
+) -> None:
+    status = response.status_code
+    if status == 404 and not_found_is_video:
+        raise AppError("VIDEO_NOT_FOUND", _NOT_FOUND_MESSAGE, 404)
+    if 500 <= status <= 599:
+        raise TransientUpstreamError(f"HTTP {status}")
+    if status < 200 or status >= 300:
+        raise AppError("UPSTREAM_BLOCKED", _BLOCKED_MESSAGE, 502)
+
+
+async def _load_f2_runtime_and_guest(aweme_id: str) -> _F2Runtime:
     _prevent_f2_default_file_logging()
 
     # f2's TokenManager hard-codes BaseCrawler's default of five retries. Read
     # only the audited guest registration contract and issue it once through
     # an explicit no-retry, no-environment transport. The detail endpoint
     # accepts an empty guest msToken, so no opaque f2 config payload is needed.
-    with httpx.Client(
-        transport=httpx.HTTPTransport(retries=0),
+    async with httpx.AsyncClient(
+        transport=httpx.AsyncHTTPTransport(retries=0),
         timeout=20,
         trust_env=False,
+        follow_redirects=False,
     ) as client:
-        ttwid_response = client.post(
-            TTWID_REGISTER_ENDPOINT,
-            content=json.dumps(TTWID_REGISTER_PAYLOAD, separators=(",", ":")),
-            headers={
-                "Content-Type": "application/json; charset=utf-8",
-                "User-Agent": USER_AGENT,
-            },
-        )
-        ttwid_response.raise_for_status()
+        try:
+            ttwid_response = await client.post(
+                TTWID_REGISTER_ENDPOINT,
+                content=json.dumps(TTWID_REGISTER_PAYLOAD, separators=(",", ":")),
+                headers={
+                    "Content-Type": "application/json; charset=utf-8",
+                    "User-Agent": USER_AGENT,
+                },
+            )
+        except httpx.TimeoutException as error:
+            raise TimeoutError from error
+        except httpx.NetworkError as error:
+            raise TransientUpstreamError(type(error).__name__) from error
+        _raise_for_upstream_status(ttwid_response, not_found_is_video=False)
         ttwid = ttwid_response.cookies.get("ttwid")
         if ttwid is None:
-            raise RuntimeError("invalid guest ttwid")
+            raise AppError("UPSTREAM_BLOCKED", _BLOCKED_MESSAGE, 502)
 
-    params = _build_post_detail_params(aweme_id, "")
-    return _F2Runtime(
-        signed_endpoint=_sign_post_detail(params),
-        cookie=f"ttwid={ttwid}; s_v_web_id={_generate_verify_fp()};",
-    )
+    try:
+        params = _build_post_detail_params(aweme_id, "")
+        signed_endpoint = _sign_post_detail(params)
+        verify_fp = _generate_verify_fp()
+    except Exception as error:
+        raise AppError("UPSTREAM_BLOCKED", _BLOCKED_MESSAGE, 502) from error
+    return _F2Runtime(signed_endpoint, f"ttwid={ttwid}; s_v_web_id={verify_fp};")
 
 
 class _PostDetailCrawler:
@@ -226,18 +250,30 @@ class _PostDetailCrawler:
         await self._client.aclose()
 
     async def fetch_post_detail(self) -> dict[str, object]:
-        response = await self._client.get(
-            self._runtime.signed_endpoint,
-            follow_redirects=False,
-        )
-        response.raise_for_status()
-        payload: dict[str, object] = response.json()
+        try:
+            response = await self._client.get(
+                self._runtime.signed_endpoint,
+                follow_redirects=False,
+            )
+        except httpx.TimeoutException as error:
+            raise TimeoutError from error
+        except httpx.NetworkError as error:
+            raise TransientUpstreamError(type(error).__name__) from error
+        _raise_for_upstream_status(response, not_found_is_video=True)
+        try:
+            payload: dict[str, object] = response.json()
+        except (TypeError, ValueError) as error:
+            raise AppError("UPSTREAM_BLOCKED", _BLOCKED_MESSAGE, 502) from error
+        if not isinstance(payload, dict):
+            raise AppError("UPSTREAM_BLOCKED", _BLOCKED_MESSAGE, 502)
         return payload
 
 
 def map_post_detail(detail: Any) -> ParsedVideo:
     if detail.api_status_code != 0:
-        raise TransientUpstreamError(f"Douyin status {detail.api_status_code}")
+        if detail.api_status_code in _MISSING_APPLICATION_STATUSES:
+            raise AppError("VIDEO_NOT_FOUND", _NOT_FOUND_MESSAGE, 404)
+        raise AppError("UPSTREAM_BLOCKED", _BLOCKED_MESSAGE, 502)
     if detail.images:
         raise AppError("UNSUPPORTED_CONTENT", "当前版本不支持图集或直播内容。", 422)
     media_urls = tuple(detail.video_play_addr or ())
@@ -257,10 +293,12 @@ def map_post_detail(detail: Any) -> ParsedVideo:
 class F2VideoParser:
     async def parse(self, aweme_id: str) -> ParsedVideo:
         try:
-            runtime = await asyncio.to_thread(_load_f2_runtime_and_guest, aweme_id)
+            runtime = await _load_f2_runtime_and_guest(aweme_id)
             async with _PostDetailCrawler(runtime) as crawler:
                 payload = await crawler.fetch_post_detail()
             detail = _post_detail_filter(payload)
+        except (AppError, TimeoutError, TransientUpstreamError):
+            raise
         except Exception as error:
-            raise TransientUpstreamError(type(error).__name__) from error
+            raise AppError("UPSTREAM_BLOCKED", _BLOCKED_MESSAGE, 502) from error
         return map_post_detail(detail)

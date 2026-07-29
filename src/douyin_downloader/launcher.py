@@ -106,7 +106,7 @@ class LocalServer:
         try:
             port = int(listener.getsockname()[1])
             sessions = SessionManager()
-            app = create_app(session_manager=sessions)
+            app = create_app(session_manager=sessions, expected_port=port)
             instance_id = str(app.state.instance_id)
             config = uvicorn.Config(
                 app,
@@ -114,6 +114,7 @@ class LocalServer:
                 port=port,
                 log_config=None,
                 access_log=False,
+                timeout_graceful_shutdown=1,
             )
             server = uvicorn.Server(config)
             thread = threading.Thread(

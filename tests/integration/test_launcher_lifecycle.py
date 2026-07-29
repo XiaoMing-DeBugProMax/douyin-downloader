@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import multiprocessing
 import os
 import secrets
 import socket
+import threading
 import time
 from pathlib import Path
 from queue import Empty
@@ -285,6 +287,109 @@ def test_duplicate_invocation_only_wakes_existing_instance(
         assert launched.headers["location"] == "/"
     finally:
         running_server.stop()
+
+
+def test_close_during_blocked_guest_registration_cleans_all_runtime_resources(
+    runtime_store: RuntimeStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    blocked = threading.Event()
+    cancelled = threading.Event()
+    parse_finished = threading.Event()
+    opened_urls: list[str] = []
+    running_servers: list[RunningServer] = []
+    parse_errors: list[BaseException] = []
+
+    class BlockingTransport(httpx.AsyncBaseTransport):
+        def __init__(self, *args: object, retries: int = 0, **kwargs: object) -> None:
+            assert retries == 0
+
+        async def handle_async_request(self, _: httpx.Request) -> httpx.Response:
+            blocked.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+            raise AssertionError("guest registration unexpectedly completed")
+
+    monkeypatch.setattr(httpx, "AsyncHTTPTransport", BlockingTransport)
+
+    class RecordingServer:
+        def __init__(self, store: RuntimeStore) -> None:
+            self._server = LocalServer(store)
+
+        def start(self) -> RunningServer:
+            running = self._server.start()
+            running_servers.append(running)
+            return running
+
+    class ParseThenCloseWindow:
+        def __init__(self, running: RunningServer) -> None:
+            self._running = running
+
+        def run(self) -> None:
+            assert opened_urls
+
+            def parse_request() -> None:
+                try:
+                    with httpx.Client(timeout=10, trust_env=False) as client:
+                        launch = client.get(opened_urls[0], follow_redirects=False)
+                        assert launch.status_code == 303
+                        client.post(
+                            f"{self._running.base_url}/api/parse",
+                            headers={"origin": self._running.base_url},
+                            json={
+                                "share_text": (
+                                    "https://www.douyin.com/video/7429378937383308594"
+                                )
+                            },
+                        )
+                except BaseException as error:
+                    parse_errors.append(error)
+                finally:
+                    parse_finished.set()
+
+            threading.Thread(
+                target=parse_request,
+                name="test-parse-client",
+                daemon=True,
+            ).start()
+            assert blocked.wait(3)
+
+    started_at = time.monotonic()
+    result = main(
+        runtime_store=runtime_store,
+        server_factory=RecordingServer,
+        window_factory=lambda running, _: ParseThenCloseWindow(running),
+        browser_open=opened_urls.append,
+        show_error=lambda *_: pytest.fail("shutdown path must not show an error"),
+    )
+    elapsed = time.monotonic() - started_at
+
+    assert result == 0
+    assert elapsed < 3
+    assert cancelled.wait(1)
+    assert parse_finished.wait(1)
+    assert len(running_servers) == 1
+    running = running_servers[0]
+    assert not running.thread.is_alive()
+    assert runtime_store.read() is None
+    with pytest.raises((httpx.ConnectError, httpx.ConnectTimeout)):
+        httpx.get(running.base_url, timeout=0.25, trust_env=False)
+    rebound = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        rebound.bind((running.host, running.port))
+    finally:
+        rebound.close()
+    if os.name == "nt":
+        mutex = runtime_store.instance_mutex()
+        try:
+            assert mutex.is_owner
+        finally:
+            mutex.close()
+    assert not any(thread.name == "test-parse-client" for thread in threading.enumerate())
+    assert all(isinstance(error, httpx.HTTPError) for error in parse_errors)
 
 
 def test_stale_runtime_with_wrong_instance_id_starts_new_and_is_not_removed_by_old_owner(

@@ -3,15 +3,18 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
 
-from douyin_downloader.domain import AppError, TransientUpstreamError
+from douyin_downloader.domain import AppError
 from douyin_downloader.f2_adapter import (
     F2VideoParser,
     map_post_detail,
 )
+from douyin_downloader.parse_service import ParseService
+from douyin_downloader.store import ParseStore
 
 
 class FakeDetail:
@@ -54,11 +57,22 @@ def test_rejects_detail_without_video_candidates() -> None:
     assert error.value.code == "UNSUPPORTED_CONTENT"
 
 
-def test_maps_nonzero_douyin_status_to_transient_failure() -> None:
+def test_maps_known_missing_douyin_status_to_video_not_found() -> None:
     detail = FakeDetail()
     detail.api_status_code = 4
-    with pytest.raises(TransientUpstreamError, match="Douyin status 4"):
+    with pytest.raises(AppError) as error:
         map_post_detail(detail)
+    assert error.value.code == "VIDEO_NOT_FOUND"
+    assert error.value.status_code == 404
+
+
+def test_maps_unknown_douyin_status_to_non_retryable_blocked_error() -> None:
+    detail = FakeDetail()
+    detail.api_status_code = 999
+    with pytest.raises(AppError) as error:
+        map_post_detail(detail)
+    assert error.value.code == "UPSTREAM_BLOCKED"
+    assert error.value.status_code == 502
 
 
 def test_low_level_f2_import_does_not_create_workspace_logs(tmp_path: Path) -> None:
@@ -97,7 +111,7 @@ def test_low_level_f2_import_does_not_create_workspace_logs(tmp_path: Path) -> N
     assert not (tmp_path / "logs").exists()
 
 
-def test_cold_f2_runtime_uses_zero_retry_token_transports(tmp_path: Path) -> None:
+def test_cold_f2_runtime_uses_async_zero_retry_token_transports(tmp_path: Path) -> None:
     project_root = Path(__file__).parents[2]
     env = os.environ.copy()
     env["PYTHONPATH"] = str(project_root / "src")
@@ -106,25 +120,19 @@ def test_cold_f2_runtime_uses_zero_retry_token_transports(tmp_path: Path) -> Non
             "import asyncio",
             "import httpx",
             "import sys",
-            "import threading",
             "retry_values = []",
-            "sync_threads = []",
-            "state = {'detail_requests': 0}",
-            "main_thread = threading.get_ident()",
-            "class RecordingSyncTransport(httpx.BaseTransport):",
-            "    def __init__(self, *args, retries=0, **kwargs):",
-            "        retry_values.append(retries)",
-            "    def handle_request(self, request):",
-            "        sync_threads.append(threading.get_ident())",
-            "        headers = [",
-            "            ('set-cookie', 'msToken=' + 'm' * 120 + '; Path=/'),",
-            "            ('set-cookie', 'ttwid=guest-token; Path=/'),",
-            "        ]",
-            "        return httpx.Response(200, headers=headers, request=request)",
+            "state = {'guest_requests': 0, 'detail_requests': 0}",
             "class RecordingAsyncTransport(httpx.AsyncBaseTransport):",
             "    def __init__(self, *args, retries=0, **kwargs):",
             "        retry_values.append(retries)",
             "    async def handle_async_request(self, request):",
+            "        if request.url.host == 'ttwid.bytedance.com':",
+            "            state['guest_requests'] += 1",
+            "            return httpx.Response(",
+            "                200,",
+            "                headers={'set-cookie': 'ttwid=guest-token; Path=/'},",
+            "                request=request,",
+            "            )",
             "        state['detail_requests'] += 1",
             "        payload = {",
             "            'status_code': 0,",
@@ -145,15 +153,13 @@ def test_cold_f2_runtime_uses_zero_retry_token_transports(tmp_path: Path) -> Non
             "            },",
             "        }",
             "        return httpx.Response(200, json=payload, request=request)",
-            "httpx.HTTPTransport = RecordingSyncTransport",
             "httpx.AsyncHTTPTransport = RecordingAsyncTransport",
             "from douyin_downloader.f2_adapter import F2VideoParser",
             "video = asyncio.run(F2VideoParser().parse('7429378937383308594'))",
             "assert video.aweme_id == '7429378937383308594'",
             "assert retry_values and all(value == 0 for value in retry_values), "
             "('retry_values', retry_values)",
-            "assert sync_threads and all(value != main_thread for value in sync_threads), "
-            "('sync_threads', sync_threads)",
+            "assert state['guest_requests'] == 1, ('state', state)",
             "assert state['detail_requests'] == 1, ('state', state)",
             "assert 'browser_cookie3' not in sys.modules",
             "assert 'pythoncom' not in sys.modules",
@@ -243,27 +249,167 @@ async def test_detail_redirect_is_not_followed(
     )
 
     async with adapter._PostDetailCrawler(runtime) as crawler:  # type: ignore[attr-defined]
-        with pytest.raises(httpx.HTTPStatusError):
+        with pytest.raises(AppError) as error:
             await crawler.fetch_post_detail()
 
+    assert error.value.code == "UPSTREAM_BLOCKED"
     assert transport.requests == 1
 
 
 @pytest.mark.asyncio
-async def test_guest_token_failure_is_mapped_to_transient_error(
+@pytest.mark.parametrize(
+    ("outcome", "expected_code", "expected_requests"),
+    [
+        ("redirect", "UPSTREAM_BLOCKED", 1),
+        ("not_found", "VIDEO_NOT_FOUND", 1),
+        ("rate_limited", "UPSTREAM_BLOCKED", 1),
+        ("server_error", "UPSTREAM_BLOCKED", 2),
+        ("timeout", "UPSTREAM_TIMEOUT", 2),
+        ("connection", "UPSTREAM_BLOCKED", 2),
+        ("missing_status", "VIDEO_NOT_FOUND", 1),
+        ("blocked_status", "UPSTREAM_BLOCKED", 1),
+    ],
+)
+async def test_parse_service_retries_only_retryable_detail_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+    expected_code: str,
+    expected_requests: int,
+) -> None:
+    import douyin_downloader.f2_adapter as adapter
+
+    requests = 0
+
+    async def stable_guest(_: str) -> Any:
+        return adapter._F2Runtime(  # type: ignore[attr-defined]
+            signed_endpoint="https://www.douyin.com/detail",
+            cookie="ttwid=guest; s_v_web_id=verify;",
+        )
+
+    class ScenarioTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            nonlocal requests
+            requests += 1
+            if outcome == "redirect":
+                return httpx.Response(
+                    302,
+                    headers={"location": "https://invalid/"},
+                    request=request,
+                )
+            if outcome == "not_found":
+                return httpx.Response(404, request=request)
+            if outcome == "rate_limited":
+                return httpx.Response(429, request=request)
+            if outcome == "server_error":
+                return httpx.Response(500, request=request)
+            if outcome == "timeout":
+                raise httpx.ReadTimeout("blocked", request=request)
+            if outcome == "connection":
+                raise httpx.ConnectError("offline", request=request)
+            status = 4 if outcome == "missing_status" else 999
+            return httpx.Response(200, json={"status_code": status}, request=request)
+
+    transport = ScenarioTransport()
+    monkeypatch.setattr(adapter, "_load_f2_runtime_and_guest", stable_guest)
+    monkeypatch.setattr(httpx, "AsyncHTTPTransport", lambda **_: transport)
+    service = ParseService(
+        resolver=_DirectResolver(),
+        parser=F2VideoParser(),
+        store=ParseStore(),
+    )
+
+    with pytest.raises(AppError) as error:
+        await service.parse("https://www.douyin.com/video/7429378937383308594")
+
+    assert error.value.code == expected_code
+    assert requests == expected_requests
+
+
+@pytest.mark.asyncio
+async def test_malformed_or_signing_failure_is_not_retried(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import douyin_downloader.f2_adapter as adapter
 
-    main_thread = threading.get_ident()
-    captured: dict[str, int] = {}
+    attempts = 0
 
-    def fail_token(_: str) -> None:
-        captured["thread"] = threading.get_ident()
-        raise RuntimeError("token failed")
+    async def malformed(_: str) -> Any:
+        nonlocal attempts
+        attempts += 1
+        raise ValueError("bad local signing configuration")
 
-    monkeypatch.setattr(adapter, "_load_f2_runtime_and_guest", fail_token)
+    monkeypatch.setattr(adapter, "_load_f2_runtime_and_guest", malformed)
+    service = ParseService(_DirectResolver(), F2VideoParser(), ParseStore())
 
-    with pytest.raises(TransientUpstreamError, match="RuntimeError"):
-        await F2VideoParser().parse("7429378937383308594")
-    assert captured["thread"] != main_thread
+    with pytest.raises(AppError) as error:
+        await service.parse("https://www.douyin.com/video/7429378937383308594")
+
+    assert error.value.code == "UPSTREAM_BLOCKED"
+    assert attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_guest_registration_404_is_blocked_and_not_retried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests = 0
+
+    class MissingGuestTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            nonlocal requests
+            requests += 1
+            return httpx.Response(404, request=request)
+
+    monkeypatch.setattr(httpx, "AsyncHTTPTransport", lambda **_: MissingGuestTransport())
+    service = ParseService(_DirectResolver(), F2VideoParser(), ParseStore())
+
+    with pytest.raises(AppError) as error:
+        await service.parse("https://www.douyin.com/video/7429378937383308594")
+
+    assert error.value.code == "UPSTREAM_BLOCKED"
+    assert requests == 1
+
+
+class _DirectResolver:
+    async def resolve(self, share_text: str) -> Any:
+        from douyin_downloader.domain import ResolvedShare
+
+        return ResolvedShare(
+            share_text,
+            "https://www.douyin.com/video/7429378937383308594",
+            "7429378937383308594",
+        )
+
+
+@pytest.mark.asyncio
+async def test_cancelling_blocked_guest_registration_leaves_no_worker_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    import douyin_downloader.f2_adapter as adapter
+
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    baseline_threads = {thread.ident for thread in threading.enumerate()}
+
+    class BlockingTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, _: httpx.Request) -> httpx.Response:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+            raise AssertionError("blocked request unexpectedly completed")
+
+    monkeypatch.setattr(httpx, "AsyncHTTPTransport", lambda **_: BlockingTransport())
+    task = asyncio.create_task(adapter.F2VideoParser().parse("7429378937383308594"))
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=1)
+
+    assert cancelled.is_set()
+    assert {thread.ident for thread in threading.enumerate()} == baseline_threads

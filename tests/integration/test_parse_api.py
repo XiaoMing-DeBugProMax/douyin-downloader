@@ -124,15 +124,15 @@ async def test_parse_requires_local_session_and_same_origin(
 @pytest.mark.asyncio
 async def test_default_app_returns_controlled_error_without_parser_adapter() -> None:
     sessions = SessionManager()
-    app = create_app(session_manager=sessions)
+    app = create_app(session_manager=sessions, expected_port=43123)
     async with AsyncClient(
         transport=ASGITransport(app=app, raise_app_exceptions=False),
-        base_url="http://127.0.0.1",
+        base_url="http://127.0.0.1:43123",
     ) as client:
         client.cookies.set("douyin_local_session", sessions.cookie_token)
         response = await client.post(
             "/api/parse",
-            headers={"origin": "http://127.0.0.1"},
+            headers={"origin": "http://127.0.0.1:43123"},
             json={"share_text": "https://v.douyin.com/example/"},
         )
 

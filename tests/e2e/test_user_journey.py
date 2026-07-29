@@ -124,11 +124,11 @@ def test_empty_unsupported_and_unknown_errors_use_chinese_copy(
 ) -> None:
     page.goto(local_app_url)
     page.locator("#parse-button").click()
-    expect(page.locator("#error")).to_have_text("请输入抖音分享文案或链接。")
+    expect(page.locator("#error")).to_have_text("没有识别到抖音链接，请粘贴完整分享文案。")
 
     page.locator("#share-text").fill("https://example.com/unsupported")
     page.locator("#parse-button").click()
-    expect(page.locator("#error")).to_have_text("仅支持抖音公开视频链接，请检查后重试。")
+    expect(page.locator("#error")).to_have_text("目前只支持抖音公开视频。")
 
     page.route("**/api/parse", lambda route: route.abort())
     page.locator("#share-text").fill("https://v.douyin.com/example/")

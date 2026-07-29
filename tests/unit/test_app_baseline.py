@@ -59,11 +59,40 @@ async def test_lifespan_composes_services_with_one_shared_client() -> None:
 
 @pytest.mark.asyncio
 async def test_production_app_rejects_test_only_host() -> None:
-    app = create_app()
+    app = create_app(expected_port=43123)
     async with AsyncClient(
         transport=ASGITransport(app=app),
         base_url="http://testserver",
     ) as client:
         response = await client.get("/api/health")
 
-    assert response.status_code == 400
+    assert response.status_code == 403
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "base_url",
+    ["http://127.0.0.1", "http://127.0.0.1:43124"],
+)
+async def test_production_app_rejects_missing_or_wrong_loopback_port(base_url: str) -> None:
+    app = create_app(expected_port=43123)
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url=base_url,
+    ) as client:
+        response = await client.get("/api/health")
+
+    assert response.status_code == 403
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("host", ["127.0.0.1", "localhost"])
+async def test_production_app_accepts_expected_loopback_authority(host: str) -> None:
+    app = create_app(expected_port=43123)
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url=f"http://{host}:43123",
+    ) as client:
+        response = await client.get("/api/health")
+
+    assert response.status_code == 200

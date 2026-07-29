@@ -30,7 +30,7 @@ class DeterministicResolver:
         if "unsupported" in share_text:
             raise AppError(
                 "UNSUPPORTED_URL",
-                "仅支持抖音公开视频链接，请检查后重试。",
+                "目前只支持抖音公开视频。",
                 400,
             )
         return ResolvedShare(
@@ -67,6 +67,13 @@ def media_transport(request: httpx.Request) -> httpx.Response:
 def _local_app_server() -> Iterator[tuple[str, SessionManager]]:
     sessions = SessionManager()
     media_client = httpx.AsyncClient(transport=httpx.MockTransport(media_transport))
+
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_socket.bind(("127.0.0.1", 0))
+    server_socket.listen(128)
+    port = int(server_socket.getsockname()[1])
+
     app = create_app(
         services=AppServices(
             parse_service=ParseService(
@@ -77,14 +84,9 @@ def _local_app_server() -> Iterator[tuple[str, SessionManager]]:
             media_client=media_client,
         ),
         session_manager=sessions,
+        expected_port=port,
         testing=True,
     )
-
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_socket.bind(("127.0.0.1", 0))
-    server_socket.listen(128)
-    port = int(server_socket.getsockname()[1])
 
     config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning", access_log=False)
     server = uvicorn.Server(config)

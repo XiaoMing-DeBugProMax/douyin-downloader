@@ -182,7 +182,7 @@ form.addEventListener("submit", async (event) => {
 
   const input = shareText.value.trim();
   if (!input) {
-    showError("请输入抖音分享文案或链接。");
+    showError("没有识别到抖音链接，请粘贴完整分享文案。");
     shareText.focus();
     return;
   }

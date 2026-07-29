@@ -5,9 +5,9 @@ from uuid import uuid4
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
-from starlette.middleware.trustedhost import TrustedHostMiddleware
+from starlette.middleware.base import RequestResponseEndpoint
 
 from douyin_downloader.domain import AppError
 from douyin_downloader.f2_adapter import F2VideoParser
@@ -47,21 +47,37 @@ def create_app(
     *,
     services: AppServices | None = None,
     session_manager: SessionManager | None = None,
+    expected_port: int | None = None,
     testing: bool = False,
 ) -> FastAPI:
+    if expected_port is None and not testing:
+        raise ValueError("production applications require an expected loopback port")
+    if expected_port is not None and not 1 <= expected_port <= 65535:
+        raise ValueError("expected loopback port must be between 1 and 65535")
+
     app = FastAPI(title="抖音视频下载", docs_url=None, redoc_url=None)
     app.router.lifespan_context = _application_lifespan
     sessions = session_manager if isinstance(session_manager, SessionManager) else SessionManager()
     app.state.services = services
     app.state.session_manager = sessions
     app.state.instance_id = uuid4().hex
-    allowed_hosts = ["127.0.0.1", "localhost"]
-    if testing:
-        allowed_hosts.append("testserver")
-    app.add_middleware(
-        TrustedHostMiddleware,
-        allowed_hosts=allowed_hosts,
+    allowed_authorities = (
+        {f"127.0.0.1:{expected_port}", f"localhost:{expected_port}"}
+        if expected_port is not None
+        else set()
     )
+    if testing:
+        allowed_authorities.add("testserver")
+
+    @app.middleware("http")
+    async def require_expected_authority(
+        request: Request,
+        call_next: RequestResponseEndpoint,
+    ) -> Response:
+        if request.headers.get("host") not in allowed_authorities:
+            return Response(status_code=403)
+        return await call_next(request)
+
     app.mount("/assets", StaticFiles(directory=STATIC_DIR), name="assets")
 
     @app.exception_handler(AppError)
