@@ -65,6 +65,54 @@ def test_rejects_malformed_urls_with_stable_message(value: str) -> None:
     assert error.value.message == "链接格式不正确，请粘贴有效的 HTTPS 抖音分享链接。"
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "https://v.douyin.com/video/7429378937383308594\x00",
+        "https://v.douyin.com/video/7429378937383308594\x7f",
+        "https://v.douyin.com/video/7429378937383308594\ud800",
+    ],
+    ids=["nul", "del", "isolated-surrogate"],
+)
+def test_rejects_transport_invalid_urls_with_stable_message(value: str) -> None:
+    with pytest.raises(AppError) as error:
+        extract_share_url(value)
+
+    assert error.value.code == "INVALID_INPUT"
+    assert error.value.status_code == 400
+    assert error.value.message == "链接格式不正确，请粘贴有效的 HTTPS 抖音分享链接。"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "value",
+    [
+        "https://v.douyin.com/video/7429378937383308594\x00",
+        "https://v.douyin.com/video/7429378937383308594\x7f",
+        "https://v.douyin.com/video/7429378937383308594\ud800",
+    ],
+    ids=["nul", "del", "isolated-surrogate"],
+)
+async def test_rejects_transport_invalid_direct_video_urls_before_requests(
+    value: str,
+) -> None:
+    requests: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(str(request.url))
+        return httpx.Response(500)
+
+    resolver = ShareResolver(httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+
+    with pytest.raises(AppError) as error:
+        await resolver.resolve(value)
+
+    assert error.value.code == "INVALID_INPUT"
+    assert error.value.status_code == 400
+    assert error.value.message == "链接格式不正确，请粘贴有效的 HTTPS 抖音分享链接。"
+    assert requests == []
+
+
 def test_rejects_https_non_douyin_url_with_platform_message() -> None:
     with pytest.raises(AppError) as error:
         extract_share_url("https://www.kuaishou.com/short-video/example")
@@ -143,6 +191,36 @@ async def test_rejects_unsafe_redirect_before_requesting_target(
 
     assert error.value.code == expected_code
     assert error.value.message == expected_message
+    assert requests == ["https://v.douyin.com/start/"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "location",
+    [
+        "http:v.douyin.com",
+        "https://",
+        "https:///video/1",
+    ],
+    ids=["scheme-without-authority", "empty-https-authority", "https-empty-host"],
+)
+async def test_rejects_malformed_redirect_location_before_requesting_target(
+    location: str,
+) -> None:
+    requests: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(str(request.url))
+        return httpx.Response(302, headers={"location": location})
+
+    resolver = ShareResolver(httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+
+    with pytest.raises(AppError) as error:
+        await resolver.resolve("https://v.douyin.com/start/")
+
+    assert error.value.code == "INVALID_INPUT"
+    assert error.value.status_code == 400
+    assert error.value.message == "链接格式不正确，请粘贴有效的 HTTPS 抖音分享链接。"
     assert requests == ["https://v.douyin.com/start/"]
 
 

@@ -16,6 +16,7 @@ ENTRY_HOSTS = frozenset(
 )
 HTTP_URL_MARKER = re.compile(r"https?://", re.IGNORECASE)
 URL_PATTERN = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+SCHEME_PREFIX = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*:")
 VIDEO_PATTERN = re.compile(r"/(?:share/)?video/(\d+)")
 TRAILING_PUNCTUATION = ".,;:!?)]}，。！；：、】【】》〉」』”"
 
@@ -33,13 +34,25 @@ def _unsupported_url(message: str = _UNSUPPORTED_URL_MESSAGE) -> AppError:
     return AppError("UNSUPPORTED_URL", message, 400)
 
 
+def _has_unsafe_url_characters(url: str) -> bool:
+    return any(
+        ord(character) <= 0x1F
+        or ord(character) == 0x7F
+        or 0xD800 <= ord(character) <= 0xDFFF
+        for character in url
+    )
+
+
 def _url_parts(url: str) -> tuple[str, str, int | None, bool]:
+    if _has_unsafe_url_characters(url):
+        raise _invalid_input(_MALFORMED_URL_MESSAGE)
     try:
+        httpx.URL(url)
         parsed = urlsplit(url)
         hostname = parsed.hostname
         port = parsed.port
         has_credentials = parsed.username is not None or parsed.password is not None
-    except ValueError as error:
+    except (httpx.InvalidURL, UnicodeError, ValueError) as error:
         raise _invalid_input(_MALFORMED_URL_MESSAGE) from error
     if not parsed.netloc or hostname is None:
         raise _invalid_input(_MALFORMED_URL_MESSAGE)
@@ -57,6 +70,15 @@ def _validated_url(url: str) -> str:
     if has_credentials or port not in {None, 443}:
         raise _unsupported_url()
     return url
+
+
+def _redirect_url(current: str, location: str) -> str:
+    if SCHEME_PREFIX.match(location) or location.startswith("//"):
+        return _validated_url(location)
+    try:
+        return _validated_url(urljoin(current, location))
+    except (UnicodeError, ValueError) as error:
+        raise _invalid_input(_MALFORMED_URL_MESSAGE) from error
 
 
 def extract_share_url(text: str) -> str:
@@ -90,6 +112,8 @@ class ShareResolver:
                     follow_redirects=False,
                     headers={"User-Agent": "Mozilla/5.0", "Accept": "text/html,*/*"},
                 )
+            except httpx.InvalidURL as error:
+                raise _invalid_input(_MALFORMED_URL_MESSAGE) from error
             except httpx.RemoteProtocolError as error:
                 if (
                     str(error).startswith("Invalid URL in location header:")
@@ -108,7 +132,7 @@ class ShareResolver:
             location = response.headers.get("location")
             if location is None:
                 break
-            current = _validated_url(urljoin(current, location))
+            current = _redirect_url(current, location)
         match = VIDEO_PATTERN.search(urlsplit(current).path)
         if match:
             return ResolvedShare(source, current, match.group(1))
