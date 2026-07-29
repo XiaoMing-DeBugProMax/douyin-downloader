@@ -299,6 +299,7 @@ def test_close_during_blocked_guest_registration_cleans_all_runtime_resources(
     opened_urls: list[str] = []
     running_servers: list[RunningServer] = []
     parse_errors: list[BaseException] = []
+    shutdown_started_at: list[float] = []
 
     class BlockingTransport(httpx.AsyncBaseTransport):
         def __init__(self, *args: object, retries: int = 0, **kwargs: object) -> None:
@@ -356,8 +357,8 @@ def test_close_during_blocked_guest_registration_cleans_all_runtime_resources(
                 daemon=True,
             ).start()
             assert blocked.wait(3)
+            shutdown_started_at.append(time.monotonic())
 
-    started_at = time.monotonic()
     result = main(
         runtime_store=runtime_store,
         server_factory=RecordingServer,
@@ -365,10 +366,11 @@ def test_close_during_blocked_guest_registration_cleans_all_runtime_resources(
         browser_open=opened_urls.append,
         show_error=lambda *_: pytest.fail("shutdown path must not show an error"),
     )
-    elapsed = time.monotonic() - started_at
+    assert len(shutdown_started_at) == 1
+    shutdown_elapsed = time.monotonic() - shutdown_started_at[0]
 
     assert result == 0
-    assert elapsed < 3
+    assert shutdown_elapsed < 2.5
     assert cancelled.wait(1)
     assert parse_finished.wait(1)
     assert len(running_servers) == 1
