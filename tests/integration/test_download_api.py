@@ -315,3 +315,63 @@ async def test_failed_media_open_logs_anonymous_error_with_zero_bytes(
     assert logged[0]["error_code"] == "DOWNLOAD_FAILED"
     assert logged[0]["bytes_streamed"] == 0
     assert "secret" not in repr(logged)
+
+
+@pytest.mark.asyncio
+async def test_stream_elapsed_includes_connection_and_headers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logged: list[dict[str, object]] = []
+    clock = [0.0]
+
+    class FakeLogger:
+        def info(self, _: str, *, extra: dict[str, object]) -> None:
+            logged.append(extra)
+
+    class TimedStream(httpx.AsyncByteStream):
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            clock[0] = 7.0
+            yield b"payload"
+
+    def transport(_: httpx.Request) -> httpx.Response:
+        clock[0] = 5.0
+        return httpx.Response(
+            200,
+            headers={"content-type": "video/mp4"},
+            stream=TimedStream(),
+        )
+
+    monkeypatch.setattr(media_module, "_LOGGER", FakeLogger())
+    monkeypatch.setattr(media_module.time, "monotonic", lambda: clock[0])
+
+    async with AsyncClient(transport=httpx.MockTransport(transport)) as client:
+        upstream = await open_upstream(
+            client,
+            "https://v95-web-sz.douyinvod.com/video.mp4",
+            "video",
+        )
+        assert b"".join([chunk async for chunk in upstream.iter_bytes()]) == b"payload"
+
+    assert logged[0]["elapsed_ms"] == 7000
+
+
+@pytest.mark.asyncio
+async def test_invalid_media_url_logs_anonymous_failure_before_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logged: list[dict[str, object]] = []
+
+    class FakeLogger:
+        def info(self, _: str, *, extra: dict[str, object]) -> None:
+            logged.append(extra)
+
+    monkeypatch.setattr(media_module, "_LOGGER", FakeLogger())
+    async with AsyncClient() as client:
+        with pytest.raises(AppError):
+            await open_upstream(client, "https://attacker.invalid/private", "video")
+
+    assert len(logged) == 1
+    assert logged[0]["operation"] == "download"
+    assert logged[0]["error_code"] == "DOWNLOAD_FAILED"
+    assert logged[0]["bytes_streamed"] == 0
+    assert "attacker" not in repr(logged)

@@ -2,11 +2,7 @@
 
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_data_files
-
-
 PROJECT_ROOT = Path(SPECPATH)
-F2_DATA = collect_data_files("f2", include_py_files=False)
 STATIC_DATA = [
     (
         str(PROJECT_ROOT / "src" / "douyin_downloader" / "web" / "static"),
@@ -28,7 +24,7 @@ a = Analysis(
     [str(PROJECT_ROOT / "src" / "douyin_downloader" / "__main__.py")],
     pathex=[str(PROJECT_ROOT / "src")],
     binaries=[],
-    datas=STATIC_DATA + F2_DATA,
+    datas=STATIC_DATA,
     hiddenimports=HIDDEN_IMPORTS,
     hookspath=[],
     hooksconfig={},

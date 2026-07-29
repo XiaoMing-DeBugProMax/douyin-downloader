@@ -214,6 +214,31 @@ def test_main_reports_startup_failure_in_chinese_and_returns_nonzero(
     assert errors == [("启动失败", "本地服务启动失败，请重试。")]
 
 
+def test_main_reports_logging_permission_failure_without_starting_server(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "LocalAppData"))
+    errors: list[tuple[str, str]] = []
+    starts: list[str] = []
+
+    def fail_logging() -> None:
+        raise PermissionError("private filesystem detail")
+
+    monkeypatch.setattr(launcher_module, "configure_logging", fail_logging)
+
+    result = main(
+        runtime_store=RuntimeStore(),
+        server_factory=lambda _: starts.append("started"),  # type: ignore[arg-type,return-value]
+        browser_open=lambda _: pytest.fail("logging failure must not open a browser"),
+        show_error=lambda title, message: errors.append((title, message)),
+    )
+
+    assert result == 1
+    assert starts == []
+    assert errors == [("启动失败", "无法访问当前用户的本地应用目录。")]
+
+
 def test_python_module_entrypoint_exits_with_main_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

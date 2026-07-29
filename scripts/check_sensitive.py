@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import re
 import shutil
 import subprocess
@@ -51,6 +52,23 @@ def scan_text(path: str, text: str) -> list[Finding]:
     return findings
 
 
+def scan_artifact_entry(name: str, content: bytes) -> list[Finding]:
+    normalized_name = name.replace("\\", "/")
+    findings: list[Finding] = []
+    if normalized_name.casefold().endswith("/test.yaml") or normalized_name.casefold() == (
+        "test.yaml"
+    ):
+        findings.append(Finding(f"artifact/{normalized_name}", 0, "artifact_forbidden_test_data"))
+    if b"\0" in content:
+        return findings
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError:
+        return findings
+    findings.extend(scan_text(f"artifact/{normalized_name}", text))
+    return findings
+
+
 def _repository_paths(project_root: Path) -> list[str]:
     git = shutil.which("git")
     if git is None:
@@ -87,15 +105,48 @@ def scan_repository(project_root: Path) -> list[Finding]:
     return findings
 
 
+def scan_artifact(path: Path) -> list[Finding]:
+    from PyInstaller.archive.readers import CArchiveReader
+
+    if not path.is_file():
+        return [Finding(path.name, 0, "artifact_missing")]
+    try:
+        archive = CArchiveReader(str(path))
+    except Exception:
+        return [Finding(path.name, 0, "artifact_unreadable")]
+
+    findings: list[Finding] = []
+    for name in sorted(archive.toc):
+        try:
+            content = archive.extract(name)
+        except Exception:
+            findings.append(Finding(f"artifact/{name}", 0, "artifact_entry_unreadable"))
+            continue
+        if isinstance(content, bytes):
+            findings.extend(scan_artifact_entry(name, content))
+    return findings
+
+
 def main() -> int:
+    parser = argparse.ArgumentParser(description="Scan repository and packaged artifact")
+    parser.add_argument("--artifact", type=Path)
+    args = parser.parse_args()
     project_root = Path(__file__).resolve().parent.parent
     findings = scan_repository(project_root)
+    if args.artifact is not None:
+        artifact_path = (
+            args.artifact
+            if args.artifact.is_absolute()
+            else project_root / args.artifact
+        )
+        findings.extend(scan_artifact(artifact_path))
     if findings:
         for finding in findings:
             print(finding.safe_summary())
         print(f"FAIL sensitive_boundary findings={len(findings)}")
         return 1
-    print("PASS sensitive_boundary findings=0")
+    scope = "repository+artifact" if args.artifact is not None else "repository"
+    print(f"PASS sensitive_boundary scope={scope} findings=0")
     return 0
 
 

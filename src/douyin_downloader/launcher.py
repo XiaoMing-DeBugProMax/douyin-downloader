@@ -315,7 +315,7 @@ def main(
     try:
         logger = configure_logging()
         store = runtime_store if runtime_store is not None else RuntimeStore()
-    except RuntimeError:
+    except (OSError, RuntimeError):
         error_dialog("启动失败", "无法访问当前用户的本地应用目录。")
         return 1
 

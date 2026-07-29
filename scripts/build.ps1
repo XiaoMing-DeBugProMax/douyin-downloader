@@ -33,6 +33,7 @@ try {
     if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
         throw "PyInstaller did not create the expected executable."
     }
+    Invoke-Python @((Join-Path $PSScriptRoot 'check_sensitive.py'), '--artifact', $exe)
     Get-FileHash -LiteralPath $exe -Algorithm SHA256
 }
 finally {

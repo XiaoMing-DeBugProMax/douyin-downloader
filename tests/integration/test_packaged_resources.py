@@ -38,3 +38,16 @@ def test_packaged_resources_resolve_below_meipass(
     for name in STATIC_NAMES:
         assert static_resource_path(name) == static_dir / name
     assert app_icon_path() == icon
+
+
+def test_packaging_manifest_never_collects_f2_dependency_data() -> None:
+    project_root = Path(__file__).parents[2]
+    manifest = (project_root / "douyin_downloader.spec").read_text(encoding="utf-8")
+    adapter = (
+        project_root / "src" / "douyin_downloader" / "f2_adapter.py"
+    ).read_text(encoding="utf-8")
+
+    assert "collect_data_files" not in manifest
+    assert "F2_DATA" not in manifest
+    assert "importlib.resources" not in adapter
+    assert "conf.yaml" not in adapter

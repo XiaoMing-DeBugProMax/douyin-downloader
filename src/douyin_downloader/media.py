@@ -54,6 +54,7 @@ def safe_video_filename(video: ParsedVideo) -> str:
 class UpstreamStream:
     response: httpx.Response
     operation: Literal["cover", "download"]
+    started_at: float
     chunk_size: int = 256 * 1024
 
     @property
@@ -61,7 +62,6 @@ class UpstreamStream:
         return self.response.headers["content-type"].split(";", maxsplit=1)[0]
 
     async def iter_bytes(self) -> AsyncIterator[bytes]:
-        started_at = time.monotonic()
         bytes_streamed = 0
         error_code = "-"
         try:
@@ -80,7 +80,7 @@ class UpstreamStream:
                     _LOGGER,
                     operation=self.operation,
                     error_code=error_code,
-                    elapsed_ms=int((time.monotonic() - started_at) * 1000),
+                    elapsed_ms=int((time.monotonic() - self.started_at) * 1000),
                     bytes_streamed=bytes_streamed,
                 )
 
@@ -92,13 +92,22 @@ async def open_upstream(
 ) -> UpstreamStream:
     started_at = time.monotonic()
     operation: Literal["cover", "download"] = "download" if kind == "video" else "cover"
-    request = client.build_request(
-        "GET",
-        validate_media_url(url, kind),
-        headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.douyin.com/"},
-    )
     try:
+        request = client.build_request(
+            "GET",
+            validate_media_url(url, kind),
+            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.douyin.com/"},
+        )
         response = await client.send(request, stream=True, follow_redirects=False)
+    except AppError:
+        log_operation(
+            _LOGGER,
+            operation=operation,
+            error_code="DOWNLOAD_FAILED",
+            elapsed_ms=int((time.monotonic() - started_at) * 1000),
+            bytes_streamed=0,
+        )
+        raise
     except httpx.HTTPError as error:
         log_operation(
             _LOGGER,
@@ -120,7 +129,7 @@ async def open_upstream(
             bytes_streamed=0,
         )
         raise _download_error()
-    return UpstreamStream(response, operation)
+    return UpstreamStream(response, operation, started_at)
 
 
 async def open_first_available(

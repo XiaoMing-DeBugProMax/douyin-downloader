@@ -18,6 +18,16 @@ USER_AGENT = (
     "Chrome/130.0.0.0 Safari/537.36"
 )
 POST_DETAIL_ENDPOINT = "https://www.douyin.com/aweme/v1/web/aweme/detail/"
+TTWID_REGISTER_ENDPOINT = "https://ttwid.bytedance.com/ttwid/union/register/"
+TTWID_REGISTER_PAYLOAD = {
+    "region": "cn",
+    "aid": 1768,
+    "needFid": False,
+    "service": "www.ixigua.com",
+    "migrate_info": {"ticket": "", "source": "node"},
+    "cbUrlProtocol": "https",
+    "union": True,
+}
 
 
 def _prevent_f2_default_file_logging() -> None:
@@ -125,21 +135,6 @@ def _post_detail_filter(payload: dict[str, object]) -> _PostDetailView:
     )
 
 
-def _load_douyin_config() -> dict[str, Any]:
-    from importlib.resources import files
-
-    import yaml  # type: ignore[import-untyped]
-
-    config_path = files("f2").joinpath("conf").joinpath("conf.yaml")
-    loaded: Any = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    if not isinstance(loaded, dict):
-        raise RuntimeError("invalid f2 config")
-    douyin = _nested(loaded, "f2", "douyin")
-    if not isinstance(douyin, dict):
-        raise RuntimeError("invalid f2 Douyin config")
-    return douyin
-
-
 def _generate_verify_fp() -> str:
     base = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
     milliseconds = int(round(time.time() * 1000))
@@ -178,58 +173,30 @@ def _sign_post_detail(params: dict[str, object]) -> str:
 
 def _load_f2_runtime_and_guest(aweme_id: str) -> _F2Runtime:
     _prevent_f2_default_file_logging()
-    douyin_config = _load_douyin_config()
-    ms_config = douyin_config.get("msToken")
-    ttwid_config = douyin_config.get("ttwid")
-    headers_config = douyin_config.get("headers")
-    if not all(isinstance(value, dict) for value in (ms_config, ttwid_config, headers_config)):
-        raise RuntimeError("invalid f2 guest config")
-    assert isinstance(ms_config, dict)
-    assert isinstance(ttwid_config, dict)
-    assert isinstance(headers_config, dict)
-    token_headers = {
-        "Content-Type": "application/json; charset=utf-8",
-        "User-Agent": str(headers_config.get("User-Agent", USER_AGENT)),
-    }
 
     # f2's TokenManager hard-codes BaseCrawler's default of five retries. Read
-    # its pinned package configuration directly and issue each guest request
-    # once through an explicit no-retry, no-environment transport.
+    # only the audited guest registration contract and issue it once through
+    # an explicit no-retry, no-environment transport. The detail endpoint
+    # accepts an empty guest msToken, so no opaque f2 config payload is needed.
     with httpx.Client(
         transport=httpx.HTTPTransport(retries=0),
         timeout=20,
         trust_env=False,
     ) as client:
-        ms_payload = json.dumps(
-            {
-                "magic": ms_config["magic"],
-                "version": ms_config["version"],
-                "dataType": ms_config["dataType"],
-                "strData": ms_config["strData"],
-                "tspFromClient": int(time.time() * 1000),
-            }
-        )
-        ms_response = client.post(
-            str(ms_config["url"]),
-            content=ms_payload,
-            headers=token_headers,
-        )
-        ms_response.raise_for_status()
-        ms_token = ms_response.cookies.get("msToken")
-        if ms_token is None or len(ms_token) not in {120, 128}:
-            raise RuntimeError("invalid guest msToken")
-
         ttwid_response = client.post(
-            str(ttwid_config["url"]),
-            content=str(ttwid_config["data"]),
-            headers=token_headers,
+            TTWID_REGISTER_ENDPOINT,
+            content=json.dumps(TTWID_REGISTER_PAYLOAD, separators=(",", ":")),
+            headers={
+                "Content-Type": "application/json; charset=utf-8",
+                "User-Agent": USER_AGENT,
+            },
         )
         ttwid_response.raise_for_status()
         ttwid = ttwid_response.cookies.get("ttwid")
         if ttwid is None:
             raise RuntimeError("invalid guest ttwid")
 
-    params = _build_post_detail_params(aweme_id, ms_token)
+    params = _build_post_detail_params(aweme_id, "")
     return _F2Runtime(
         signed_endpoint=_sign_post_detail(params),
         cookie=f"ttwid={ttwid}; s_v_web_id={_generate_verify_fp()};",

@@ -1,4 +1,4 @@
-from scripts.check_sensitive import scan_text
+from scripts.check_sensitive import scan_artifact_entry, scan_text
 
 
 def test_sensitive_gate_detects_concrete_values_without_echoing_them() -> None:
@@ -52,3 +52,27 @@ def test_sensitive_gate_rejects_real_short_share_url_only_in_committed_report() 
         "tests/unit/test_example.py",
         "sample=https://v.douyin.com/example/",
     )
+
+
+def test_artifact_gate_rejects_dependency_test_data_and_secret_content() -> None:
+    long_value = "ABCDEFGHIJKLMNOPQRSTUVWXYZ" + "123456"
+
+    name_findings = scan_artifact_entry("f2/conf/test.yaml", b"safe: true")
+    content_findings = scan_artifact_entry(
+        "f2/conf/settings.yaml",
+        f'cookie: "ttwid={long_value}"'.encode(),
+    )
+
+    assert [finding.rule for finding in name_findings] == [
+        "artifact_forbidden_test_data"
+    ]
+    assert [finding.rule for finding in content_findings] == ["concrete_ttwid"]
+    assert long_value not in content_findings[0].safe_summary()
+
+
+def test_artifact_gate_allows_required_code_and_sanitized_assets() -> None:
+    assert scan_artifact_entry("f2/utils/abogus.pyc", b"\0compiled-code") == []
+    assert scan_artifact_entry(
+        "douyin_downloader/web/static/app.js",
+        b"const launch_token = sessions.issue_launch_token();",
+    ) == []
