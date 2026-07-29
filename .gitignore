@@ -1,7 +1,13 @@
 .superpowers/
 .worktrees/
+.agents/
+.codex/
+.idea/
+.vscode/
 logs/
 *.log
+Thumbs.db
+.DS_Store
 
 __pycache__/
 *.py[cod]
@@ -14,6 +20,21 @@ htmlcov/
 .venv/
 venv/
 .env
+.env.*
+!.env.example
 
 build/
 dist/
+downloads/
+*.exe
+*.mp4
+*.mkv
+*.mov
+*.webm
+*.part
+
+# Local development instructions and source-research notes
+AGENTS.md
+AI项目开发总提示词.md
+1.txt
+2.txt
