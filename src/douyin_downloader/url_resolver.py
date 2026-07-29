@@ -14,37 +14,62 @@ ENTRY_HOSTS = frozenset(
         "www.iesdouyin.com",
     }
 )
-URL_PATTERN = re.compile(r"https?://[^\s<>\"']+")
+HTTP_URL_MARKER = re.compile(r"https?://", re.IGNORECASE)
+URL_PATTERN = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 VIDEO_PATTERN = re.compile(r"/(?:share/)?video/(\d+)")
 TRAILING_PUNCTUATION = ".,;:!?)]}，。！；：、】【】》〉」』”"
 
+_MISSING_LINK_MESSAGE = "没有识别到抖音链接，请粘贴完整分享文案。"
+_MALFORMED_URL_MESSAGE = "链接格式不正确，请粘贴有效的 HTTPS 抖音分享链接。"
+_UNSUPPORTED_URL_MESSAGE = "目前只支持抖音公开视频。"
+_HTTPS_ONLY_MESSAGE = "仅支持 HTTPS 抖音公开视频链接。"
 
-def _unsupported_url() -> AppError:
-    return AppError("UNSUPPORTED_URL", "目前只支持抖音公开视频。", 400)
+
+def _invalid_input(message: str) -> AppError:
+    return AppError("INVALID_INPUT", message, 400)
+
+
+def _unsupported_url(message: str = _UNSUPPORTED_URL_MESSAGE) -> AppError:
+    return AppError("UNSUPPORTED_URL", message, 400)
+
+
+def _url_parts(url: str) -> tuple[str, str, int | None, bool]:
+    try:
+        parsed = urlsplit(url)
+        hostname = parsed.hostname
+        port = parsed.port
+        has_credentials = parsed.username is not None or parsed.password is not None
+    except ValueError as error:
+        raise _invalid_input(_MALFORMED_URL_MESSAGE) from error
+    if not parsed.netloc or hostname is None:
+        raise _invalid_input(_MALFORMED_URL_MESSAGE)
+    return parsed.scheme.lower(), hostname.lower(), port, has_credentials
 
 
 def _validated_url(url: str) -> str:
-    parsed = urlsplit(url)
-    if parsed.scheme not in {"http", "https"} or parsed.hostname not in ENTRY_HOSTS:
+    scheme, hostname, port, has_credentials = _url_parts(url)
+    if hostname not in ENTRY_HOSTS:
         raise _unsupported_url()
-    if parsed.username or parsed.password:
+    if scheme != "https":
+        if scheme == "http":
+            raise _unsupported_url(_HTTPS_ONLY_MESSAGE)
         raise _unsupported_url()
-    try:
-        port = parsed.port
-    except ValueError as error:
-        raise _unsupported_url() from error
-    default_port = 80 if parsed.scheme == "http" else 443
-    if port not in {None, default_port}:
+    if has_credentials or port not in {None, 443}:
         raise _unsupported_url()
     return url
 
 
 def extract_share_url(text: str) -> str:
     if not 1 <= len(text) <= 2000:
-        raise AppError("INVALID_INPUT", "没有识别到抖音链接，请粘贴完整分享文案。", 400)
+        raise _invalid_input(_MISSING_LINK_MESSAGE)
     match = URL_PATTERN.search(text)
     if match is None:
-        raise AppError("INVALID_INPUT", "没有识别到抖音链接，请粘贴完整分享文案。", 400)
+        message = (
+            _MALFORMED_URL_MESSAGE
+            if HTTP_URL_MARKER.search(text)
+            else _MISSING_LINK_MESSAGE
+        )
+        raise _invalid_input(message)
     return _validated_url(match.group(0).rstrip(TRAILING_PUNCTUATION))
 
 
@@ -65,6 +90,8 @@ class ShareResolver:
                     follow_redirects=False,
                     headers={"User-Agent": "Mozilla/5.0", "Accept": "text/html,*/*"},
                 )
+            except httpx.RemoteProtocolError as error:
+                raise _invalid_input(_MALFORMED_URL_MESSAGE) from error
             except httpx.HTTPError as error:
                 raise TransientUpstreamError(type(error).__name__) from error
             if response.status_code >= 500:
