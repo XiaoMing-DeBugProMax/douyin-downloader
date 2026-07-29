@@ -91,7 +91,12 @@ class ShareResolver:
                     headers={"User-Agent": "Mozilla/5.0", "Accept": "text/html,*/*"},
                 )
             except httpx.RemoteProtocolError as error:
-                raise _invalid_input(_MALFORMED_URL_MESSAGE) from error
+                if (
+                    str(error).startswith("Invalid URL in location header:")
+                    and isinstance(error.__context__, httpx.InvalidURL)
+                ):
+                    raise _invalid_input(_MALFORMED_URL_MESSAGE) from error
+                raise TransientUpstreamError(type(error).__name__) from error
             except httpx.HTTPError as error:
                 raise TransientUpstreamError(type(error).__name__) from error
             if response.status_code >= 500:

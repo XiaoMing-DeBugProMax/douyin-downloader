@@ -1,7 +1,7 @@
 import httpx
 import pytest
 
-from douyin_downloader.domain import AppError
+from douyin_downloader.domain import AppError, TransientUpstreamError
 from douyin_downloader.url_resolver import ShareResolver, extract_share_url
 
 
@@ -144,6 +144,19 @@ async def test_rejects_unsafe_redirect_before_requesting_target(
     assert error.value.code == expected_code
     assert error.value.message == expected_message
     assert requests == ["https://v.douyin.com/start/"]
+
+
+@pytest.mark.asyncio
+async def test_treats_non_location_remote_protocol_error_as_transient() -> None:
+    def handler(_: httpx.Request) -> httpx.Response:
+        raise httpx.RemoteProtocolError("Server disconnected")
+
+    resolver = ShareResolver(httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+
+    with pytest.raises(TransientUpstreamError) as error:
+        await resolver.resolve("https://v.douyin.com/start/")
+
+    assert str(error.value) == "RemoteProtocolError"
 
 
 @pytest.mark.asyncio
