@@ -145,6 +145,16 @@ def test_main_runs_new_instance_in_order_and_always_stops(
     events: list[str] = []
     running = FakeRunningServer()
 
+    class FakeLogger:
+        def info(self, _: str, *, extra: dict[str, object]) -> None:
+            events.append(f"log:{extra['operation']}")
+
+    def configure_logging() -> FakeLogger:
+        events.append("logging")
+        return FakeLogger()
+
+    monkeypatch.setattr(launcher_module, "configure_logging", configure_logging)
+
     def stop() -> None:
         running.stop_calls += 1
         events.append("stop")
@@ -169,7 +179,15 @@ def test_main_runs_new_instance_in_order_and_always_stops(
     )
 
     assert result == 0
-    assert events == ["start", "browser", "window", "stop"]
+    assert events == [
+        "logging",
+        "start",
+        "log:application_start",
+        "browser",
+        "window",
+        "stop",
+        "log:application_stop",
+    ]
     assert running.stop_calls == 1
 
 

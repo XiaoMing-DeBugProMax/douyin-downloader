@@ -1,6 +1,5 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from pathlib import Path
 from uuid import uuid4
 
 import httpx
@@ -13,12 +12,13 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from douyin_downloader.domain import AppError
 from douyin_downloader.f2_adapter import F2VideoParser
 from douyin_downloader.parse_service import ParseService
+from douyin_downloader.resources import static_directory, static_resource_path
 from douyin_downloader.session import COOKIE_NAME, SessionManager
 from douyin_downloader.store import ParseStore
 from douyin_downloader.url_resolver import ShareResolver
 from douyin_downloader.web.routes import AppServices, build_router
 
-STATIC_DIR = Path(__file__).with_name("static")
+STATIC_DIR = static_directory()
 
 
 @asynccontextmanager
@@ -109,7 +109,7 @@ def create_app(
                 path="/",
             )
             return response
-        return FileResponse(STATIC_DIR / "index.html")
+        return FileResponse(static_resource_path("index.html"))
 
     app.include_router(build_router())
 

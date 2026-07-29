@@ -15,6 +15,7 @@ from urllib.parse import urlencode
 import httpx
 import uvicorn
 
+from douyin_downloader.logging_config import configure_logging, log_operation
 from douyin_downloader.runtime import RuntimeInfo, RuntimeStore, WindowsInstanceMutex
 from douyin_downloader.session import SessionManager
 from douyin_downloader.web.app import create_app
@@ -312,6 +313,7 @@ def main(
     opener = browser_open if browser_open is not None else webbrowser.open
     error_dialog = show_error if show_error is not None else messagebox.showerror
     try:
+        logger = configure_logging()
         store = runtime_store if runtime_store is not None else RuntimeStore()
     except RuntimeError:
         error_dialog("启动失败", "无法访问当前用户的本地应用目录。")
@@ -330,22 +332,48 @@ def main(
 
     def start_new_instance() -> int:
         nonlocal mutex_safe_to_close
+        started_at = time.monotonic()
         try:
             running_server = make_server(store).start()
         except (OSError, RuntimeError) as error:
+            log_operation(
+                logger,
+                operation="application_start",
+                error_code="START_FAILED",
+                elapsed_ms=int((time.monotonic() - started_at) * 1000),
+                bytes_streamed=0,
+            )
             if isinstance(error, ServerStartError) and not error.thread_stopped:
                 mutex_safe_to_close = False
             error_dialog("启动失败", "本地服务启动失败，请重试。")
             return 1
+        log_operation(
+            logger,
+            operation="application_start",
+            error_code="-",
+            elapsed_ms=int((time.monotonic() - started_at) * 1000),
+            bytes_streamed=0,
+        )
         try:
             open_running_browser(running_server, opener)
             make_window(running_server, opener).run()
         finally:
+            stopped_at = time.monotonic()
+            stop_error_code = "-"
             try:
                 running_server.stop()
             except RuntimeError:
                 mutex_safe_to_close = False
+                stop_error_code = "STOP_FAILED"
                 raise
+            finally:
+                log_operation(
+                    logger,
+                    operation="application_stop",
+                    error_code=stop_error_code,
+                    elapsed_ms=int((time.monotonic() - stopped_at) * 1000),
+                    bytes_streamed=0,
+                )
         return 0
 
     try:

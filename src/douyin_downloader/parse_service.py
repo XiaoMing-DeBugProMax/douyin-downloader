@@ -1,4 +1,6 @@
 import asyncio
+import logging
+import time
 from typing import Protocol
 
 from douyin_downloader.domain import (
@@ -8,7 +10,10 @@ from douyin_downloader.domain import (
     ResolvedShare,
     TransientUpstreamError,
 )
+from douyin_downloader.logging_config import log_operation
 from douyin_downloader.store import ParseStore
+
+_LOGGER = logging.getLogger("douyin_downloader")
 
 
 class Resolver(Protocol):
@@ -26,19 +31,37 @@ class ParseService:
         self.store = store
 
     async def parse(self, share_text: str) -> ParseResult:
-        for attempt in range(2):
-            try:
-                async with asyncio.timeout(20):
-                    resolved = await self._resolver.resolve(share_text)
-                    video = await self._parser.parse(resolved.aweme_id)
-                return ParseResult(self.store.put(video), video)
-            except (TimeoutError, TransientUpstreamError) as error:
-                if attempt == 1:
-                    if isinstance(error, TimeoutError):
-                        code = "UPSTREAM_TIMEOUT"
-                    else:
-                        code = "UPSTREAM_BLOCKED"
-                    status = 504 if code == "UPSTREAM_TIMEOUT" else 502
-                    raise AppError(code, "解析服务暂时不可用，请稍后重试。", status) from error
-                await asyncio.sleep(0.25)
-        raise AssertionError("retry loop must return or raise")
+        started_at = time.monotonic()
+        error_code = "-"
+        try:
+            for attempt in range(2):
+                try:
+                    async with asyncio.timeout(20):
+                        resolved = await self._resolver.resolve(share_text)
+                        video = await self._parser.parse(resolved.aweme_id)
+                    return ParseResult(self.store.put(video), video)
+                except (TimeoutError, TransientUpstreamError) as error:
+                    if attempt == 1:
+                        if isinstance(error, TimeoutError):
+                            code = "UPSTREAM_TIMEOUT"
+                        else:
+                            code = "UPSTREAM_BLOCKED"
+                        status = 504 if code == "UPSTREAM_TIMEOUT" else 502
+                        raise AppError(
+                            code,
+                            "解析服务暂时不可用，请稍后重试。",
+                            status,
+                        ) from error
+                    await asyncio.sleep(0.25)
+            raise AssertionError("retry loop must return or raise")
+        except AppError as error:
+            error_code = error.code
+            raise
+        finally:
+            log_operation(
+                _LOGGER,
+                operation="parse",
+                error_code=error_code,
+                elapsed_ms=int((time.monotonic() - started_at) * 1000),
+                bytes_streamed=0,
+            )

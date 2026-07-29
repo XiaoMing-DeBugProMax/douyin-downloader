@@ -1,11 +1,14 @@
 from collections.abc import AsyncIterator
 from dataclasses import replace
+from pathlib import Path
 
 import httpx
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from douyin_downloader.domain import ParsedVideo, ResolvedShare
+import douyin_downloader.media as media_module
+from douyin_downloader.domain import AppError, ParsedVideo, ResolvedShare
+from douyin_downloader.logging_config import configure_logging
 from douyin_downloader.media import open_upstream
 from douyin_downloader.parse_service import ParseService
 from douyin_downloader.session import SessionManager
@@ -209,3 +212,106 @@ async def test_stopped_stream_closes_upstream_response() -> None:
         await iterator.aclose()
 
     assert stream.closed is True
+
+
+@pytest.mark.asyncio
+async def test_completed_stream_logs_only_operation_metrics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logged: list[dict[str, object]] = []
+
+    class FakeLogger:
+        def info(self, _: str, *, extra: dict[str, object]) -> None:
+            logged.append(extra)
+
+    monkeypatch.setattr(media_module, "_LOGGER", FakeLogger())
+    stream = TrackingStream()
+
+    def transport(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"content-type": "video/mp4"}, stream=stream)
+
+    async with AsyncClient(transport=httpx.MockTransport(transport)) as client:
+        upstream = await open_upstream(
+            client, "https://v95-web-sz.douyinvod.com/video.mp4", "video"
+        )
+        assert b"".join([chunk async for chunk in upstream.iter_bytes()]) == b"firstsecond"
+
+    assert logged == [
+        {
+            "operation": "download",
+            "error_code": "-",
+            "elapsed_ms": pytest.approx(0, abs=1000),
+            "bytes_streamed": 11,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_real_routes_write_safe_parse_cover_and_download_metrics(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "LocalAppData"))
+    logger = configure_logging()
+
+    async with AsyncClient(transport=httpx.MockTransport(media_transport)) as media_client:
+        app, sessions = make_app(media_client)
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://testserver"
+        ) as client:
+            client.cookies.set("douyin_local_session", sessions.cookie_token)
+            parse_response = await client.post(
+                "/api/parse",
+                headers={"origin": "http://testserver"},
+                json={"share_text": "sensitive share text"},
+            )
+            token = parse_response.json()["parse_token"]
+            assert (await client.get(f"/api/cover/{token}")).content == b"jpeg-data"
+            assert (await client.get(f"/api/download/{token}")).content == b"mp4-data"
+
+    for handler in logger.handlers:
+        handler.flush()
+    log_path = tmp_path / "LocalAppData" / "DouyinLocalDownloader" / "logs" / "app.log"
+    text = log_path.read_text(encoding="utf-8")
+    lines = text.splitlines()
+
+    assert len(lines) == 3
+    assert "operation=parse error_code=-" in lines[0]
+    assert "bytes_streamed=0" in lines[0]
+    assert "operation=cover error_code=-" in lines[1]
+    assert "bytes_streamed=9" in lines[1]
+    assert "operation=download error_code=-" in lines[2]
+    assert "bytes_streamed=8" in lines[2]
+    assert "sensitive share text" not in text
+    assert token not in text
+    assert "douyinvod.com" not in text
+
+
+@pytest.mark.asyncio
+async def test_failed_media_open_logs_anonymous_error_with_zero_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logged: list[dict[str, object]] = []
+
+    class FakeLogger:
+        def info(self, _: str, *, extra: dict[str, object]) -> None:
+            logged.append(extra)
+
+    monkeypatch.setattr(media_module, "_LOGGER", FakeLogger())
+
+    def transport(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, headers={"content-type": "text/plain"})
+
+    async with AsyncClient(transport=httpx.MockTransport(transport)) as client:
+        with pytest.raises(AppError, match="下载失败"):
+            await open_upstream(
+                client,
+                "https://p3.douyinpic.com/private-cover.jpeg?secret=must-not-log",
+                "cover",
+            )
+
+    assert len(logged) == 1
+    assert logged[0]["operation"] == "cover"
+    assert logged[0]["error_code"] == "DOWNLOAD_FAILED"
+    assert logged[0]["bytes_streamed"] == 0
+    assert "secret" not in repr(logged)
