@@ -609,6 +609,43 @@ textarea:focus {
   grid-column: 1 / -1;
 }
 
+.archive-strip {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 12px;
+  padding: 12px;
+  gap: 12px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--panel-soft);
+}
+
+.archive-strip > div:first-child {
+  display: grid;
+  gap: 3px;
+}
+
+.archive-strip strong {
+  font-size: 13px;
+}
+
+.archive-strip span {
+  color: var(--muted-readable);
+  font-size: 12px;
+}
+
+.archive-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.archive-actions .button {
+  min-height: 38px;
+  padding: 8px 12px;
+  font-size: 12px;
+}
+
 .usage-note {
   margin: 18px 0 0;
   color: var(--muted-readable);
@@ -737,6 +774,15 @@ textarea:focus {
     min-width: 0;
     padding-inline: 8px;
     font-size: 13px;
+  }
+
+  .archive-strip {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .archive-actions .button {
+    flex: 1;
   }
 
   .usage-note {

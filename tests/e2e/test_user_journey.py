@@ -3,7 +3,7 @@ from urllib.parse import urlsplit
 
 import pytest
 from playwright.sync_api import Error as PlaywrightError
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Page, Route, expect
 
 UNKNOWN_ERROR = "解析服务暂时不可用，请稍后重试。"
 
@@ -123,6 +123,51 @@ def test_parse_preview_theme_and_default_download(page: Page, local_app_url: str
     page.reload()
     assert page.locator("html").get_attribute("data-theme") == "dark"
     assert page.locator("#result").is_hidden()
+
+
+def test_managed_archive_strip_updates_and_opens_folder(
+    page: Page,
+    local_app_url: str,
+) -> None:
+    opened: list[str] = []
+
+    def handle_work(route: Route) -> None:
+        request = route.request
+        if request.url.endswith("/open"):
+            opened.append(request.url)
+            route.fulfill(status=204)
+        else:
+            route.fulfill(
+                status=200,
+                json={
+                    "aweme_id": "7429378937383308594",
+                    "status": "not_archived",
+                    "can_open_folder": False,
+                },
+            )
+
+    page.route("**/api/archive/work/**", handle_work)
+    page.route(
+        "**/api/archive/single",
+        lambda route: route.fulfill(
+            status=200,
+            json={
+                "operation_id": "operation-1",
+                "aweme_id": "7429378937383308594",
+                "status": "archived",
+                "can_open_folder": True,
+            },
+        ),
+    )
+    parse_video(page, local_app_url)
+    expect(page.locator("#archive-status")).to_have_text("尚未归档")
+
+    page.locator("#archive-start").click()
+
+    expect(page.locator("#archive-status")).to_have_text("已归档")
+    expect(page.locator("#archive-open")).to_be_visible()
+    page.locator("#archive-open").click()
+    assert len(opened) == 1
 
 
 def test_split_description_only_extracts_trailing_tags(

@@ -20,6 +20,10 @@ def test_parse_page_uses_safe_text_rendering_and_required_controls() -> None:
         "duration",
         "download-default",
         "download-custom",
+        "archive-strip",
+        "archive-status",
+        "archive-start",
+        "archive-open",
         "parse-another",
         "theme-button",
         "theme-menu",
@@ -34,4 +38,6 @@ def test_parse_page_uses_safe_text_rendering_and_required_controls() -> None:
     assert "parseButton.disabled = true" in script
     assert "window.location.assign" in script
     assert "response.body.pipeTo" in script
+    assert 'fetch("/api/archive/single"' in script
+    assert "/api/archive/work/" in script
     assert "new Blob" not in script

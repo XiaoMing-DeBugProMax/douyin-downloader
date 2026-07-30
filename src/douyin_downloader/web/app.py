@@ -9,10 +9,16 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Resp
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import RequestResponseEndpoint
 
+from douyin_downloader.archive import (
+    HttpMediaAccess,
+    ManagedArchive,
+    WindowsDirectoryChooser,
+)
 from douyin_downloader.domain import AppError
-from douyin_downloader.f2_adapter import F2VideoParser
+from douyin_downloader.f2_adapter import F2VideoParser, F2WorkAccess
 from douyin_downloader.parse_service import ParseService
 from douyin_downloader.resources import static_directory, static_resource_path
+from douyin_downloader.runtime import RuntimeStore
 from douyin_downloader.session import COOKIE_NAME, SessionManager
 from douyin_downloader.store import ParseStore
 from douyin_downloader.url_resolver import ShareResolver
@@ -29,13 +35,25 @@ async def _application_lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     client = httpx.AsyncClient(timeout=20)
     app.state.http_client = client
+    work_access = F2WorkAccess()
+    try:
+        database_path = RuntimeStore().app_dir / "archive.db"
+        managed_archive: ManagedArchive | None = ManagedArchive(
+            database_path=database_path,
+            work_access=work_access,
+            media_access=HttpMediaAccess(client),
+        )
+    except (OSError, RuntimeError):
+        managed_archive = None
     app.state.services = AppServices(
         parse_service=ParseService(
             ShareResolver(client),
-            F2VideoParser(),
+            F2VideoParser(work_access),
             ParseStore(),
         ),
         media_client=client,
+        managed_archive=managed_archive,
+        directory_chooser=WindowsDirectoryChooser(),
     )
     try:
         yield

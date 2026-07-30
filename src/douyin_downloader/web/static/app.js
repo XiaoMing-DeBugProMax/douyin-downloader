@@ -17,6 +17,9 @@ const tags = document.querySelector("#tags");
 const duration = document.querySelector("#duration");
 const downloadDefault = document.querySelector("#download-default");
 const downloadCustom = document.querySelector("#download-custom");
+const archiveStatus = document.querySelector("#archive-status");
+const archiveStart = document.querySelector("#archive-start");
+const archiveOpen = document.querySelector("#archive-open");
 const parseAnother = document.querySelector("#parse-another");
 const themeButton = document.querySelector("#theme-button");
 const themeMenu = document.querySelector("#theme-menu");
@@ -167,6 +170,7 @@ function splitDescription(value) {
 function renderPreview(video, parseToken) {
   currentParse = {
     token: parseToken,
+    awemeId: video.aweme_id,
     suggestedName:
       typeof video.suggested_filename === "string" ? video.suggested_filename : "video.mp4",
   };
@@ -182,6 +186,35 @@ function renderPreview(video, parseToken) {
   tags.hidden = !displayText.tags;
   duration.textContent = `${Math.round(video.duration_ms / 1000)} 秒`;
   result.hidden = false;
+  setArchiveState("not_archived");
+  refreshArchiveStatus(video.aweme_id);
+}
+
+function setArchiveState(state) {
+  const archived = state === "archived";
+  const unavailable = state === "unavailable";
+  archiveStatus.textContent = archived
+    ? "已归档"
+    : unavailable
+      ? "归档暂时不可用"
+      : "尚未归档";
+  archiveStart.hidden = archived;
+  archiveStart.disabled = unavailable;
+  archiveOpen.hidden = !archived;
+}
+
+async function refreshArchiveStatus(awemeId) {
+  try {
+    const response = await fetch(`/api/archive/work/${encodeURIComponent(awemeId)}`);
+    if (!response.ok) {
+      if (currentParse?.awemeId === awemeId) setArchiveState("unavailable");
+      return;
+    }
+    const payload = await response.json();
+    if (currentParse?.awemeId === awemeId) setArchiveState(payload.status);
+  } catch (_) {
+    if (currentParse?.awemeId === awemeId) setArchiveState("unavailable");
+  }
 }
 
 function setParsingState(parsing) {
@@ -276,6 +309,44 @@ downloadCustom.addEventListener("click", () => {
   }
 });
 
+archiveStart.addEventListener("click", async () => {
+  if (!currentParse || archiveStart.disabled) return;
+  archiveStart.disabled = true;
+  archiveStart.textContent = "正在归档";
+  try {
+    const response = await fetch("/api/archive/single", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ parse_token: currentParse.token }),
+    });
+    if (!response.ok) {
+      if (response.status !== 409) showError(await responseErrorMessage(response));
+      return;
+    }
+    const payload = await response.json();
+    setArchiveState(payload.status);
+    showNotice("视频已加入本地归档。");
+  } catch (_) {
+    showError(UNKNOWN_ERROR);
+  } finally {
+    archiveStart.disabled = false;
+    archiveStart.textContent = "加入本地归档";
+  }
+});
+
+archiveOpen.addEventListener("click", async () => {
+  if (!currentParse) return;
+  try {
+    const response = await fetch(
+      `/api/archive/work/${encodeURIComponent(currentParse.awemeId)}/open`,
+      { method: "POST" },
+    );
+    if (!response.ok) showError(await responseErrorMessage(response));
+  } catch (_) {
+    showError(UNKNOWN_ERROR);
+  }
+});
+
 parseAnother.addEventListener("click", () => {
   currentParse = null;
   form.reset();
@@ -289,6 +360,7 @@ parseAnother.addEventListener("click", () => {
   tags.removeAttribute("title");
   tags.hidden = true;
   duration.textContent = "";
+  setArchiveState("not_archived");
   showNotice("");
   shareText.focus();
 });

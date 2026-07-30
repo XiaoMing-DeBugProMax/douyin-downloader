@@ -1,22 +1,47 @@
+import asyncio
 import secrets
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Protocol
 from urllib.parse import quote
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
-from starlette.responses import StreamingResponse
+from starlette.responses import Response, StreamingResponse
 
+from douyin_downloader.archive import (
+    ArchiveItemSnapshot,
+    ArchiveOperationSnapshot,
+    SingleArchiveRequest,
+)
 from douyin_downloader.domain import AppError
 from douyin_downloader.media import UpstreamStream, open_first_available, safe_video_filename
 from douyin_downloader.parse_service import ParseService
 from douyin_downloader.session import SessionManager, require_local_session, require_same_origin
 
 
+class ManagedArchiveModule(Protocol):
+    async def archive_single(
+        self,
+        request: SingleArchiveRequest,
+    ) -> ArchiveOperationSnapshot: ...
+
+    def get_work_archive(self, aweme_id: str) -> ArchiveItemSnapshot | None: ...
+
+    def open_work_folder(self, aweme_id: str) -> None: ...
+
+
+class DirectoryChooser(Protocol):
+    def choose_directory(self) -> Path | None: ...
+
+
 @dataclass(slots=True)
 class AppServices:
     parse_service: ParseService
     media_client: httpx.AsyncClient
+    managed_archive: ManagedArchiveModule | None = None
+    directory_chooser: DirectoryChooser | None = None
 
 
 class ParseRequest(BaseModel):
@@ -37,6 +62,23 @@ class ParseResponse(BaseModel):
     video: VideoResponse
 
 
+class ArchiveRequest(BaseModel):
+    parse_token: str = Field(min_length=1, max_length=200)
+
+
+class ArchiveResponse(BaseModel):
+    operation_id: str
+    aweme_id: str
+    status: str
+    can_open_folder: bool
+
+
+class ArchiveWorkResponse(BaseModel):
+    aweme_id: str
+    status: str
+    can_open_folder: bool
+
+
 def content_disposition_filename(filename: str) -> str:
     ascii_fallback = filename.encode("ascii", "ignore").decode("ascii")
     if not ascii_fallback.removesuffix(".mp4").strip(" .-"):
@@ -49,6 +91,13 @@ def _services(request: Request) -> AppServices:
     if services is None:
         raise AppError("UPSTREAM_BLOCKED", "解析服务暂时不可用，请稍后重试。", 502)
     return services
+
+
+def _managed_archive(request: Request) -> ManagedArchiveModule:
+    archive = _services(request).managed_archive
+    if archive is None:
+        raise AppError("ARCHIVE_UNAVAILABLE", "本地归档暂时不可用，快速下载仍可使用。", 503)
+    return archive
 
 
 def streaming_cover_response(upstream: UpstreamStream) -> StreamingResponse:
@@ -117,5 +166,67 @@ def build_router() -> APIRouter:
                 "X-Content-Type-Options": "nosniff",
             },
         )
+
+    @router.post(
+        "/api/archive/single",
+        response_model=ArchiveResponse,
+        dependencies=[Depends(require_local_session), Depends(require_same_origin)],
+    )
+    async def archive_single(
+        payload: ArchiveRequest,
+        request: Request,
+    ) -> ArchiveResponse:
+        services = _services(request)
+        video = services.parse_service.store.get(payload.parse_token)
+        archive = _managed_archive(request)
+        if services.directory_chooser is None:
+            raise AppError("ARCHIVE_UNAVAILABLE", "本地归档暂时不可用，快速下载仍可使用。", 503)
+        archive_root = await asyncio.to_thread(services.directory_chooser.choose_directory)
+        if archive_root is None:
+            raise AppError("ARCHIVE_SELECTION_CANCELLED", "已取消选择归档目录。", 409)
+        result = await archive.archive_single(
+            SingleArchiveRequest(
+                aweme_id=video.aweme_id,
+                archive_root=archive_root,
+            )
+        )
+        return ArchiveResponse(
+            operation_id=result.operation.task_id,
+            aweme_id=result.archive_item.aweme_id,
+            status=result.archive_item.status,
+            can_open_folder=True,
+        )
+
+    @router.get(
+        "/api/archive/work/{aweme_id}",
+        response_model=ArchiveWorkResponse,
+        dependencies=[Depends(require_local_session)],
+    )
+    async def archive_work_status(
+        aweme_id: str,
+        request: Request,
+    ) -> ArchiveWorkResponse:
+        if not aweme_id.isdigit():
+            raise AppError("INVALID_INPUT", "作品标识无效。", 400)
+        item = _managed_archive(request).get_work_archive(aweme_id)
+        return ArchiveWorkResponse(
+            aweme_id=aweme_id,
+            status=item.status if item is not None else "not_archived",
+            can_open_folder=item is not None,
+        )
+
+    @router.post(
+        "/api/archive/work/{aweme_id}/open",
+        status_code=204,
+        dependencies=[Depends(require_local_session), Depends(require_same_origin)],
+    )
+    async def open_archive_work_folder(
+        aweme_id: str,
+        request: Request,
+    ) -> Response:
+        if not aweme_id.isdigit():
+            raise AppError("INVALID_INPUT", "作品标识无效。", 400)
+        _managed_archive(request).open_work_folder(aweme_id)
+        return Response(status_code=204)
 
     return router
