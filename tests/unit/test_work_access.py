@@ -7,8 +7,9 @@ from douyin_downloader.domain import (
     AuthorSnapshot,
     MusicSnapshot,
     ParsedVideo,
+    PlaybackSource,
     PublicMetrics,
-    VideoVariant,
+    ResolvedWork,
     WorkSnapshot,
 )
 from douyin_downloader.f2_adapter import F2VideoParser, F2WorkAccess
@@ -98,26 +99,40 @@ class StaticPostDetail:
 async def test_work_access_returns_filtered_stable_snapshot() -> None:
     access = F2WorkAccess(StaticPostDetail())
 
-    snapshot = await access.fetch_work("7429378937383308594")
+    resolved = await access.fetch_work("7429378937383308594")
 
-    assert snapshot == WorkSnapshot(
-        aweme_id="7429378937383308594",
-        content_type="video",
-        public_url="https://www.douyin.com/video/7429378937383308594",
-        description="作品文案 #标签",
-        published_at=1_720_000_000,
-        duration_ms=15_279,
-        author=AuthorSnapshot(
-            stable_id="MS4wLjABAAAAstable",
-            nickname="钟哥！！",
+    assert resolved == ResolvedWork(
+        snapshot=WorkSnapshot(
+            aweme_id="7429378937383308594",
+            content_type="video",
+            public_url="https://www.douyin.com/video/7429378937383308594",
+            description="作品文案 #标签",
+            published_at=1_720_000_000,
+            duration_ms=15_279,
+            author=AuthorSnapshot(
+                stable_id="MS4wLjABAAAAstable",
+                nickname="钟哥！！",
+            ),
+            music=MusicSnapshot(
+                stable_id="music-1",
+                title="作品原声",
+                author="音乐作者",
+                duration_seconds=16,
+            ),
+            public_metrics=PublicMetrics(
+                likes=11,
+                comments=12,
+                shares=13,
+                collects=14,
+            ),
         ),
         cover_urls=(
             "https://p3.douyinpic.com/origin.jpeg",
             "https://p9.douyinpic.com/origin.jpeg",
             "https://p3.douyinpic.com/cover.jpeg",
         ),
-        video_variants=(
-            VideoVariant(
+        playback_sources=(
+            PlaybackSource(
                 bitrate=900_000,
                 gear_name="normal_720",
                 quality_type=20,
@@ -125,12 +140,12 @@ async def test_work_access_returns_filtered_stable_snapshot() -> None:
                 width=720,
                 height=1280,
                 size_bytes=1_000,
-                media_urls=(
+                cdn_mirror_urls=(
                     "https://v95-web-sz.douyinvod.com/720-a.mp4",
                     "https://v11-web.douyinvod.com/720-b.mp4",
                 ),
             ),
-            VideoVariant(
+            PlaybackSource(
                 bitrate=1_800_000,
                 gear_name="normal_1080",
                 quality_type=40,
@@ -138,31 +153,19 @@ async def test_work_access_returns_filtered_stable_snapshot() -> None:
                 width=1080,
                 height=1920,
                 size_bytes=2_000,
-                media_urls=("https://v95-web-sz.douyinvod.com/1080-a.mp4",),
+                cdn_mirror_urls=("https://v95-web-sz.douyinvod.com/1080-a.mp4",),
             ),
-        ),
-        music=MusicSnapshot(
-            stable_id="music-1",
-            title="作品原声",
-            author="音乐作者",
-            duration_seconds=16,
-        ),
-        public_metrics=PublicMetrics(
-            likes=11,
-            comments=12,
-            shares=13,
-            collects=14,
         ),
     )
 
 
 @pytest.mark.asyncio
 async def test_snapshot_selects_highest_reliable_variant_without_collapsing_mirrors() -> None:
-    snapshot = await F2WorkAccess(StaticPostDetail()).fetch_work("7429378937383308594")
+    resolved = await F2WorkAccess(StaticPostDetail()).fetch_work("7429378937383308594")
 
-    preferred = snapshot.preferred_video_variant()
+    preferred = resolved.preferred_playback_source()
 
-    assert preferred == VideoVariant(
+    assert preferred == PlaybackSource(
         bitrate=1_800_000,
         gear_name="normal_1080",
         quality_type=40,
@@ -170,31 +173,36 @@ async def test_snapshot_selects_highest_reliable_variant_without_collapsing_mirr
         width=1080,
         height=1920,
         size_bytes=2_000,
-        media_urls=("https://v95-web-sz.douyinvod.com/1080-a.mp4",),
+        cdn_mirror_urls=("https://v95-web-sz.douyinvod.com/1080-a.mp4",),
     )
 
 
 @pytest.mark.asyncio
 async def test_work_access_filters_secrets_and_unselected_upstream_fields() -> None:
-    snapshot = await F2WorkAccess(StaticPostDetail()).fetch_work("7429378937383308594")
+    resolved = await F2WorkAccess(StaticPostDetail()).fetch_work("7429378937383308594")
 
-    filtered_snapshot = repr(asdict(snapshot))
+    filtered_snapshot = repr(asdict(resolved.snapshot))
 
     assert "must-not-survive" not in filtered_snapshot
     assert "cookie" not in filtered_snapshot
     assert "authorization" not in filtered_snapshot
+    assert "douyinvod.com" not in filtered_snapshot
+    assert "douyinpic.com" not in filtered_snapshot
+    assert "cdn_mirror_urls" not in filtered_snapshot
 
 
 @pytest.mark.asyncio
 async def test_quick_download_can_use_a_replaceable_work_access_without_behavior_change() -> None:
-    snapshot = await F2WorkAccess(StaticPostDetail()).fetch_work("7429378937383308594")
+    resolved = await F2WorkAccess(StaticPostDetail()).fetch_work("7429378937383308594")
 
     class DeterministicWorkAccess:
-        async def fetch_work(self, aweme_id: str) -> WorkSnapshot:
-            assert aweme_id == snapshot.aweme_id
-            return snapshot
+        async def fetch_work(self, aweme_id: str) -> ResolvedWork:
+            assert aweme_id == resolved.snapshot.aweme_id
+            return resolved
 
-    parsed = await F2VideoParser(DeterministicWorkAccess()).parse(snapshot.aweme_id)
+    parsed = await F2VideoParser(DeterministicWorkAccess()).parse(
+        resolved.snapshot.aweme_id
+    )
 
     assert parsed == ParsedVideo(
         aweme_id="7429378937383308594",
@@ -237,3 +245,26 @@ async def test_work_access_maps_upstream_errors_at_its_public_interface(
 
     assert error.value.code == expected_code
     assert error.value.status_code == expected_http_status
+
+
+class MissingAuthorIdentityPostDetail:
+    async def fetch(self, aweme_id: str) -> dict[str, object]:
+        payload = await StaticPostDetail().fetch(aweme_id)
+        aweme_detail = payload["aweme_detail"]
+        assert isinstance(aweme_detail, dict)
+        author = aweme_detail["author"]
+        assert isinstance(author, dict)
+        author.pop("sec_uid")
+        author.pop("uid")
+        return payload
+
+
+@pytest.mark.asyncio
+async def test_work_access_rejects_missing_stable_author_identity() -> None:
+    access = F2WorkAccess(MissingAuthorIdentityPostDetail())
+
+    with pytest.raises(AppError) as error:
+        await access.fetch_work("7429378937383308594")
+
+    assert error.value.code == "UPSTREAM_BLOCKED"
+    assert error.value.status_code == 502

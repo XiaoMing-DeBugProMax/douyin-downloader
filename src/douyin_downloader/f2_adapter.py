@@ -14,9 +14,10 @@ from douyin_downloader.domain import (
     AuthorSnapshot,
     MusicSnapshot,
     ParsedVideo,
+    PlaybackSource,
     PublicMetrics,
+    ResolvedWork,
     TransientUpstreamError,
-    VideoVariant,
     WorkSnapshot,
 )
 
@@ -95,7 +96,6 @@ class _F2Runtime:
 class _PostDetailView:
     api_status_code: Any
     aweme_id: Any
-    aweme_type: Any
     create_time: Any
     author_sec_uid: Any
     author_uid: Any
@@ -140,7 +140,6 @@ def _post_detail_filter(payload: dict[str, object]) -> _PostDetailView:
     return _PostDetailView(
         api_status_code=_nested(payload, "status_code"),
         aweme_id=_nested(payload, "aweme_detail", "aweme_id"),
-        aweme_type=_nested(payload, "aweme_detail", "aweme_type"),
         create_time=_nested(payload, "aweme_detail", "create_time"),
         author_sec_uid=_nested(payload, "aweme_detail", "author", "sec_uid"),
         author_uid=_nested(payload, "aweme_detail", "author", "uid"),
@@ -308,7 +307,7 @@ class _PostDetailCrawler:
 
 
 class WorkAccess(Protocol):
-    async def fetch_work(self, aweme_id: str) -> WorkSnapshot: ...
+    async def fetch_work(self, aweme_id: str) -> ResolvedWork: ...
 
 
 class _PostDetailSource(Protocol):
@@ -330,8 +329,8 @@ def _optional_text(value: object) -> str:
     return value if isinstance(value, str) else ""
 
 
-def _video_variants(detail: Any) -> tuple[VideoVariant, ...]:
-    variants: list[VideoVariant] = []
+def _playback_sources(detail: Any) -> tuple[PlaybackSource, ...]:
+    sources: list[PlaybackSource] = []
     raw_variants = getattr(detail, "video_bit_rate", None)
     if isinstance(raw_variants, list):
         for raw_variant in raw_variants:
@@ -345,8 +344,8 @@ def _video_variants(detail: Any) -> tuple[VideoVariant, ...]:
                 continue
             is_bytevc1 = _optional_int(raw_variant.get("is_bytevc1"))
             codec = "h265" if is_bytevc1 == 1 else "h264" if is_bytevc1 == 0 else ""
-            variants.append(
-                VideoVariant(
+            sources.append(
+                PlaybackSource(
                     bitrate=_optional_int(raw_variant.get("bit_rate")),
                     gear_name=_optional_text(raw_variant.get("gear_name")),
                     quality_type=_optional_int(raw_variant.get("quality_type")),
@@ -354,17 +353,17 @@ def _video_variants(detail: Any) -> tuple[VideoVariant, ...]:
                     width=_optional_int(play_addr.get("width")),
                     height=_optional_int(play_addr.get("height")),
                     size_bytes=_optional_int(play_addr.get("data_size")),
-                    media_urls=media_urls,
+                    cdn_mirror_urls=media_urls,
                 )
             )
-    if variants:
-        return tuple(variants)
+    if sources:
+        return tuple(sources)
 
     media_urls = tuple(getattr(detail, "video_play_addr", None) or ())
     if not media_urls:
         return ()
     return (
-        VideoVariant(
+        PlaybackSource(
             bitrate=None,
             gear_name="",
             quality_type=None,
@@ -372,7 +371,7 @@ def _video_variants(detail: Any) -> tuple[VideoVariant, ...]:
             width=None,
             height=None,
             size_bytes=None,
-            media_urls=media_urls,
+            cdn_mirror_urls=media_urls,
         ),
     )
 
@@ -401,7 +400,7 @@ def _public_metrics(raw_statistics: object) -> PublicMetrics:
     )
 
 
-def _map_work_snapshot(detail: Any) -> WorkSnapshot:
+def _validated_video_detail(detail: Any) -> tuple[str, tuple[PlaybackSource, ...]]:
     if detail.api_status_code != 0:
         if detail.api_status_code in _MISSING_APPLICATION_STATUSES:
             raise AppError("VIDEO_NOT_FOUND", _NOT_FOUND_MESSAGE, 404)
@@ -410,33 +409,43 @@ def _map_work_snapshot(detail: Any) -> WorkSnapshot:
         raise AppError("UNSUPPORTED_CONTENT", "当前版本不支持图集或直播内容。", 422)
 
     aweme_id = str(detail.aweme_id or "")
-    variants = _video_variants(detail)
-    if not aweme_id or not variants:
+    playback_sources = _playback_sources(detail)
+    if not aweme_id or not playback_sources:
         raise AppError("UNSUPPORTED_CONTENT", "当前版本只支持公开视频。", 422)
+    return aweme_id, playback_sources
 
+
+def _map_resolved_work(detail: Any) -> ResolvedWork:
+    aweme_id, playback_sources = _validated_video_detail(detail)
     cover_urls = tuple(getattr(detail, "cover_urls", None) or ())
     if not cover_urls and detail.cover:
         cover_urls = (str(detail.cover),)
     stable_author_id = (
         getattr(detail, "author_sec_uid", None)
         or getattr(detail, "author_uid", None)
-        or ""
     )
-    return WorkSnapshot(
-        aweme_id=aweme_id,
-        content_type="video",
-        public_url=f"https://www.douyin.com/video/{aweme_id}",
-        description=str(detail.desc_raw or ""),
-        published_at=_optional_int(getattr(detail, "create_time", None)),
-        duration_ms=int(detail.duration or 0),
-        author=AuthorSnapshot(
-            stable_id=str(stable_author_id),
-            nickname=str(detail.nickname_raw or ""),
+    if stable_author_id is None or isinstance(stable_author_id, bool):
+        raise AppError("UPSTREAM_BLOCKED", _BLOCKED_MESSAGE, 502)
+    stable_author_id = str(stable_author_id)
+    if not stable_author_id:
+        raise AppError("UPSTREAM_BLOCKED", _BLOCKED_MESSAGE, 502)
+    return ResolvedWork(
+        snapshot=WorkSnapshot(
+            aweme_id=aweme_id,
+            content_type="video",
+            public_url=f"https://www.douyin.com/video/{aweme_id}",
+            description=str(detail.desc_raw or ""),
+            published_at=_optional_int(getattr(detail, "create_time", None)),
+            duration_ms=int(detail.duration or 0),
+            author=AuthorSnapshot(
+                stable_id=stable_author_id,
+                nickname=str(detail.nickname_raw or ""),
+            ),
+            music=_music_snapshot(getattr(detail, "music", None)),
+            public_metrics=_public_metrics(getattr(detail, "statistics", None)),
         ),
         cover_urls=cover_urls,
-        video_variants=variants,
-        music=_music_snapshot(getattr(detail, "music", None)),
-        public_metrics=_public_metrics(getattr(detail, "statistics", None)),
+        playback_sources=playback_sources,
     )
 
 
@@ -444,11 +453,11 @@ class F2WorkAccess:
     def __init__(self, source: _PostDetailSource | None = None) -> None:
         self._source = source if source is not None else _RemotePostDetailSource()
 
-    async def fetch_work(self, aweme_id: str) -> WorkSnapshot:
+    async def fetch_work(self, aweme_id: str) -> ResolvedWork:
         try:
             payload = await self._source.fetch(aweme_id)
             detail = _post_detail_filter(payload)
-            return _map_work_snapshot(detail)
+            return _map_resolved_work(detail)
         except (AppError, TimeoutError, TransientUpstreamError):
             raise
         except Exception as error:
@@ -456,23 +465,15 @@ class F2WorkAccess:
 
 
 def map_post_detail(detail: Any) -> ParsedVideo:
-    if detail.api_status_code != 0:
-        if detail.api_status_code in _MISSING_APPLICATION_STATUSES:
-            raise AppError("VIDEO_NOT_FOUND", _NOT_FOUND_MESSAGE, 404)
-        raise AppError("UPSTREAM_BLOCKED", _BLOCKED_MESSAGE, 502)
-    if detail.images:
-        raise AppError("UNSUPPORTED_CONTENT", "当前版本不支持图集或直播内容。", 422)
-    media_urls = tuple(detail.video_play_addr or ())
-    if not media_urls:
-        raise AppError("UNSUPPORTED_CONTENT", "当前版本只支持公开视频。", 422)
+    aweme_id, playback_sources = _validated_video_detail(detail)
     cover_urls = (detail.cover,) if detail.cover else ()
     return ParsedVideo(
-        aweme_id=str(detail.aweme_id),
+        aweme_id=aweme_id,
         author=str(detail.nickname_raw or ""),
         description=str(detail.desc_raw or ""),
         duration_ms=int(detail.duration or 0),
         cover_urls=cover_urls,
-        media_urls=media_urls,
+        media_urls=playback_sources[0].cdn_mirror_urls,
     )
 
 
@@ -481,5 +482,5 @@ class F2VideoParser:
         self._work_access = work_access if work_access is not None else F2WorkAccess()
 
     async def parse(self, aweme_id: str) -> ParsedVideo:
-        snapshot = await self._work_access.fetch_work(aweme_id)
-        return snapshot.quick_download_projection()
+        resolved = await self._work_access.fetch_work(aweme_id)
+        return resolved.quick_download_projection()
