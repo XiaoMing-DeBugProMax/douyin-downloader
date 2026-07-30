@@ -5,11 +5,20 @@ import logging
 import secrets
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 import httpx
 
-from douyin_downloader.domain import AppError, ParsedVideo, TransientUpstreamError
+from douyin_downloader.domain import (
+    AppError,
+    AuthorSnapshot,
+    MusicSnapshot,
+    ParsedVideo,
+    PublicMetrics,
+    TransientUpstreamError,
+    VideoVariant,
+    WorkSnapshot,
+)
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -86,11 +95,19 @@ class _F2Runtime:
 class _PostDetailView:
     api_status_code: Any
     aweme_id: Any
+    aweme_type: Any
+    create_time: Any
+    author_sec_uid: Any
+    author_uid: Any
     nickname_raw: Any
     desc_raw: Any
     duration: Any
     cover: Any
+    cover_urls: Any
     video_play_addr: Any
+    video_bit_rate: Any
+    music: Any
+    statistics: Any
     images: Any
 
 
@@ -106,6 +123,16 @@ def _nested(value: object, *keys: str | int) -> Any:
     return current
 
 
+def _urls(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        return ()
+    return tuple(item for item in value if isinstance(item, str) and item)
+
+
+def _dedupe_urls(*groups: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(url for group in groups for url in group))
+
+
 def _post_detail_filter(payload: dict[str, object]) -> _PostDetailView:
     # This is the subset of f2 0.0.1.7 PostDetailFilter consumed by
     # map_post_detail. Importing the upstream filter also imports
@@ -113,6 +140,10 @@ def _post_detail_filter(payload: dict[str, object]) -> _PostDetailView:
     return _PostDetailView(
         api_status_code=_nested(payload, "status_code"),
         aweme_id=_nested(payload, "aweme_detail", "aweme_id"),
+        aweme_type=_nested(payload, "aweme_detail", "aweme_type"),
+        create_time=_nested(payload, "aweme_detail", "create_time"),
+        author_sec_uid=_nested(payload, "aweme_detail", "author", "sec_uid"),
+        author_uid=_nested(payload, "aweme_detail", "author", "uid"),
         nickname_raw=_nested(payload, "aweme_detail", "author", "nickname"),
         desc_raw=_nested(payload, "aweme_detail", "desc"),
         duration=_nested(payload, "aweme_detail", "duration"),
@@ -124,6 +155,10 @@ def _post_detail_filter(payload: dict[str, object]) -> _PostDetailView:
             "url_list",
             0,
         ),
+        cover_urls=_dedupe_urls(
+            _urls(_nested(payload, "aweme_detail", "video", "origin_cover", "url_list")),
+            _urls(_nested(payload, "aweme_detail", "video", "cover", "url_list")),
+        ),
         video_play_addr=_nested(
             payload,
             "aweme_detail",
@@ -133,6 +168,9 @@ def _post_detail_filter(payload: dict[str, object]) -> _PostDetailView:
             "play_addr",
             "url_list",
         ),
+        video_bit_rate=_nested(payload, "aweme_detail", "video", "bit_rate"),
+        music=_nested(payload, "aweme_detail", "music"),
+        statistics=_nested(payload, "aweme_detail", "statistics"),
         images=_nested(payload, "aweme_detail", "images") or [],
     )
 
@@ -269,6 +307,154 @@ class _PostDetailCrawler:
         return payload
 
 
+class WorkAccess(Protocol):
+    async def fetch_work(self, aweme_id: str) -> WorkSnapshot: ...
+
+
+class _PostDetailSource(Protocol):
+    async def fetch(self, aweme_id: str) -> dict[str, object]: ...
+
+
+class _RemotePostDetailSource:
+    async def fetch(self, aweme_id: str) -> dict[str, object]:
+        runtime = await _load_f2_runtime_and_guest(aweme_id)
+        async with _PostDetailCrawler(runtime) as crawler:
+            return await crawler.fetch_post_detail()
+
+
+def _optional_int(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _optional_text(value: object) -> str:
+    return value if isinstance(value, str) else ""
+
+
+def _video_variants(detail: Any) -> tuple[VideoVariant, ...]:
+    variants: list[VideoVariant] = []
+    raw_variants = getattr(detail, "video_bit_rate", None)
+    if isinstance(raw_variants, list):
+        for raw_variant in raw_variants:
+            if not isinstance(raw_variant, dict):
+                continue
+            play_addr = raw_variant.get("play_addr")
+            if not isinstance(play_addr, dict):
+                continue
+            media_urls = _urls(play_addr.get("url_list"))
+            if not media_urls:
+                continue
+            is_bytevc1 = _optional_int(raw_variant.get("is_bytevc1"))
+            codec = "h265" if is_bytevc1 == 1 else "h264" if is_bytevc1 == 0 else ""
+            variants.append(
+                VideoVariant(
+                    bitrate=_optional_int(raw_variant.get("bit_rate")),
+                    gear_name=_optional_text(raw_variant.get("gear_name")),
+                    quality_type=_optional_int(raw_variant.get("quality_type")),
+                    codec=codec,
+                    width=_optional_int(play_addr.get("width")),
+                    height=_optional_int(play_addr.get("height")),
+                    size_bytes=_optional_int(play_addr.get("data_size")),
+                    media_urls=media_urls,
+                )
+            )
+    if variants:
+        return tuple(variants)
+
+    media_urls = tuple(getattr(detail, "video_play_addr", None) or ())
+    if not media_urls:
+        return ()
+    return (
+        VideoVariant(
+            bitrate=None,
+            gear_name="",
+            quality_type=None,
+            codec="",
+            width=None,
+            height=None,
+            size_bytes=None,
+            media_urls=media_urls,
+        ),
+    )
+
+
+def _music_snapshot(raw_music: object) -> MusicSnapshot | None:
+    if not isinstance(raw_music, dict):
+        return None
+    stable_id = raw_music.get("id_str") or raw_music.get("mid") or raw_music.get("id")
+    if stable_id is None:
+        return None
+    return MusicSnapshot(
+        stable_id=str(stable_id),
+        title=_optional_text(raw_music.get("title")),
+        author=_optional_text(raw_music.get("author")),
+        duration_seconds=_optional_int(raw_music.get("duration")),
+    )
+
+
+def _public_metrics(raw_statistics: object) -> PublicMetrics:
+    statistics = raw_statistics if isinstance(raw_statistics, dict) else {}
+    return PublicMetrics(
+        likes=_optional_int(statistics.get("digg_count")),
+        comments=_optional_int(statistics.get("comment_count")),
+        shares=_optional_int(statistics.get("share_count")),
+        collects=_optional_int(statistics.get("collect_count")),
+    )
+
+
+def _map_work_snapshot(detail: Any) -> WorkSnapshot:
+    if detail.api_status_code != 0:
+        if detail.api_status_code in _MISSING_APPLICATION_STATUSES:
+            raise AppError("VIDEO_NOT_FOUND", _NOT_FOUND_MESSAGE, 404)
+        raise AppError("UPSTREAM_BLOCKED", _BLOCKED_MESSAGE, 502)
+    if detail.images:
+        raise AppError("UNSUPPORTED_CONTENT", "当前版本不支持图集或直播内容。", 422)
+
+    aweme_id = str(detail.aweme_id or "")
+    variants = _video_variants(detail)
+    if not aweme_id or not variants:
+        raise AppError("UNSUPPORTED_CONTENT", "当前版本只支持公开视频。", 422)
+
+    cover_urls = tuple(getattr(detail, "cover_urls", None) or ())
+    if not cover_urls and detail.cover:
+        cover_urls = (str(detail.cover),)
+    stable_author_id = (
+        getattr(detail, "author_sec_uid", None)
+        or getattr(detail, "author_uid", None)
+        or ""
+    )
+    return WorkSnapshot(
+        aweme_id=aweme_id,
+        content_type="video",
+        public_url=f"https://www.douyin.com/video/{aweme_id}",
+        description=str(detail.desc_raw or ""),
+        published_at=_optional_int(getattr(detail, "create_time", None)),
+        duration_ms=int(detail.duration or 0),
+        author=AuthorSnapshot(
+            stable_id=str(stable_author_id),
+            nickname=str(detail.nickname_raw or ""),
+        ),
+        cover_urls=cover_urls,
+        video_variants=variants,
+        music=_music_snapshot(getattr(detail, "music", None)),
+        public_metrics=_public_metrics(getattr(detail, "statistics", None)),
+    )
+
+
+class F2WorkAccess:
+    def __init__(self, source: _PostDetailSource | None = None) -> None:
+        self._source = source if source is not None else _RemotePostDetailSource()
+
+    async def fetch_work(self, aweme_id: str) -> WorkSnapshot:
+        try:
+            payload = await self._source.fetch(aweme_id)
+            detail = _post_detail_filter(payload)
+            return _map_work_snapshot(detail)
+        except (AppError, TimeoutError, TransientUpstreamError):
+            raise
+        except Exception as error:
+            raise AppError("UPSTREAM_BLOCKED", _BLOCKED_MESSAGE, 502) from error
+
+
 def map_post_detail(detail: Any) -> ParsedVideo:
     if detail.api_status_code != 0:
         if detail.api_status_code in _MISSING_APPLICATION_STATUSES:
@@ -291,14 +477,9 @@ def map_post_detail(detail: Any) -> ParsedVideo:
 
 
 class F2VideoParser:
+    def __init__(self, work_access: WorkAccess | None = None) -> None:
+        self._work_access = work_access if work_access is not None else F2WorkAccess()
+
     async def parse(self, aweme_id: str) -> ParsedVideo:
-        try:
-            runtime = await _load_f2_runtime_and_guest(aweme_id)
-            async with _PostDetailCrawler(runtime) as crawler:
-                payload = await crawler.fetch_post_detail()
-            detail = _post_detail_filter(payload)
-        except (AppError, TimeoutError, TransientUpstreamError):
-            raise
-        except Exception as error:
-            raise AppError("UPSTREAM_BLOCKED", _BLOCKED_MESSAGE, 502) from error
-        return map_post_detail(detail)
+        snapshot = await self._work_access.fetch_work(aweme_id)
+        return snapshot.quick_download_projection()
