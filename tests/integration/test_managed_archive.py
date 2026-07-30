@@ -1,9 +1,14 @@
+import asyncio
+import hashlib
+import os
+import sqlite3
 import struct
 from collections.abc import AsyncIterator
 from pathlib import Path
 
 import pytest
 
+from douyin_downloader import archive_paths
 from douyin_downloader.archive import ManagedArchive, RemoteVideo, SingleArchiveRequest
 from douyin_downloader.domain import (
     AppError,
@@ -23,6 +28,11 @@ class UnexpectedWorkAccess:
 class UnexpectedMediaAccess:
     async def open_video(self, _: tuple[str, ...]) -> object:
         raise AssertionError("invalid roots must fail before media access")
+
+
+class FailingWorkAccess:
+    async def fetch_work(self, _: str) -> ResolvedWork:
+        raise AppError("UPSTREAM_BLOCKED", "解析服务暂时不可用。", 502)
 
 
 def mp4_box(kind: bytes, payload: bytes) -> bytes:
@@ -92,6 +102,19 @@ class StaticWorkAccess:
         )
 
 
+class BlockingWorkAccess(StaticWorkAccess):
+    def __init__(self) -> None:
+        self.calls = 0
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def fetch_work(self, aweme_id: str) -> ResolvedWork:
+        self.calls += 1
+        self.started.set()
+        await self.release.wait()
+        return await super().fetch_work(aweme_id)
+
+
 class StaticMediaAccess:
     def __init__(self, payload: bytes) -> None:
         self.payload = payload
@@ -112,12 +135,39 @@ class StaticMediaAccess:
         )
 
 
+class DirectoryReplacementAttempt(StaticMediaAccess):
+    def __init__(self, payload: bytes, work_directory: Path) -> None:
+        super().__init__(payload)
+        self.work_directory = work_directory
+        self.replacement_was_blocked = False
+
+    async def open_video(self, cdn_mirror_urls: tuple[str, ...]) -> RemoteVideo:
+        moved_directory = self.work_directory.with_name("moved-work")
+        try:
+            self.work_directory.rename(moved_directory)
+        except OSError:
+            self.replacement_was_blocked = True
+        else:
+            self.work_directory.mkdir()
+        return await super().open_video(cdn_mirror_urls)
+
+
 class RecordingFolderOpener:
     def __init__(self) -> None:
         self.opened: list[Path] = []
 
     def open_folder(self, path: Path) -> None:
         self.opened.append(path)
+
+
+class SimulatedProcessCrash(BaseException):
+    pass
+
+
+class CrashAfterPromotingFile:
+    def promote(self, part_path: Path, final_path: Path) -> None:
+        part_path.replace(final_path)
+        raise SimulatedProcessCrash
 
 
 @pytest.mark.asyncio
@@ -185,6 +235,37 @@ async def test_single_archive_persists_three_levels_and_promotes_valid_mp4(
 
 
 @pytest.mark.asyncio
+async def test_single_archive_persists_failed_tasks_when_work_resolution_fails(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "library"
+    root.mkdir()
+    database = tmp_path / "archive.db"
+    archive = ManagedArchive(
+        database_path=database,
+        work_access=FailingWorkAccess(),
+        media_access=UnexpectedMediaAccess(),
+    )
+
+    with pytest.raises(AppError) as error:
+        await archive.archive_single(
+            SingleArchiveRequest("7429378937383308594", root)
+        )
+
+    assert error.value.code == "UPSTREAM_BLOCKED"
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT lifecycle, phase, result FROM archive_operations"
+        ).fetchall() == [("finished", "idle", "failed")]
+        assert connection.execute(
+            "SELECT lifecycle, phase, result FROM source_tasks"
+        ).fetchall() == [("finished", "idle", "failed")]
+        assert connection.execute(
+            "SELECT lifecycle, phase, result FROM work_tasks"
+        ).fetchall() == [("finished", "idle", "failed")]
+
+
+@pytest.mark.asyncio
 async def test_completed_archive_survives_restart_and_skips_duplicate_download(
     tmp_path: Path,
 ) -> None:
@@ -216,6 +297,69 @@ async def test_completed_archive_survives_restart_and_skips_duplicate_download(
     assert duplicate.archive_item == archived
     assert duplicate.operation.result == "success"
     assert first_media.requests != []
+
+
+@pytest.mark.asyncio
+async def test_restart_recovers_a_file_promoted_just_before_process_crash(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "library"
+    root.mkdir()
+    database = tmp_path / "archive.db"
+    interrupted = ManagedArchive(
+        database_path=database,
+        work_access=StaticWorkAccess(),
+        media_access=StaticMediaAccess(valid_mp4()),
+        file_promoter=CrashAfterPromotingFile(),
+    )
+
+    with pytest.raises(SimulatedProcessCrash):
+        await interrupted.archive_single(
+            SingleArchiveRequest("7429378937383308594", root)
+        )
+
+    restarted = ManagedArchive(
+        database_path=database,
+        work_access=UnexpectedWorkAccess(),
+        media_access=UnexpectedMediaAccess(),
+    )
+    recovered = restarted.get_work_archive("7429378937383308594")
+
+    assert recovered is not None
+    assert recovered.status == "archived"
+    assert (
+        root / recovered.relative_directory / "7429378937383308594.mp4"
+    ).is_file()
+    assert list(root.rglob("*.part")) == []
+
+
+@pytest.mark.asyncio
+async def test_concurrent_requests_for_one_work_share_one_archive_operation(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "library"
+    root.mkdir()
+    work_access = BlockingWorkAccess()
+    media = StaticMediaAccess(valid_mp4())
+    archive = ManagedArchive(
+        database_path=tmp_path / "archive.db",
+        work_access=work_access,
+        media_access=media,
+    )
+    request = SingleArchiveRequest("7429378937383308594", root)
+
+    first = asyncio.create_task(archive.archive_single(request))
+    await work_access.started.wait()
+    second = asyncio.create_task(archive.archive_single(request))
+    await asyncio.sleep(0)
+    work_access.release.set()
+    first_result, second_result = await asyncio.gather(first, second)
+
+    assert work_access.calls == 1
+    assert len(media.requests) == 1
+    assert first_result == second_result
+    assert list(root.rglob("*.mp4")) != []
+    assert list(root.rglob("*.part")) == []
 
 
 @pytest.mark.asyncio
@@ -263,3 +407,67 @@ async def test_invalid_mp4_removes_partial_and_never_registers_archive(
     assert list(root.rglob("*.part")) == []
     assert list(root.rglob("*.mp4")) == []
     assert archive.get_work_archive("7429378937383308594") is None
+
+
+@pytest.mark.asyncio
+async def test_archive_refuses_a_preexisting_reparse_point_in_its_write_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "library"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    author_digest = hashlib.sha256(b"MS4wLjABAAAAstable").hexdigest()[:16]
+    author_directory = root / f"author-{author_digest}"
+    author_directory.mkdir()
+    monkeypatch.setattr(
+        archive_paths,
+        "is_reparse_point",
+        lambda path: path == author_directory,
+    )
+    archive = ManagedArchive(
+        database_path=tmp_path / "archive.db",
+        work_access=StaticWorkAccess(),
+        media_access=StaticMediaAccess(valid_mp4()),
+    )
+
+    with pytest.raises(AppError) as error:
+        await archive.archive_single(
+            SingleArchiveRequest("7429378937383308594", root)
+        )
+
+    assert error.value.code == "ARCHIVE_PATH_INVALID"
+    assert list(outside.rglob("*.mp4")) == []
+    assert list(outside.rglob("*.part")) == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows directory-handle semantics")
+@pytest.mark.asyncio
+async def test_archive_pins_its_validated_write_directory_until_promotion(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "library"
+    root.mkdir()
+    author_digest = hashlib.sha256(b"MS4wLjABAAAAstable").hexdigest()[:16]
+    work_directory = (
+        root
+        / f"author-{author_digest}"
+        / "2024"
+        / "work-7429378937383308594"
+    )
+    media = DirectoryReplacementAttempt(valid_mp4(), work_directory)
+    archive = ManagedArchive(
+        database_path=tmp_path / "archive.db",
+        work_access=StaticWorkAccess(),
+        media_access=media,
+    )
+
+    result = await archive.archive_single(
+        SingleArchiveRequest("7429378937383308594", root)
+    )
+
+    assert media.replacement_was_blocked is True
+    assert (
+        root / result.archive_item.relative_directory / "7429378937383308594.mp4"
+    ).is_file()
