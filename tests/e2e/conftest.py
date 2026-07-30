@@ -46,8 +46,8 @@ class DeterministicParser:
             aweme_id=aweme_id,
             author="钟哥！！",
             description=(
-                "#王者荣耀 #王者荣耀热门 "
-                "这是一段用于验证窄屏自动换行与长内容布局的公开视频描述"
+                "这是一段用于验证单行隐藏与长内容布局的公开视频描述 "
+                "#王者荣耀 #王者荣耀热门"
             ),
             duration_ms=15279,
             cover_urls=("https://p3.douyinpic.com/cover.png",),

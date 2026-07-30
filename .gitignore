@@ -33,6 +33,9 @@ downloads/
 *.webm
 *.part
 
+# Local implementation plans
+docs/superpowers/plans/
+
 # Local development instructions and source-research notes
 AGENTS.md
 AI项目开发总提示词.md

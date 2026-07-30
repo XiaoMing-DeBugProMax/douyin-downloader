@@ -13,6 +13,7 @@ const result = document.querySelector("#result");
 const cover = document.querySelector("#cover");
 const author = document.querySelector("#author");
 const description = document.querySelector("#description");
+const tags = document.querySelector("#tags");
 const duration = document.querySelector("#duration");
 const downloadDefault = document.querySelector("#download-default");
 const downloadCustom = document.querySelector("#download-custom");
@@ -152,15 +153,33 @@ async function responseErrorMessage(response) {
   return UNKNOWN_ERROR;
 }
 
+function splitDescription(value) {
+  const original = typeof value === "string" ? value.trim() : "";
+  const match = original.match(/((?:#[^\s#]+\s*)+)$/u);
+  if (!match) return { description: original, tags: "" };
+
+  return {
+    description: original.slice(0, match.index).trimEnd(),
+    tags: match[1].trim(),
+  };
+}
+
 function renderPreview(video, parseToken) {
   currentParse = {
     token: parseToken,
     suggestedName:
       typeof video.suggested_filename === "string" ? video.suggested_filename : "video.mp4",
   };
+  const displayText = splitDescription(video.description);
+  const descriptionText = displayText.description || "暂无文案";
   cover.src = video.cover_url;
   author.textContent = video.author;
-  description.textContent = video.description || "暂无文案";
+  author.title = video.author;
+  description.textContent = descriptionText;
+  description.title = descriptionText;
+  tags.textContent = displayText.tags;
+  tags.title = displayText.tags;
+  tags.hidden = !displayText.tags;
   duration.textContent = `${Math.round(video.duration_ms / 1000)} 秒`;
   result.hidden = false;
 }
@@ -263,7 +282,12 @@ parseAnother.addEventListener("click", () => {
   result.hidden = true;
   cover.removeAttribute("src");
   author.textContent = "";
+  author.removeAttribute("title");
   description.textContent = "";
+  description.removeAttribute("title");
+  tags.textContent = "";
+  tags.removeAttribute("title");
+  tags.hidden = true;
   duration.textContent = "";
   showNotice("");
   shareText.focus();

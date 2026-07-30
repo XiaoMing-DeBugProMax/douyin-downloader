@@ -78,6 +78,32 @@ def test_parse_preview_theme_and_default_download(page: Page, local_app_url: str
     parse_video(page, local_app_url)
     assert page.locator("#author").inner_text() == "钟哥！！"
     assert page.locator("#duration").inner_text() == "15 秒"
+    description = page.locator("#description")
+    tags = page.locator("#tags")
+    expect(description).to_have_text("这是一段用于验证单行隐藏与长内容布局的公开视频描述")
+    expect(tags).to_have_text("#王者荣耀 #王者荣耀热门")
+    expect(description).to_have_attribute(
+        "title", "这是一段用于验证单行隐藏与长内容布局的公开视频描述"
+    )
+    expect(tags).to_have_attribute("title", "#王者荣耀 #王者荣耀热门")
+    expect(page.locator("#author")).to_have_attribute("title", "钟哥！！")
+    for selector in ("#author", "#description", "#tags"):
+        styles = page.locator(selector).evaluate(
+            """element => {
+              const style = getComputedStyle(element);
+              return {
+                overflow: style.overflow,
+                textOverflow: style.textOverflow,
+                whiteSpace: style.whiteSpace,
+              };
+            }"""
+        )
+        assert styles == {
+            "overflow": "hidden",
+            "textOverflow": "ellipsis",
+            "whiteSpace": "nowrap",
+        }
+    expect(tags).to_have_css("color", "rgb(154, 103, 0)")
 
     with page.expect_download() as download_info:
         page.locator("#download-default").click()
@@ -86,11 +112,92 @@ def test_parse_preview_theme_and_default_download(page: Page, local_app_url: str
     page.locator("#theme-button").click()
     page.locator('[data-theme="dark"]').click()
     assert page.locator("html").get_attribute("data-theme") == "dark"
+    expect(tags).to_have_css("color", "rgb(255, 216, 77)")
+    page.locator("#theme-button").click()
+    page.locator('[data-theme="calm"]').click()
+    expect(tags).to_have_css("color", "rgb(138, 97, 0)")
+    page.locator("#theme-button").click()
+    page.locator('[data-theme="dark"]').click()
     assert page.evaluate("Object.keys(localStorage)") == ["douyin-local-theme"]
 
     page.reload()
     assert page.locator("html").get_attribute("data-theme") == "dark"
     assert page.locator("#result").is_hidden()
+
+
+def test_split_description_only_extracts_trailing_tags(
+    page: Page,
+    local_app_url: str,
+) -> None:
+    page.goto(local_app_url)
+
+    cases = page.evaluate(
+        """() => [
+          splitDescription("普通文案"),
+          splitDescription("普通文案 #单标签"),
+          splitDescription("普通文案#标签一 #标签二"),
+          splitDescription("普通文案 #标签一#标签二"),
+          splitDescription("正文 #中间标签 后面还有文字"),
+          splitDescription("#只有标签"),
+          splitDescription(""),
+        ]"""
+    )
+
+    assert cases == [
+        {"description": "普通文案", "tags": ""},
+        {"description": "普通文案", "tags": "#单标签"},
+        {"description": "普通文案", "tags": "#标签一 #标签二"},
+        {"description": "普通文案", "tags": "#标签一#标签二"},
+        {"description": "正文 #中间标签 后面还有文字", "tags": ""},
+        {"description": "", "tags": "#只有标签"},
+        {"description": "", "tags": ""},
+    ]
+
+
+def test_result_rows_really_overflow_and_missing_tags_take_no_space(
+    page: Page,
+    local_app_url: str,
+) -> None:
+    page.set_viewport_size({"width": 390, "height": 844})
+    page.goto(local_app_url)
+    page.evaluate(
+        """() => renderPreview({
+          author: "这是一个用于验证标题单行省略效果的超长作者名称".repeat(3),
+          description:
+            "这是一个用于验证普通文案单行省略效果的超长视频文案".repeat(3) +
+            " #超长视频标签".repeat(8),
+          duration_ms: 15279,
+          cover_url: "/assets/app-icon.png",
+          suggested_filename: "video.mp4",
+        }, "test-token")"""
+    )
+
+    for selector in ("#author", "#description", "#tags"):
+        metrics = page.locator(selector).evaluate(
+            """element => {
+              const style = getComputedStyle(element);
+              return {
+                clientWidth: element.clientWidth,
+                scrollWidth: element.scrollWidth,
+                height: element.getBoundingClientRect().height,
+                lineHeight: Number.parseFloat(style.lineHeight),
+              };
+            }"""
+        )
+        assert metrics["scrollWidth"] > metrics["clientWidth"]
+        assert metrics["height"] <= metrics["lineHeight"] * 1.1
+
+    page.evaluate(
+        """() => renderPreview({
+          author: "普通作者",
+          description: "没有标签的普通文案",
+          duration_ms: 15279,
+          cover_url: "/assets/app-icon.png",
+          suggested_filename: "video.mp4",
+        }, "test-token")"""
+    )
+    expect(page.locator("#tags")).to_be_hidden()
+    assert page.locator("#tags").bounding_box() is None
 
 
 def test_duplicate_parse_click_has_one_active_request(page: Page, local_app_url: str) -> None:
