@@ -40,4 +40,8 @@ def test_parse_page_uses_safe_text_rendering_and_required_controls() -> None:
     assert "response.body.pipeTo" in script
     assert 'fetch("/api/archive/single"' in script
     assert "/api/archive/work/" in script
+    assert 'state === "needs_repair"' in script
+    assert 'state === "location_unavailable"' in script
+    assert '"待修复"' in script
+    assert '"修复本地归档"' in script
     assert "new Blob" not in script

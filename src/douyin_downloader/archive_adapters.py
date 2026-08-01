@@ -4,7 +4,7 @@ import os
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 
 import httpx
 
@@ -12,25 +12,37 @@ from douyin_downloader.media import open_first_available
 
 
 @dataclass(frozen=True, slots=True)
-class RemoteVideo:
+class RemoteArtifact:
     content_type: str
     expected_size: int | None
     chunks: AsyncIterator[bytes]
 
 
 class MediaAccess(Protocol):
-    async def open_video(self, cdn_mirror_urls: tuple[str, ...]) -> RemoteVideo: ...
+    async def open_video(self, cdn_mirror_urls: tuple[str, ...]) -> RemoteArtifact: ...
+
+    async def open_cover(self, cdn_mirror_urls: tuple[str, ...]) -> RemoteArtifact: ...
 
 
 class HttpMediaAccess:
     def __init__(self, client: httpx.AsyncClient) -> None:
         self._client = client
 
-    async def open_video(self, cdn_mirror_urls: tuple[str, ...]) -> RemoteVideo:
+    async def open_video(self, cdn_mirror_urls: tuple[str, ...]) -> RemoteArtifact:
+        return await self._open(cdn_mirror_urls, "video")
+
+    async def open_cover(self, cdn_mirror_urls: tuple[str, ...]) -> RemoteArtifact:
+        return await self._open(cdn_mirror_urls, "cover")
+
+    async def _open(
+        self,
+        cdn_mirror_urls: tuple[str, ...],
+        kind: Literal["cover", "video"],
+    ) -> RemoteArtifact:
         upstream = await open_first_available(
             self._client,
             cdn_mirror_urls,
-            "video",
+            kind,
         )
         raw_length = upstream.response.headers.get("content-length")
         expected_size: int | None = None
@@ -41,7 +53,7 @@ class HttpMediaAccess:
                 parsed_length = 0
             if parsed_length > 0:
                 expected_size = parsed_length
-        return RemoteVideo(
+        return RemoteArtifact(
             content_type=upstream.content_type,
             expected_size=expected_size,
             chunks=upstream.iter_bytes(),

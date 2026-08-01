@@ -43,6 +43,7 @@ class WorkSnapshot:
     content_type: str
     public_url: str
     description: str
+    tags: tuple[str, ...]
     published_at: int | None
     duration_ms: int
     author: AuthorSnapshot

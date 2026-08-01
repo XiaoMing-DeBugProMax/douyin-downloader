@@ -5,6 +5,9 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
+
+from douyin_downloader.archive_artifacts import ArtifactKind, ArtifactRecord
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,6 +23,8 @@ class StoredArchive:
     aweme_id: str
     root: Path
     relative_directory: Path
+    status: str
+    artifacts: tuple[ArtifactRecord, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,25 +33,26 @@ class PendingPromotion:
     aweme_id: str
     root: Path
     relative_directory: Path
+    artifacts: tuple[ArtifactRecord, ...]
 
 
 class ArchiveStore:
     def __init__(self, database_path: Path) -> None:
         self._database_path = database_path
 
-    def load_completed(self, aweme_id: str) -> StoredArchive | None:
+    def load_archive(self, aweme_id: str) -> StoredArchive | None:
         if not self._database_path.is_file():
             return None
         with self._connection() as connection:
             row = connection.execute(
                 """
                 SELECT o.operation_id, s.source_task_id, w.work_task_id,
-                       i.root_path, i.relative_directory
+                       i.root_path, i.relative_directory, i.status
                 FROM archive_items AS i
                 JOIN archive_operations AS o ON o.operation_id = i.operation_id
                 JOIN source_tasks AS s ON s.operation_id = o.operation_id
                 JOIN work_tasks AS w ON w.source_task_id = s.source_task_id
-                WHERE i.aweme_id = ? AND i.status = 'archived'
+                WHERE i.aweme_id = ?
                 """,
                 (aweme_id,),
             ).fetchone()
@@ -57,7 +63,16 @@ class ArchiveStore:
             aweme_id=aweme_id,
             root=Path(str(row[3])),
             relative_directory=Path(str(row[4])),
+            status=str(row[5]),
+            artifacts=self._load_artifacts(aweme_id),
         )
+
+    def set_archive_status(self, aweme_id: str, status: str) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                "UPDATE archive_items SET status=? WHERE aweme_id=?",
+                (status, aweme_id),
+            )
 
     def create_running(
         self,
@@ -88,11 +103,48 @@ class ArchiveStore:
         aweme_id: str,
         root: Path,
         relative_directory: Path,
+        artifacts: tuple[ArtifactRecord, ...],
     ) -> None:
         with self._connection() as connection:
             connection.execute(
-                "INSERT INTO archive_items VALUES (?, ?, ?, ?, 'promoting')",
+                """
+                INSERT INTO archive_items VALUES (?, ?, ?, ?, 'promoting')
+                ON CONFLICT(aweme_id) DO UPDATE SET
+                    operation_id=excluded.operation_id,
+                    root_path=excluded.root_path,
+                    relative_directory=excluded.relative_directory,
+                    status='promoting'
+                """,
                 (aweme_id, ids.operation, str(root), str(relative_directory)),
+            )
+            connection.execute(
+                "DELETE FROM archive_artifacts WHERE aweme_id=?",
+                (aweme_id,),
+            )
+            connection.executemany(
+                """
+                INSERT INTO archive_artifacts
+                    (aweme_id, kind, relative_path, part_relative_path,
+                     size_bytes, mime_type, sha256, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    (
+                        aweme_id,
+                        artifact.kind,
+                        str(artifact.relative_path),
+                        (
+                            str(artifact.part_relative_path)
+                            if artifact.part_relative_path is not None
+                            else None
+                        ),
+                        artifact.size_bytes,
+                        artifact.mime_type,
+                        artifact.sha256,
+                        artifact.status,
+                    )
+                    for artifact in artifacts
+                ),
             )
 
     def finish_promotion(self, ids: TaskIds, aweme_id: str) -> None:
@@ -101,6 +153,11 @@ class ArchiveStore:
                 "UPDATE archive_items SET status='archived' "
                 "WHERE aweme_id=? AND operation_id=?",
                 (aweme_id, ids.operation),
+            )
+            connection.execute(
+                "UPDATE archive_artifacts SET status='archived', "
+                "part_relative_path=NULL WHERE aweme_id=?",
+                (aweme_id,),
             )
             _set_task_results(connection, ids, "success")
 
@@ -131,6 +188,7 @@ class ArchiveStore:
                 aweme_id=str(row[0]),
                 root=Path(str(row[2])),
                 relative_directory=Path(str(row[3])),
+                artifacts=self._load_artifacts(str(row[0])),
             )
             for row in rows
         )
@@ -138,8 +196,14 @@ class ArchiveStore:
     def discard_promotion(self, promotion: PendingPromotion) -> None:
         with self._connection() as connection:
             connection.execute(
-                "DELETE FROM archive_items WHERE aweme_id=? AND operation_id=?",
+                "UPDATE archive_items SET status='needs_repair' "
+                "WHERE aweme_id=? AND operation_id=?",
                 (promotion.aweme_id, promotion.ids.operation),
+            )
+            connection.execute(
+                "UPDATE archive_artifacts SET status='needs_repair', "
+                "part_relative_path=NULL WHERE aweme_id=?",
+                (promotion.aweme_id,),
             )
             _set_task_results(connection, promotion.ids, "failed")
 
@@ -178,9 +242,46 @@ class ArchiveStore:
                 relative_directory TEXT NOT NULL,
                 status TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS archive_artifacts (
+                aweme_id TEXT NOT NULL REFERENCES archive_items(aweme_id)
+                    ON DELETE CASCADE,
+                kind TEXT NOT NULL,
+                relative_path TEXT NOT NULL,
+                part_relative_path TEXT,
+                size_bytes INTEGER NOT NULL,
+                mime_type TEXT NOT NULL,
+                sha256 TEXT NOT NULL,
+                status TEXT NOT NULL,
+                PRIMARY KEY (aweme_id, kind)
+            );
             """
         )
         return connection
+
+    def _load_artifacts(self, aweme_id: str) -> tuple[ArtifactRecord, ...]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT kind, relative_path, part_relative_path,
+                       size_bytes, mime_type, sha256, status
+                FROM archive_artifacts
+                WHERE aweme_id=?
+                ORDER BY kind
+                """,
+                (aweme_id,),
+            ).fetchall()
+        return tuple(
+            ArtifactRecord(
+                kind=cast(ArtifactKind, str(row[0])),
+                relative_path=Path(str(row[1])),
+                part_relative_path=Path(str(row[2])) if row[2] is not None else None,
+                size_bytes=int(row[3]),
+                mime_type=str(row[4]),
+                sha256=str(row[5]),
+                status=str(row[6]),
+            )
+            for row in rows
+        )
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:

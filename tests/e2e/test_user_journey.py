@@ -166,7 +166,10 @@ def test_managed_archive_strip_updates_and_opens_folder(
 
     expect(page.locator("#archive-status")).to_have_text("已归档")
     expect(page.locator("#archive-open")).to_be_visible()
-    page.locator("#archive-open").click()
+    with page.expect_response(
+        lambda response: response.url.endswith("/open") and response.status == 204
+    ):
+        page.locator("#archive-open").click()
     assert len(opened) == 1
 
 

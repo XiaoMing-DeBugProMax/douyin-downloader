@@ -1,3 +1,4 @@
+import threading
 from pathlib import Path
 
 import httpx
@@ -42,6 +43,8 @@ class RecordingManagedArchive:
         self.requests: list[SingleArchiveRequest] = []
         self.items: dict[str, ArchiveItemSnapshot] = {}
         self.opened: list[str] = []
+        self.status_thread_ids: list[int] = []
+        self.open_thread_ids: list[int] = []
 
     async def archive_single(
         self,
@@ -63,9 +66,11 @@ class RecordingManagedArchive:
         )
 
     def get_work_archive(self, aweme_id: str) -> ArchiveItemSnapshot | None:
+        self.status_thread_ids.append(threading.get_ident())
         return self.items.get(aweme_id)
 
     def open_work_folder(self, aweme_id: str) -> None:
+        self.open_thread_ids.append(threading.get_ident())
         self.opened.append(aweme_id)
 
 
@@ -84,6 +89,7 @@ async def test_archive_route_uses_parse_token_without_exposing_paths_or_media_ur
     store = ParseStore()
     parse_token = store.put(VIDEO)
     managed_archive = RecordingManagedArchive()
+    event_loop_thread_id = threading.get_ident()
     sessions = SessionManager()
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(lambda _: httpx.Response(404))
@@ -135,3 +141,41 @@ async def test_archive_route_uses_parse_token_without_exposing_paths_or_media_ur
     }
     assert open_response.status_code == 204
     assert managed_archive.opened == [VIDEO.aweme_id]
+    assert managed_archive.status_thread_ids != [event_loop_thread_id]
+    assert managed_archive.open_thread_ids != [event_loop_thread_id]
+
+
+@pytest.mark.asyncio
+async def test_location_unavailable_archive_cannot_open_folder(tmp_path: Path) -> None:
+    managed_archive = RecordingManagedArchive()
+    managed_archive.items[VIDEO.aweme_id] = ArchiveItemSnapshot(
+        VIDEO.aweme_id,
+        "location_unavailable",
+        tmp_path / "missing",
+    )
+    sessions = SessionManager()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(404))
+    ) as media_client:
+        app = create_app(
+            services=AppServices(
+                parse_service=ParseService(UnusedResolver(), UnusedParser(), ParseStore()),
+                media_client=media_client,
+                managed_archive=managed_archive,
+            ),
+            session_manager=sessions,
+            testing=True,
+        )
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://testserver",
+        ) as client:
+            client.cookies.set("douyin_local_session", sessions.cookie_token)
+            response = await client.get(f"/api/archive/work/{VIDEO.aweme_id}")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "aweme_id": VIDEO.aweme_id,
+        "status": "location_unavailable",
+        "can_open_folder": False,
+    }

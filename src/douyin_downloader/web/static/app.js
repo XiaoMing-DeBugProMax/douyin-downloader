@@ -27,6 +27,7 @@ const themeChoices = Array.from(themeMenu.querySelectorAll("[data-theme]"));
 
 let currentParse = null;
 let isParsing = false;
+let currentArchiveState = "not_archived";
 
 function storedTheme() {
   try {
@@ -191,16 +192,24 @@ function renderPreview(video, parseToken) {
 }
 
 function setArchiveState(state) {
+  currentArchiveState = state;
   const archived = state === "archived";
+  const needsRepair = state === "needs_repair";
+  const locationUnavailable = state === "location_unavailable";
   const unavailable = state === "unavailable";
   archiveStatus.textContent = archived
     ? "已归档"
+    : needsRepair
+      ? "待修复"
+      : locationUnavailable
+        ? "位置不可用"
     : unavailable
       ? "归档暂时不可用"
       : "尚未归档";
-  archiveStart.hidden = archived;
-  archiveStart.disabled = unavailable;
-  archiveOpen.hidden = !archived;
+  archiveStart.hidden = archived || locationUnavailable;
+  archiveStart.disabled = unavailable || locationUnavailable;
+  archiveStart.textContent = needsRepair ? "修复本地归档" : "加入本地归档";
+  archiveOpen.hidden = !(archived || needsRepair);
 }
 
 async function refreshArchiveStatus(awemeId) {
@@ -325,12 +334,11 @@ archiveStart.addEventListener("click", async () => {
     }
     const payload = await response.json();
     setArchiveState(payload.status);
-    showNotice("视频已加入本地归档。");
+    showNotice("本地归档已更新。");
   } catch (_) {
     showError(UNKNOWN_ERROR);
   } finally {
-    archiveStart.disabled = false;
-    archiveStart.textContent = "加入本地归档";
+    setArchiveState(currentArchiveState);
   }
 });
 

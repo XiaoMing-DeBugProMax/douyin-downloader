@@ -208,11 +208,16 @@ def build_router() -> APIRouter:
     ) -> ArchiveWorkResponse:
         if not aweme_id.isdigit():
             raise AppError("INVALID_INPUT", "作品标识无效。", 400)
-        item = _managed_archive(request).get_work_archive(aweme_id)
+        item = await asyncio.to_thread(
+            _managed_archive(request).get_work_archive,
+            aweme_id,
+        )
         return ArchiveWorkResponse(
             aweme_id=aweme_id,
             status=item.status if item is not None else "not_archived",
-            can_open_folder=item is not None,
+            can_open_folder=(
+                item is not None and item.status != "location_unavailable"
+            ),
         )
 
     @router.post(
@@ -226,7 +231,10 @@ def build_router() -> APIRouter:
     ) -> Response:
         if not aweme_id.isdigit():
             raise AppError("INVALID_INPUT", "作品标识无效。", 400)
-        _managed_archive(request).open_work_folder(aweme_id)
+        await asyncio.to_thread(
+            _managed_archive(request).open_work_folder,
+            aweme_id,
+        )
         return Response(status_code=204)
 
     return router

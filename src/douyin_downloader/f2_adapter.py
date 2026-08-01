@@ -101,6 +101,7 @@ class _PostDetailView:
     author_uid: Any
     nickname_raw: Any
     desc_raw: Any
+    text_extra: Any
     duration: Any
     cover: Any
     cover_urls: Any
@@ -133,6 +134,23 @@ def _dedupe_urls(*groups: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(url for group in groups for url in group))
 
 
+def _hashtags(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        return ()
+    names = (
+        item.get("hashtag_name")
+        for item in value
+        if isinstance(item, dict)
+    )
+    return tuple(
+        dict.fromkeys(
+            name.strip()
+            for name in names
+            if isinstance(name, str) and name.strip()
+        )
+    )
+
+
 def _post_detail_filter(payload: dict[str, object]) -> _PostDetailView:
     # This is the subset of f2 0.0.1.7 PostDetailFilter consumed by
     # map_post_detail. Importing the upstream filter also imports
@@ -145,6 +163,7 @@ def _post_detail_filter(payload: dict[str, object]) -> _PostDetailView:
         author_uid=_nested(payload, "aweme_detail", "author", "uid"),
         nickname_raw=_nested(payload, "aweme_detail", "author", "nickname"),
         desc_raw=_nested(payload, "aweme_detail", "desc"),
+        text_extra=_nested(payload, "aweme_detail", "text_extra"),
         duration=_nested(payload, "aweme_detail", "duration"),
         cover=_nested(
             payload,
@@ -435,6 +454,7 @@ def _map_resolved_work(detail: Any) -> ResolvedWork:
             content_type="video",
             public_url=f"https://www.douyin.com/video/{aweme_id}",
             description=str(detail.desc_raw or ""),
+            tags=_hashtags(getattr(detail, "text_extra", None)),
             published_at=_optional_int(getattr(detail, "create_time", None)),
             duration_ms=int(detail.duration or 0),
             author=AuthorSnapshot(

@@ -27,6 +27,7 @@ class StaticPostDetail:
                 "aweme_type": 0,
                 "create_time": 1_720_000_000,
                 "desc": "作品文案 #标签",
+                "text_extra": [{"hashtag_name": "标签"}],
                 "duration": 15_279,
                 "images": [],
                 "author": {
@@ -107,6 +108,7 @@ async def test_work_access_returns_filtered_stable_snapshot() -> None:
             content_type="video",
             public_url="https://www.douyin.com/video/7429378937383308594",
             description="作品文案 #标签",
+            tags=("标签",),
             published_at=1_720_000_000,
             duration_ms=15_279,
             author=AuthorSnapshot(
