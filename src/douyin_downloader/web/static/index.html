@@ -48,7 +48,18 @@
       </div>
     </header>
 
+    <nav class="workspace-nav" aria-label="工作区">
+      <div class="workspace-tabs" role="tablist" aria-label="应用工作区">
+        <button id="tab-quick" type="button" role="tab" data-workspace="quick" aria-selected="true" aria-controls="quick-workspace" tabindex="0">快速下载</button>
+        <button id="tab-batch" type="button" role="tab" data-workspace="batch" aria-selected="false" aria-controls="batch-workspace" tabindex="-1">批量下载</button>
+        <button id="tab-tasks" type="button" role="tab" data-workspace="tasks" aria-selected="false" aria-controls="tasks-workspace" tabindex="-1">任务中心</button>
+        <button id="tab-library" type="button" role="tab" data-workspace="library" aria-selected="false" aria-controls="library-workspace" tabindex="-1">本地档案库</button>
+        <button id="tab-settings" type="button" role="tab" data-workspace="settings" aria-selected="false" aria-controls="settings-workspace" tabindex="-1">设置</button>
+      </div>
+    </nav>
+
     <main id="main-content" class="page-shell" tabindex="-1">
+      <section id="quick-workspace" class="workspace-panel" role="tabpanel" aria-labelledby="tab-quick">
       <section class="intro" aria-labelledby="page-title">
         <p class="eyebrow">LOCAL VIDEO TOOL</p>
         <h1 id="page-title">把分享链接，变成一段视频。</h1>
@@ -123,6 +134,76 @@
       </section>
 
       <p class="usage-note">仅下载你拥有权利或已获授权的公开视频。</p>
+      </section>
+
+      <section id="batch-workspace" class="workspace-panel placeholder-workspace" role="tabpanel" aria-labelledby="tab-batch" hidden>
+        <p class="eyebrow">BATCH ARCHIVE</p>
+        <h1>批量下载</h1>
+        <p>主页、合集与其他公开来源的批量采集将在后续规格中接入。</p>
+      </section>
+
+      <section id="tasks-workspace" class="workspace-panel placeholder-workspace" role="tabpanel" aria-labelledby="tab-tasks" hidden>
+        <p class="eyebrow">TASK CENTER</p>
+        <h1>任务中心</h1>
+        <p>持久任务、进度与失败重试将在本周期后续功能中开放。</p>
+      </section>
+
+      <section id="library-workspace" class="workspace-panel placeholder-workspace" role="tabpanel" aria-labelledby="tab-library" hidden>
+        <p class="eyebrow">LOCAL ARCHIVE</p>
+        <h1>本地档案库</h1>
+        <p>已归档作品的检索与管理将在本周期后续功能中开放。</p>
+      </section>
+
+      <section id="settings-workspace" class="workspace-panel settings-workspace" role="tabpanel" aria-labelledby="tab-settings" hidden>
+        <div class="workspace-heading">
+          <p class="eyebrow">LOCAL SETTINGS</p>
+          <h1>设置</h1>
+          <p>这些默认值只影响之后创建的归档操作，已有档案不会被移动。</p>
+        </div>
+
+        <form id="settings-form" class="settings-panel" novalidate>
+          <div class="settings-field settings-root-field">
+            <label for="settings-root">默认归档根目录</label>
+            <div class="settings-inline">
+              <input id="settings-root" type="text" readonly placeholder="尚未选择">
+              <button id="settings-root-select" class="button button-secondary" type="button">选择文件夹</button>
+            </div>
+            <p>应用只会在你明确选择的目录内创建固定的作者、年份和作品目录。</p>
+          </div>
+
+          <div class="settings-field">
+            <label for="settings-template">基础名称模板</label>
+            <input id="settings-template" type="text" maxlength="200" aria-describedby="settings-template-help settings-error">
+            <p id="settings-template-help">可用字段：{date}、{author}、{description}、{aweme_id}。模板不能改变目录。</p>
+          </div>
+
+          <fieldset class="settings-field profile-field">
+            <legend>默认归档方案</legend>
+            <label><input id="settings-audio" type="checkbox"> 提取完整视频音轨 M4A</label>
+            <label><input id="settings-description" type="checkbox"> 导出作品文案 TXT</label>
+            <p>可先保存方案；音轨与文案生成将在下一阶段启用，启用前归档会明确提示。</p>
+          </fieldset>
+
+          <div class="settings-grid">
+            <div class="settings-field">
+              <label for="settings-concurrency">下载并发</label>
+              <input id="settings-concurrency" type="number" min="1" max="5" step="1" inputmode="numeric">
+              <p>允许 1 至 5，默认 3。</p>
+            </div>
+            <div class="settings-field">
+              <label for="settings-retry">失败重试</label>
+              <input id="settings-retry" type="number" min="0" max="3" step="1" inputmode="numeric">
+              <p>允许 0 至 3，默认 3。</p>
+            </div>
+          </div>
+
+          <div class="settings-feedback">
+            <p id="settings-status" role="status" aria-live="polite"></p>
+            <p id="settings-error" role="alert"></p>
+          </div>
+          <button id="settings-save" class="button button-primary" type="submit">保存设置</button>
+        </form>
+      </section>
     </main>
 
     <script src="/assets/app.js" defer></script>

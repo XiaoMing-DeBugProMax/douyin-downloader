@@ -384,7 +384,7 @@ def test_keyboard_focus_theme_menu_and_skip_link(page: Page, local_app_url: str)
     expect(page.locator('#theme-menu [data-theme="calm"]')).to_be_focused()
     page.keyboard.press("Tab")
     expect(page.locator("#theme-menu")).to_be_hidden()
-    expect(page.locator("#share-text")).to_be_focused()
+    expect(page.locator("#tab-quick")).to_be_focused()
 
     page.locator("#theme-button").focus()
     page.keyboard.press("Enter")
@@ -394,10 +394,55 @@ def test_keyboard_focus_theme_menu_and_skip_link(page: Page, local_app_url: str)
     expect(page.locator("#theme-button")).to_be_focused()
 
 
+def test_settings_workspace_persists_and_keeps_theme_and_keyboard_navigation(
+    page: Page,
+    local_app_url: str,
+) -> None:
+    page.goto(local_app_url)
+    settings_tab = page.get_by_role("tab", name="设置", exact=True)
+    settings_tab.click()
+    expect(page.locator("#settings-workspace")).to_be_visible()
+
+    with page.expect_response(
+        lambda response: response.url.endswith("/api/settings/archive-root/select")
+        and response.status == 200
+    ):
+        page.locator("#settings-root-select").click()
+    expect(page.locator("#settings-root")).not_to_have_value("")
+
+    page.locator("#settings-template").fill("{date}-{author}-{aweme_id}")
+    page.locator("#settings-concurrency").fill("5")
+    page.locator("#settings-retry").fill("1")
+    page.locator("#settings-audio").check()
+    page.locator("#settings-save").click()
+    expect(page.locator("#settings-status")).to_have_text("设置已保存。")
+
+    page.locator("#theme-button").click()
+    page.locator('[data-theme="dark"]').click()
+    expect(page.locator("html")).to_have_attribute("data-theme", "dark")
+
+    page.reload()
+    settings_tab = page.get_by_role("tab", name="设置", exact=True)
+    settings_tab.focus()
+    page.keyboard.press("ArrowLeft")
+    expect(page.get_by_role("tab", name="本地档案库", exact=True)).to_be_focused()
+    page.keyboard.press("End")
+    expect(settings_tab).to_be_focused()
+    page.keyboard.press("Enter")
+
+    expect(page.locator("#settings-template")).to_have_value(
+        "{date}-{author}-{aweme_id}"
+    )
+    expect(page.locator("#settings-concurrency")).to_have_value("5")
+    expect(page.locator("#settings-retry")).to_have_value("1")
+    expect(page.locator("#settings-audio")).to_be_checked()
+    expect(page.locator("html")).to_have_attribute("data-theme", "dark")
+
+
 def test_light_theme_small_text_meets_wcag_aa(page: Page, local_app_url: str) -> None:
     page.goto(local_app_url)
     for selector, background, pseudo in (
-        (".eyebrow", "--page", ""),
+        ("#quick-workspace .eyebrow", "--page", ""),
         (".intro-copy", "--page", ""),
         (".input-hint", "--panel", ""),
         ("#share-text", "--panel-soft", "::placeholder"),

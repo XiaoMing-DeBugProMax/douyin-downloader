@@ -5,6 +5,7 @@ import threading
 import time
 from collections.abc import Iterator
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import httpx
 import pytest
@@ -14,6 +15,7 @@ from playwright.sync_api import Page, sync_playwright
 from douyin_downloader.domain import AppError, ParsedVideo, ResolvedShare
 from douyin_downloader.parse_service import ParseService
 from douyin_downloader.session import COOKIE_NAME, SessionManager
+from douyin_downloader.settings import SettingsModule
 from douyin_downloader.store import ParseStore
 from douyin_downloader.web.app import create_app
 from douyin_downloader.web.routes import AppServices
@@ -63,10 +65,23 @@ def media_transport(request: httpx.Request) -> httpx.Response:
     return httpx.Response(404)
 
 
+class StaticDirectoryChooser:
+    def __init__(self, selected: Path) -> None:
+        self._selected = selected
+
+    def choose_directory(self) -> Path:
+        return self._selected
+
+
 @pytest.fixture(scope="session")
 def _local_app_server() -> Iterator[tuple[str, SessionManager]]:
     sessions = SessionManager()
     media_client = httpx.AsyncClient(transport=httpx.MockTransport(media_transport))
+    runtime_directory = TemporaryDirectory(prefix="douyin-e2e-")
+    runtime_path = Path(runtime_directory.name)
+    archive_root = runtime_path / "library"
+    archive_root.mkdir()
+    settings = SettingsModule(runtime_path / "archive.db")
 
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -82,6 +97,8 @@ def _local_app_server() -> Iterator[tuple[str, SessionManager]]:
                 ParseStore(),
             ),
             media_client=media_client,
+            settings=settings,
+            directory_chooser=StaticDirectoryChooser(archive_root),
         ),
         session_manager=sessions,
         expected_port=port,
@@ -112,6 +129,7 @@ def _local_app_server() -> Iterator[tuple[str, SessionManager]]:
             thread.join(timeout=10)
         server_socket.close()
         asyncio.run(media_client.aclose())
+        runtime_directory.cleanup()
     assert not thread.is_alive(), "local E2E server did not stop"
 
 

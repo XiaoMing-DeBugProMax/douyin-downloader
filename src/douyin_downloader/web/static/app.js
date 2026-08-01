@@ -24,10 +24,24 @@ const parseAnother = document.querySelector("#parse-another");
 const themeButton = document.querySelector("#theme-button");
 const themeMenu = document.querySelector("#theme-menu");
 const themeChoices = Array.from(themeMenu.querySelectorAll("[data-theme]"));
+const workspaceTabs = Array.from(document.querySelectorAll("[data-workspace]"));
+const workspacePanels = Array.from(document.querySelectorAll(".workspace-panel"));
+const settingsForm = document.querySelector("#settings-form");
+const settingsRoot = document.querySelector("#settings-root");
+const settingsRootSelect = document.querySelector("#settings-root-select");
+const settingsTemplate = document.querySelector("#settings-template");
+const settingsAudio = document.querySelector("#settings-audio");
+const settingsDescription = document.querySelector("#settings-description");
+const settingsConcurrency = document.querySelector("#settings-concurrency");
+const settingsRetry = document.querySelector("#settings-retry");
+const settingsSave = document.querySelector("#settings-save");
+const settingsStatus = document.querySelector("#settings-status");
+const settingsError = document.querySelector("#settings-error");
 
 let currentParse = null;
 let isParsing = false;
 let currentArchiveState = "not_archived";
+let settingsLoaded = false;
 
 function storedTheme() {
   try {
@@ -135,6 +149,49 @@ document.addEventListener("keydown", (event) => {
   }
 });
 
+function workspaceTabIndex(tab) {
+  const index = workspaceTabs.indexOf(tab);
+  return index >= 0 ? index : 0;
+}
+
+function focusWorkspaceTab(index) {
+  const normalized = (index + workspaceTabs.length) % workspaceTabs.length;
+  workspaceTabs[normalized].focus();
+}
+
+function activateWorkspace(name) {
+  for (const tab of workspaceTabs) {
+    const selected = tab.dataset.workspace === name;
+    tab.setAttribute("aria-selected", String(selected));
+    tab.tabIndex = selected ? 0 : -1;
+  }
+  for (const panel of workspacePanels) {
+    panel.hidden = panel.id !== `${name}-workspace`;
+  }
+  if (name === "settings") loadSettings();
+}
+
+for (const tab of workspaceTabs) {
+  tab.addEventListener("click", () => activateWorkspace(tab.dataset.workspace));
+  tab.addEventListener("keydown", (event) => {
+    const index = workspaceTabIndex(tab);
+    let nextIndex = null;
+    if (event.key === "ArrowRight") nextIndex = index + 1;
+    if (event.key === "ArrowLeft") nextIndex = index - 1;
+    if (event.key === "Home") nextIndex = 0;
+    if (event.key === "End") nextIndex = workspaceTabs.length - 1;
+    if (nextIndex !== null) {
+      event.preventDefault();
+      focusWorkspaceTab(nextIndex);
+      return;
+    }
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      activateWorkspace(tab.dataset.workspace);
+    }
+  });
+}
+
 function showNotice(message) {
   status.textContent = message;
   errorAlert.textContent = "";
@@ -145,17 +202,124 @@ function showError(message) {
   status.textContent = "";
 }
 
-async function responseErrorMessage(response) {
+async function responseError(response) {
   try {
     const payload = await response.json();
     if (typeof payload?.error?.message === "string" && payload.error.message.trim()) {
-      return payload.error.message;
+      return { code: payload.error.code, message: payload.error.message };
     }
   } catch (_) {
     // Fall through to the stable unknown-error copy.
   }
-  return UNKNOWN_ERROR;
+  return { code: "UNKNOWN", message: UNKNOWN_ERROR };
 }
+
+async function responseErrorMessage(response) {
+  return (await responseError(response)).message;
+}
+
+function renderSettings(payload) {
+  settingsRoot.value = typeof payload.archive_root === "string" ? payload.archive_root : "";
+  settingsTemplate.value = payload.naming_template;
+  settingsAudio.checked = payload.profile.include_audio;
+  settingsDescription.checked = payload.profile.include_description;
+  settingsConcurrency.value = String(payload.download_concurrency);
+  settingsRetry.value = String(payload.retry_limit);
+}
+
+function showSettingsNotice(message) {
+  settingsStatus.textContent = message;
+  settingsError.textContent = "";
+}
+
+function showSettingsError(message, target = null) {
+  settingsError.textContent = message;
+  settingsStatus.textContent = "";
+  if (target) target.focus();
+}
+
+async function loadSettings(force = false) {
+  if (settingsLoaded && !force) return;
+  try {
+    const response = await fetch("/api/settings");
+    if (!response.ok) {
+      showSettingsError(await responseErrorMessage(response));
+      return;
+    }
+    renderSettings(await response.json());
+    settingsLoaded = true;
+  } catch (_) {
+    showSettingsError(UNKNOWN_ERROR);
+  }
+}
+
+settingsRootSelect.addEventListener("click", async () => {
+  settingsRootSelect.disabled = true;
+  try {
+    const response = await fetch("/api/settings/archive-root/select", { method: "POST" });
+    if (!response.ok) {
+      const failure = await responseError(response);
+      if (failure.code !== "ARCHIVE_SELECTION_CANCELLED") {
+        showSettingsError(failure.message);
+      }
+      return;
+    }
+    renderSettings(await response.json());
+    settingsLoaded = true;
+    showSettingsNotice("归档根目录已更新。")
+  } catch (_) {
+    showSettingsError(UNKNOWN_ERROR);
+  } finally {
+    settingsRootSelect.disabled = false;
+  }
+});
+
+settingsForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const concurrency = Number(settingsConcurrency.value);
+  const retryLimit = Number(settingsRetry.value);
+  const template = settingsTemplate.value.trim();
+  if (!template || /[\\/]/u.test(template)) {
+    showSettingsError("基础名称模板不能包含目录分隔符。", settingsTemplate);
+    return;
+  }
+  if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 5) {
+    showSettingsError("下载并发必须是 1 到 5 之间的整数。", settingsConcurrency);
+    return;
+  }
+  if (!Number.isInteger(retryLimit) || retryLimit < 0 || retryLimit > 3) {
+    showSettingsError("失败重试必须是 0 到 3 之间的整数。", settingsRetry);
+    return;
+  }
+
+  settingsSave.disabled = true;
+  try {
+    const response = await fetch("/api/settings", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        naming_template: template,
+        profile: {
+          include_audio: settingsAudio.checked,
+          include_description: settingsDescription.checked,
+        },
+        download_concurrency: concurrency,
+        retry_limit: retryLimit,
+      }),
+    });
+    if (!response.ok) {
+      showSettingsError(await responseErrorMessage(response));
+      return;
+    }
+    renderSettings(await response.json());
+    settingsLoaded = true;
+    showSettingsNotice("设置已保存。");
+  } catch (_) {
+    showSettingsError(UNKNOWN_ERROR);
+  } finally {
+    settingsSave.disabled = false;
+  }
+});
 
 function splitDescription(value) {
   const original = typeof value === "string" ? value.trim() : "";
@@ -329,7 +493,8 @@ archiveStart.addEventListener("click", async () => {
       body: JSON.stringify({ parse_token: currentParse.token }),
     });
     if (!response.ok) {
-      if (response.status !== 409) showError(await responseErrorMessage(response));
+      const failure = await responseError(response);
+      if (failure.code !== "ARCHIVE_SELECTION_CANCELLED") showError(failure.message);
       return;
     }
     const payload = await response.json();
