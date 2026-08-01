@@ -5,7 +5,12 @@ from pathlib import Path
 
 import pytest
 
-from douyin_downloader.resources import app_icon_path, static_resource_path
+from douyin_downloader.resources import (
+    app_icon_path,
+    ffmpeg_executable_path,
+    ffprobe_executable_path,
+    static_resource_path,
+)
 
 STATIC_NAMES = ("index.html", "styles.css", "app.js", "app-icon.png")
 
@@ -38,6 +43,19 @@ def test_packaged_resources_resolve_below_meipass(
     for name in STATIC_NAMES:
         assert static_resource_path(name) == static_dir / name
     assert app_icon_path() == icon
+    assert ffmpeg_executable_path() == bundle_root / "ffmpeg" / "ffmpeg.exe"
+    assert ffprobe_executable_path() == bundle_root / "ffmpeg" / "ffprobe.exe"
+
+
+def test_source_media_tools_resolve_below_the_managed_dependency_cache() -> None:
+    project_root = Path(__file__).parents[2]
+
+    assert ffmpeg_executable_path() == (
+        project_root / ".deps" / "ffmpeg" / "bin" / "ffmpeg.exe"
+    )
+    assert ffprobe_executable_path() == (
+        project_root / ".deps" / "ffmpeg" / "bin" / "ffprobe.exe"
+    )
 
 
 def test_packaging_manifest_never_collects_f2_dependency_data() -> None:

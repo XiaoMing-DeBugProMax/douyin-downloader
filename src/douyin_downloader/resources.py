@@ -28,3 +28,18 @@ def app_icon_path() -> Path:
     if bundle_root is not None:
         return Path(bundle_root) / "assets" / "app-icon.ico"
     return Path(__file__).resolve().parents[2] / "assets" / "app-icon.ico"
+
+
+def ffmpeg_executable_path() -> Path:
+    return _media_tool_directory() / "ffmpeg.exe"
+
+
+def ffprobe_executable_path() -> Path:
+    return _media_tool_directory() / "ffprobe.exe"
+
+
+def _media_tool_directory() -> Path:
+    bundle_root = getattr(sys, "_MEIPASS", None)
+    if bundle_root is not None:
+        return Path(bundle_root) / "ffmpeg"
+    return Path(__file__).resolve().parents[2] / ".deps" / "ffmpeg" / "bin"
