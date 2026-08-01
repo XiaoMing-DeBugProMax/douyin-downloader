@@ -142,6 +142,8 @@ def test_managed_archive_strip_updates_and_opens_folder(
                 json={
                     "aweme_id": "7429378937383308594",
                     "status": "not_archived",
+                    "audio_outcome": "not_requested",
+                    "description_outcome": "not_requested",
                     "can_open_folder": False,
                 },
             )
@@ -155,6 +157,8 @@ def test_managed_archive_strip_updates_and_opens_folder(
                 "operation_id": "operation-1",
                 "aweme_id": "7429378937383308594",
                 "status": "archived",
+                "audio_outcome": "no_audio",
+                "description_outcome": "ready",
                 "can_open_folder": True,
             },
         ),
@@ -164,7 +168,9 @@ def test_managed_archive_strip_updates_and_opens_folder(
 
     page.locator("#archive-start").click()
 
-    expect(page.locator("#archive-status")).to_have_text("已归档")
+    expect(page.locator("#archive-status")).to_have_text(
+        "已归档 · 音轨：无音轨 · 文案：已导出"
+    )
     expect(page.locator("#archive-open")).to_be_visible()
     with page.expect_response(
         lambda response: response.url.endswith("/open") and response.status == 204

@@ -131,6 +131,8 @@ async def test_archive_route_uses_parse_token_without_exposing_paths_or_media_ur
         "operation_id": "task-id",
         "aweme_id": VIDEO.aweme_id,
         "status": "archived",
+        "audio_outcome": "not_requested",
+        "description_outcome": "not_requested",
         "can_open_folder": True,
     }
     assert managed_archive.requests == [
@@ -141,6 +143,8 @@ async def test_archive_route_uses_parse_token_without_exposing_paths_or_media_ur
     assert status_response.json() == {
         "aweme_id": VIDEO.aweme_id,
         "status": "archived",
+        "audio_outcome": "not_requested",
+        "description_outcome": "not_requested",
         "can_open_folder": True,
     }
     assert open_response.status_code == 204
@@ -181,5 +185,7 @@ async def test_location_unavailable_archive_cannot_open_folder(tmp_path: Path) -
     assert response.json() == {
         "aweme_id": VIDEO.aweme_id,
         "status": "location_unavailable",
+        "audio_outcome": "not_requested",
+        "description_outcome": "not_requested",
         "can_open_folder": False,
     }

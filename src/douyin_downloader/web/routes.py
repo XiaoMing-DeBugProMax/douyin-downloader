@@ -88,12 +88,16 @@ class ArchiveResponse(BaseModel):
     operation_id: str
     aweme_id: str
     status: str
+    audio_outcome: str
+    description_outcome: str
     can_open_folder: bool
 
 
 class ArchiveWorkResponse(BaseModel):
     aweme_id: str
     status: str
+    audio_outcome: str
+    description_outcome: str
     can_open_folder: bool
 
 
@@ -271,6 +275,8 @@ def build_router() -> APIRouter:
             operation_id=result.operation.task_id,
             aweme_id=result.archive_item.aweme_id,
             status=result.archive_item.status,
+            audio_outcome=result.archive_item.audio_outcome,
+            description_outcome=result.archive_item.description_outcome,
             can_open_folder=True,
         )
 
@@ -346,6 +352,12 @@ def build_router() -> APIRouter:
         return ArchiveWorkResponse(
             aweme_id=aweme_id,
             status=item.status if item is not None else "not_archived",
+            audio_outcome=(
+                item.audio_outcome if item is not None else "not_requested"
+            ),
+            description_outcome=(
+                item.description_outcome if item is not None else "not_requested"
+            ),
             can_open_folder=(
                 item is not None and item.status != "location_unavailable"
             ),

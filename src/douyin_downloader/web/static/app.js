@@ -41,6 +41,8 @@ const settingsError = document.querySelector("#settings-error");
 let currentParse = null;
 let isParsing = false;
 let currentArchiveState = "not_archived";
+let currentAudioOutcome = "not_requested";
+let currentDescriptionOutcome = "not_requested";
 let settingsLoaded = false;
 
 function storedTheme() {
@@ -355,13 +357,19 @@ function renderPreview(video, parseToken) {
   refreshArchiveStatus(video.aweme_id);
 }
 
-function setArchiveState(state) {
+function setArchiveState(
+  state,
+  audioOutcome = "not_requested",
+  descriptionOutcome = "not_requested",
+) {
   currentArchiveState = state;
+  currentAudioOutcome = audioOutcome;
+  currentDescriptionOutcome = descriptionOutcome;
   const archived = state === "archived";
   const needsRepair = state === "needs_repair";
   const locationUnavailable = state === "location_unavailable";
   const unavailable = state === "unavailable";
-  archiveStatus.textContent = archived
+  const statusText = archived
     ? "已归档"
     : needsRepair
       ? "待修复"
@@ -370,6 +378,21 @@ function setArchiveState(state) {
     : unavailable
       ? "归档暂时不可用"
       : "尚未归档";
+  const audioText = {
+    ready: "音轨：已提取",
+    no_audio: "音轨：无音轨",
+    probe_failed: "音轨：探测失败",
+    extract_failed: "音轨：提取失败",
+    validation_failed: "音轨：校验失败",
+    missing: "音轨：待补充",
+  }[audioOutcome];
+  const descriptionText = {
+    ready: "文案：已导出",
+    missing: "文案：待补充",
+  }[descriptionOutcome];
+  archiveStatus.textContent = [statusText, audioText, descriptionText]
+    .filter(Boolean)
+    .join(" · ");
   archiveStart.hidden = archived || locationUnavailable;
   archiveStart.disabled = unavailable || locationUnavailable;
   archiveStart.textContent = needsRepair ? "修复本地归档" : "加入本地归档";
@@ -384,7 +407,13 @@ async function refreshArchiveStatus(awemeId) {
       return;
     }
     const payload = await response.json();
-    if (currentParse?.awemeId === awemeId) setArchiveState(payload.status);
+    if (currentParse?.awemeId === awemeId) {
+      setArchiveState(
+        payload.status,
+        payload.audio_outcome,
+        payload.description_outcome,
+      );
+    }
   } catch (_) {
     if (currentParse?.awemeId === awemeId) setArchiveState("unavailable");
   }
@@ -498,12 +527,20 @@ archiveStart.addEventListener("click", async () => {
       return;
     }
     const payload = await response.json();
-    setArchiveState(payload.status);
+    setArchiveState(
+      payload.status,
+      payload.audio_outcome,
+      payload.description_outcome,
+    );
     showNotice("本地归档已更新。");
   } catch (_) {
     showError(UNKNOWN_ERROR);
   } finally {
-    setArchiveState(currentArchiveState);
+    setArchiveState(
+      currentArchiveState,
+      currentAudioOutcome,
+      currentDescriptionOutcome,
+    );
   }
 });
 
