@@ -18,6 +18,11 @@ from douyin_downloader.archive import (
     RemoteArtifact,
     SingleArchiveRequest,
 )
+from douyin_downloader.audio_artifacts import (
+    AudioArtifactError,
+    AudioExtractionOutcome,
+    AudioFailureReason,
+)
 from douyin_downloader.domain import (
     AppError,
     AuthorSnapshot,
@@ -167,6 +172,44 @@ class StaticMediaAccess:
             chunks=chunks(),
         )
 
+
+class RecordingAudioTool:
+    def __init__(self, outcome: AudioExtractionOutcome) -> None:
+        self.outcome = outcome
+        self.extractions: list[tuple[Path, Path]] = []
+        self.validations: list[tuple[Path, Path | None, AudioExtractionOutcome]] = []
+
+    def extract(
+        self,
+        source_video: Path,
+        output_part: Path,
+    ) -> AudioExtractionOutcome:
+        self.extractions.append((source_video, output_part))
+        if self.outcome == "ready":
+            output_part.write_bytes(b"stream-copied-audio")
+        return self.outcome
+
+    def validate(
+        self,
+        source_video: Path,
+        audio_artifact: Path | None,
+        expected: AudioExtractionOutcome,
+    ) -> None:
+        self.validations.append((source_video, audio_artifact, expected))
+
+
+class FailingAudioTool(RecordingAudioTool):
+    def __init__(self, reason: AudioFailureReason) -> None:
+        super().__init__("ready")
+        self.reason = reason
+
+    def extract(
+        self,
+        source_video: Path,
+        output_part: Path,
+    ) -> AudioExtractionOutcome:
+        self.extractions.append((source_video, output_part))
+        raise AudioArtifactError(self.reason)
 
 def valid_png() -> bytes:
     output = io.BytesIO()
@@ -497,31 +540,193 @@ async def test_changed_root_applies_only_to_new_work(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_unavailable_optional_profile_is_rejected_without_silent_completion(
+async def test_requested_description_exports_only_the_original_work_description(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "library"
     root.mkdir()
     archive = ManagedArchive(
         database_path=tmp_path / "archive.db",
-        work_access=UnexpectedWorkAccess(),
-        media_access=UnexpectedMediaAccess(),
+        work_access=StaticWorkAccess(),
+        media_access=StaticMediaAccess(valid_mp4()),
     )
     settings = OperationSettingsSnapshot(
         archive_root=root,
         naming_template="{aweme_id}",
-        profile=ArchiveProfile(include_audio=True),
+        profile=ArchiveProfile(include_description=True),
         download_concurrency=3,
         retry_limit=3,
     )
 
-    with pytest.raises(AppError) as raised:
-        await archive.archive_single(
-            SingleArchiveRequest.from_settings("7429378937383308594", settings)
-        )
+    result = await archive.archive_single(
+        SingleArchiveRequest.from_settings("7429378937383308594", settings)
+    )
 
-    assert raised.value.code == "ARCHIVE_PROFILE_UNAVAILABLE"
-    assert not (tmp_path / "archive.db").exists()
+    work_directory = root / result.archive_item.relative_directory
+    description_path = work_directory / "7429378937383308594.description.txt"
+    assert result.archive_item.status == "archived"
+    assert result.archive_item.description_outcome == "ready"
+    assert description_path.read_text(encoding="utf-8") == "归档测试作品"
+    assert b"music-123" not in description_path.read_bytes()
+
+
+@pytest.mark.asyncio
+async def test_requested_audio_is_extracted_from_the_archived_video(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "library"
+    root.mkdir()
+    audio = RecordingAudioTool("ready")
+    archive = ManagedArchive(
+        database_path=tmp_path / "archive.db",
+        work_access=StaticWorkAccess(),
+        media_access=StaticMediaAccess(valid_mp4()),
+        audio_tool=audio,
+    )
+
+    result = await archive.archive_single(
+        SingleArchiveRequest(
+            "7429378937383308594",
+            root,
+            profile=ArchiveProfile(include_audio=True),
+        )
+    )
+
+    work_directory = root / result.archive_item.relative_directory
+    audio_path = work_directory / "7429378937383308594.audio.m4a"
+    assert result.archive_item.status == "archived"
+    assert result.archive_item.audio_outcome == "ready"
+    assert audio_path.read_bytes() == b"stream-copied-audio"
+    assert len(audio.extractions) == 1
+    assert audio.extractions[0][0].name.endswith(".mp4.part")
+    metadata = json.loads(
+        (work_directory / "7429378937383308594.metadata.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert {artifact["kind"] for artifact in metadata["artifacts"]} == {
+        "video",
+        "cover",
+        "audio",
+    }
+    audited = archive.get_work_archive("7429378937383308594")
+    assert audited is not None
+    assert audited.status == "archived"
+    assert audio.validations == [
+        (
+            work_directory / "7429378937383308594.mp4",
+            audio_path,
+            "ready",
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_video_without_audio_remains_a_complete_archive(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "library"
+    root.mkdir()
+    audio = RecordingAudioTool("no_audio")
+    archive = ManagedArchive(
+        database_path=tmp_path / "archive.db",
+        work_access=StaticWorkAccess(),
+        media_access=StaticMediaAccess(valid_mp4()),
+        audio_tool=audio,
+    )
+
+    result = await archive.archive_single(
+        SingleArchiveRequest(
+            "7429378937383308594",
+            root,
+            profile=ArchiveProfile(include_audio=True),
+        )
+    )
+
+    work_directory = root / result.archive_item.relative_directory
+    assert result.archive_item.status == "archived"
+    assert result.archive_item.audio_outcome == "no_audio"
+    assert result.operation.result == "success"
+    assert list(work_directory.glob("*.m4a")) == []
+    assert (work_directory / "7429378937383308594.mp4").is_file()
+    assert (work_directory / "7429378937383308594.cover.png").is_file()
+    assert (work_directory / "7429378937383308594.metadata.json").is_file()
+
+
+@pytest.mark.asyncio
+async def test_audio_validation_failure_preserves_required_archive_artifacts(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "library"
+    root.mkdir()
+    archive = ManagedArchive(
+        database_path=tmp_path / "archive.db",
+        work_access=StaticWorkAccess(),
+        media_access=StaticMediaAccess(valid_mp4()),
+        audio_tool=FailingAudioTool("validation_failed"),
+    )
+
+    result = await archive.archive_single(
+        SingleArchiveRequest(
+            "7429378937383308594",
+            root,
+            profile=ArchiveProfile(include_audio=True),
+        )
+    )
+
+    work_directory = root / result.archive_item.relative_directory
+    assert result.archive_item.status == "needs_repair"
+    assert result.archive_item.audio_outcome == "validation_failed"
+    assert result.operation.result == "partial_success"
+    assert (work_directory / "7429378937383308594.mp4").is_file()
+    assert (work_directory / "7429378937383308594.cover.png").is_file()
+    assert (work_directory / "7429378937383308594.metadata.json").is_file()
+    assert list(work_directory.glob("*.m4a")) == []
+
+
+@pytest.mark.asyncio
+async def test_audio_is_supplemented_without_redownloading_a_healthy_mp4(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "library"
+    root.mkdir()
+    database = tmp_path / "archive.db"
+    original = ManagedArchive(
+        database_path=database,
+        work_access=StaticWorkAccess(),
+        media_access=StaticMediaAccess(valid_mp4()),
+    )
+    first = await original.archive_single(
+        SingleArchiveRequest("7429378937383308594", root)
+    )
+    work_directory = root / first.archive_item.relative_directory
+    video_path = work_directory / "7429378937383308594.mp4"
+    video_hash = hashlib.sha256(video_path.read_bytes()).hexdigest()
+    audio = RecordingAudioTool("ready")
+    supplement = ManagedArchive(
+        database_path=database,
+        work_access=StaticWorkAccess(),
+        media_access=UnexpectedMediaAccess(),
+        audio_tool=audio,
+    )
+
+    second = await supplement.archive_single(
+        SingleArchiveRequest(
+            "7429378937383308594",
+            root,
+            profile=ArchiveProfile(include_audio=True),
+        )
+    )
+
+    assert second.archive_item.status == "archived"
+    assert (work_directory / "7429378937383308594.audio.m4a").is_file()
+    assert hashlib.sha256(video_path.read_bytes()).hexdigest() == video_hash
+    assert audio.extractions == [
+        (
+            video_path,
+            work_directory / f"7429378937383308594.{second.operation.task_id}.audio.m4a.part",
+        )
+    ]
 
 
 @pytest.mark.asyncio

@@ -8,12 +8,12 @@ from pathlib import Path, PurePosixPath
 from typing import Literal
 
 from PIL import Image, UnidentifiedImageError
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator
 
 from douyin_downloader.archive_validation import archive_failed
 from douyin_downloader.domain import ResolvedWork
 
-ArtifactKind = Literal["video", "cover", "metadata"]
+ArtifactKind = Literal["video", "cover", "audio", "description", "metadata"]
 _IMAGE_FORMATS = {
     "JPEG": ("image/jpeg", ".jpg"),
     "PNG": ("image/png", ".png"),
@@ -84,9 +84,9 @@ class DiscoveryMetadata(BaseModel):
 class ArtifactMetadata(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    kind: Literal["video", "cover"]
+    kind: Literal["video", "cover", "audio", "description"]
     path: str
-    size_bytes: int = Field(gt=0)
+    size_bytes: int = Field(ge=0)
     mime_type: str
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
@@ -96,6 +96,17 @@ class ArtifactMetadata(BaseModel):
         path = PurePosixPath(value)
         if path.is_absolute() or ".." in path.parts or "\\" in value:
             raise ValueError("artifact paths must be relative")
+        return value
+
+    @field_validator("size_bytes")
+    @classmethod
+    def only_description_may_be_empty(
+        cls,
+        value: int,
+        info: ValidationInfo,
+    ) -> int:
+        if value == 0 and info.data.get("kind") != "description":
+            raise ValueError("only a description artifact may be empty")
         return value
 
 
@@ -128,6 +139,8 @@ def artifact_digest(
     path: Path,
     relative_path: Path,
     mime_type: str,
+    *,
+    allow_empty: bool = False,
 ) -> ArtifactRecord:
     digest = hashlib.sha256()
     size_bytes = 0
@@ -135,7 +148,7 @@ def artifact_digest(
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             size_bytes += len(chunk)
             digest.update(chunk)
-    if size_bytes <= 0:
+    if size_bytes <= 0 and not allow_empty:
         raise archive_failed()
     return ArtifactRecord(
         kind=kind,
@@ -143,6 +156,21 @@ def artifact_digest(
         size_bytes=size_bytes,
         mime_type=mime_type,
         sha256=digest.hexdigest(),
+    )
+
+
+def write_description(
+    path: Path,
+    description: str,
+    relative_path: Path,
+) -> ArtifactRecord:
+    path.write_text(description, encoding="utf-8", newline="")
+    return artifact_digest(
+        "description",
+        path,
+        relative_path,
+        "text/plain; charset=utf-8",
+        allow_empty=True,
     )
 
 
@@ -196,14 +224,20 @@ def write_metadata(
         ),
         artifacts=tuple(
             ArtifactMetadata(
-                kind=_media_artifact_kind(artifact.kind),
+                kind=_metadata_artifact_kind(artifact.kind),
                 path=artifact.relative_path.as_posix(),
                 size_bytes=artifact.size_bytes,
                 mime_type=artifact.mime_type,
                 sha256=artifact.sha256,
             )
             for artifact in artifacts
-            if artifact.kind in {"video", "cover"}
+            if artifact.kind in {"video", "cover", "audio", "description"}
+            and artifact.status not in {
+                "no_audio",
+                "probe_failed",
+                "extract_failed",
+                "validation_failed",
+            }
         ),
     )
     path.write_text(
@@ -234,14 +268,19 @@ def validate_metadata(path: Path, aweme_id: str) -> ArchiveMetadata:
     if document.work.aweme_id != aweme_id:
         raise archive_failed()
     kinds = {artifact.kind for artifact in document.artifacts}
-    if kinds != {"video", "cover"}:
+    if not {"video", "cover"}.issubset(kinds):
         raise archive_failed()
     return document
 
 
-def _media_artifact_kind(
+def _metadata_artifact_kind(
     kind: ArtifactKind,
-) -> Literal["video", "cover"]:
-    if kind == "video" or kind == "cover":
+) -> Literal["video", "cover", "audio", "description"]:
+    if (
+        kind == "video"
+        or kind == "cover"
+        or kind == "audio"
+        or kind == "description"
+    ):
         return kind
-    raise ValueError("metadata is not a media artifact")
+    raise ValueError("metadata is not a file artifact")

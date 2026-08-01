@@ -7,7 +7,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from subprocess import CompletedProcess
-from typing import Literal
+from typing import Literal, Protocol
 
 AudioExtractionOutcome = Literal["ready", "no_audio"]
 AudioFailureReason = Literal["probe_failed", "extract_failed", "validation_failed"]
@@ -31,6 +31,21 @@ class AudioArtifactError(Exception):
     def __init__(self, reason: AudioFailureReason) -> None:
         super().__init__(reason)
         self.reason = reason
+
+
+class AudioArtifactTool(Protocol):
+    def extract(
+        self,
+        source_video: Path,
+        output_part: Path,
+    ) -> AudioExtractionOutcome: ...
+
+    def validate(
+        self,
+        source_video: Path,
+        audio_artifact: Path | None,
+        expected: AudioExtractionOutcome,
+    ) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)

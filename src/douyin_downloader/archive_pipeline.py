@@ -11,18 +11,22 @@ from douyin_downloader.archive_artifacts import (
     artifact_digest,
     inspect_cover,
     validate_metadata,
+    write_description,
     write_metadata,
 )
 from douyin_downloader.archive_paths import is_reparse_point
 from douyin_downloader.archive_validation import archive_failed, inspect_mp4
 from douyin_downloader.async_tools import run_in_thread_cancellation_safe
+from douyin_downloader.audio_artifacts import AudioArtifactError, AudioArtifactTool
 from douyin_downloader.domain import AppError, ResolvedWork
+from douyin_downloader.settings import ArchiveProfile
 
 
 @dataclass(frozen=True, slots=True)
 class PreparedArchive:
     artifacts: tuple[ArtifactRecord, ...]
     promotions: tuple[tuple[Path, Path], ...]
+    result: str = "success"
 
     def discard_parts(self) -> None:
         _discard_paths(part_path for part_path, _ in self.promotions)
@@ -31,8 +35,13 @@ class PreparedArchive:
 class ArchiveArtifactPipeline:
     """Owns archive artifact creation, integrity inspection, and crash recovery."""
 
-    def __init__(self, media_access: MediaAccess) -> None:
+    def __init__(
+        self,
+        media_access: MediaAccess,
+        audio_tool: AudioArtifactTool,
+    ) -> None:
         self._media_access = media_access
+        self._audio_tool = audio_tool
 
     async def prepare(
         self,
@@ -43,6 +52,7 @@ class ArchiveArtifactPipeline:
         valid_artifacts: dict[str, ArtifactRecord],
         registered_artifacts: dict[str, ArtifactRecord],
         base_name: str,
+        profile: ArchiveProfile,
     ) -> PreparedArchive:
         part_paths: list[Path] = []
         promotions: list[tuple[Path, Path]] = []
@@ -79,6 +89,12 @@ class ArchiveArtifactPipeline:
                 )
                 video = _pending(video, video_part)
                 promotions.append((video_part, video_final))
+                video_input_path = video_part
+            else:
+                video_input_path = registered_path(
+                    output_directory,
+                    video.relative_path,
+                )
 
             cover = valid_artifacts.get("cover")
             if cover is None:
@@ -112,6 +128,85 @@ class ArchiveArtifactPipeline:
                 cover = _pending(cover, cover_part)
                 promotions.append((cover_part, cover_final))
 
+            file_artifacts = [video, cover]
+            if profile.include_audio:
+                audio = valid_artifacts.get("audio")
+                if audio is None:
+                    registered_audio = registered_artifacts.get("audio")
+                    audio_relative = (
+                        registered_audio.relative_path
+                        if registered_audio is not None
+                        else Path(f"{base_name}.audio.m4a")
+                    )
+                    audio_final = registered_path(output_directory, audio_relative)
+                    audio_part = output_directory / (
+                        f"{aweme_id}.{operation_id}.audio.m4a.part"
+                    )
+                    part_paths.append(audio_part)
+                    try:
+                        outcome = await run_in_thread_cancellation_safe(
+                            self._audio_tool.extract,
+                            video_input_path,
+                            audio_part,
+                        )
+                    except AudioArtifactError as error:
+                        audio_part.unlink(missing_ok=True)
+                        audio = ArtifactRecord(
+                            kind="audio",
+                            relative_path=audio_relative,
+                            size_bytes=0,
+                            mime_type="audio/mp4",
+                            sha256="",
+                            status=error.reason,
+                        )
+                    else:
+                        if outcome == "no_audio":
+                            audio = ArtifactRecord(
+                                kind="audio",
+                                relative_path=audio_relative,
+                                size_bytes=0,
+                                mime_type="audio/mp4",
+                                sha256="",
+                                status="no_audio",
+                            )
+                        else:
+                            audio = await run_in_thread_cancellation_safe(
+                                artifact_digest,
+                                "audio",
+                                audio_part,
+                                audio_relative,
+                                "audio/mp4",
+                            )
+                            audio = _pending(audio, audio_part)
+                            promotions.append((audio_part, audio_final))
+                file_artifacts.append(audio)
+            if profile.include_description:
+                description = valid_artifacts.get("description")
+                if description is None:
+                    registered_description = registered_artifacts.get("description")
+                    description_relative = (
+                        registered_description.relative_path
+                        if registered_description is not None
+                        else Path(f"{base_name}.description.txt")
+                    )
+                    description_final = registered_path(
+                        output_directory,
+                        description_relative,
+                    )
+                    description_part = output_directory / (
+                        f"{aweme_id}.{operation_id}.description.txt.part"
+                    )
+                    part_paths.append(description_part)
+                    description = await run_in_thread_cancellation_safe(
+                        write_description,
+                        description_part,
+                        resolved.snapshot.description,
+                        description_relative,
+                    )
+                    description = _pending(description, description_part)
+                    promotions.append((description_part, description_final))
+                file_artifacts.append(description)
+
             registered_metadata = registered_artifacts.get("metadata")
             metadata_relative = (
                 registered_metadata.relative_path
@@ -128,7 +223,7 @@ class ArchiveArtifactPipeline:
                 metadata_part,
                 resolved,
                 operation_id,
-                (video, cover),
+                tuple(file_artifacts),
                 metadata_relative,
             )
             metadata = _pending(metadata, metadata_part)
@@ -136,8 +231,17 @@ class ArchiveArtifactPipeline:
                 (metadata_part, metadata_final)
             )
             return PreparedArchive(
-                artifacts=(video, cover, metadata),
+                artifacts=(*file_artifacts, metadata),
                 promotions=tuple(promotions),
+                result=(
+                    "partial_success"
+                    if any(
+                        artifact.status
+                        in {"probe_failed", "extract_failed", "validation_failed"}
+                        for artifact in file_artifacts
+                    )
+                    else "success"
+                ),
             )
         except Exception:
             _discard_paths(part_paths)
@@ -151,8 +255,31 @@ class ArchiveArtifactPipeline:
     ) -> dict[str, ArtifactRecord]:
         registrations = {artifact.kind: artifact for artifact in artifacts}
         valid: dict[str, ArtifactRecord] = {}
-        for kind in ("video", "cover"):
+        for kind in ("video", "cover", "audio", "description"):
             registration = registrations.get(kind)
+            if kind in {"audio", "description"} and registration is None:
+                continue
+            if kind == "audio" and registration is not None:
+                video = valid.get("video")
+                if video is None:
+                    continue
+                try:
+                    video_path = registered_path(
+                        output_directory,
+                        video.relative_path,
+                    )
+                    if registration.status == "no_audio":
+                        self._audio_tool.validate(video_path, None, "no_audio")
+                        valid["audio"] = registration
+                        continue
+                    if registration.status in {
+                        "probe_failed",
+                        "extract_failed",
+                        "validation_failed",
+                    }:
+                        continue
+                except (AudioArtifactError, AppError, OSError):
+                    continue
             relative_path = (
                 registration.relative_path
                 if registration is not None
@@ -164,6 +291,15 @@ class ArchiveArtifactPipeline:
                 path = registered_path(output_directory, relative_path)
                 if not path.is_file():
                     continue
+                if kind == "audio":
+                    video = valid.get("video")
+                    if video is None:
+                        continue
+                    self._audio_tool.validate(
+                        registered_path(output_directory, video.relative_path),
+                        path,
+                        "ready",
+                    )
                 valid[kind] = _inspect_local_artifact(
                     kind,
                     path,
@@ -171,7 +307,7 @@ class ArchiveArtifactPipeline:
                     aweme_id,
                     registration,
                 )
-            except (AppError, OSError):
+            except (AudioArtifactError, AppError, OSError):
                 continue
 
         metadata_registration = registrations.get("metadata")
@@ -194,14 +330,20 @@ class ArchiveArtifactPipeline:
                 declared = {
                     artifact.kind: artifact for artifact in document.artifacts
                 }
-                if all(
+                file_kinds = {
+                    kind
+                    for kind in valid
+                    if kind in {"video", "cover", "audio", "description"}
+                    and valid[kind].status != "no_audio"
+                }
+                if set(declared) == file_kinds and all(
                     kind in valid
                     and kind in declared
                     and declared[kind].path == valid[kind].relative_path.as_posix()
                     and declared[kind].size_bytes == valid[kind].size_bytes
                     and declared[kind].mime_type == valid[kind].mime_type
                     and declared[kind].sha256 == valid[kind].sha256
-                    for kind in ("video", "cover")
+                    for kind in file_kinds
                 ):
                     valid["metadata"] = metadata_digest
         except (AppError, OSError):
@@ -214,11 +356,10 @@ class ArchiveArtifactPipeline:
         aweme_id: str,
         artifacts: tuple[ArtifactRecord, ...],
     ) -> None:
-        if {artifact.kind for artifact in artifacts} != {
-            "video",
-            "cover",
-            "metadata",
-        }:
+        kinds = {artifact.kind for artifact in artifacts}
+        if not {"video", "cover", "metadata"}.issubset(kinds) or not kinds.issubset(
+            {"video", "cover", "description", "metadata"}
+        ):
             raise archive_failed()
         part_paths: list[Path] = []
         try:
@@ -319,6 +460,14 @@ def _inspect_local_artifact(
     elif kind == "metadata":
         validate_metadata(path, aweme_id)
         mime_type = "application/json"
+    elif kind == "audio":
+        mime_type = "audio/mp4"
+    elif kind == "description":
+        try:
+            path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as error:
+            raise archive_failed() from error
+        mime_type = "text/plain; charset=utf-8"
     else:
         raise archive_failed()
     digest = artifact_digest(kind, path, relative_path, mime_type)
@@ -357,6 +506,14 @@ def _validate_registered_artifact(
             raise archive_failed()
     elif registration.kind == "metadata":
         validate_metadata(path, aweme_id)
+    elif registration.kind == "audio":
+        if registration.status == "no_audio":
+            return
+    elif registration.kind == "description":
+        try:
+            path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as error:
+            raise archive_failed() from error
     else:
         raise archive_failed()
     digest = artifact_digest(

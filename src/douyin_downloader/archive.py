@@ -5,7 +5,7 @@ import threading
 import weakref
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Protocol
 from uuid import uuid4
@@ -32,7 +32,12 @@ from douyin_downloader.archive_store import (
     TaskIds,
 )
 from douyin_downloader.async_tools import run_in_thread_cancellation_safe
+from douyin_downloader.audio_artifacts import (
+    AudioArtifactTool,
+    FfmpegAudioArtifactTool,
+)
 from douyin_downloader.domain import AppError, ResolvedWork
+from douyin_downloader.resources import ffmpeg_executable_path, ffprobe_executable_path
 from douyin_downloader.settings import (
     ArchiveProfile,
     NamingTemplate,
@@ -98,6 +103,8 @@ class ArchiveItemSnapshot:
     aweme_id: str
     status: str
     relative_directory: Path
+    audio_outcome: str = "not_requested"
+    description_outcome: str = "not_requested"
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,12 +134,20 @@ class ManagedArchive:
         database_path: Path,
         work_access: WorkAccess,
         media_access: MediaAccess,
+        audio_tool: AudioArtifactTool | None = None,
         folder_opener: FolderOpener | None = None,
         file_promoter: FilePromoter | None = None,
     ) -> None:
         self._store = ArchiveStore(database_path)
         self._work_access = work_access
-        self._artifact_pipeline = ArchiveArtifactPipeline(media_access)
+        self._artifact_pipeline = ArchiveArtifactPipeline(
+            media_access,
+            audio_tool
+            or FfmpegAudioArtifactTool(
+                ffmpeg_executable_path(),
+                ffprobe_executable_path(),
+            ),
+        )
         self._folder_opener = folder_opener or WindowsFolderOpener()
         self._file_promoter = file_promoter or AtomicFilePromoter()
         self._integrity_locks: weakref.WeakValueDictionary[
@@ -163,13 +178,6 @@ class ManagedArchive:
             download_concurrency=settings.download_concurrency,
             retry_limit=settings.retry_limit,
         )
-        if settings.profile.include_audio or settings.profile.include_description:
-            raise AppError(
-                "ARCHIVE_PROFILE_UNAVAILABLE",
-                "可选音轨与文案成果将在下一阶段启用，请暂时关闭后再归档。",
-                409,
-            )
-
         async with _hold_thread_lock(self._integrity_lock(request.aweme_id)):
             return await self._archive_single_locked(request.aweme_id, settings)
 
@@ -186,13 +194,27 @@ class ManagedArchive:
         valid_artifacts: dict[str, ArtifactRecord] = {}
         existing_relative_directory: Path | None = None
         if existing is not None:
-            if existing.status == "archived":
+            effective_profile = ArchiveProfile(
+                include_audio=(
+                    existing.stored.settings.profile.include_audio
+                    or settings.profile.include_audio
+                ),
+                include_description=(
+                    existing.stored.settings.profile.include_description
+                    or settings.profile.include_description
+                ),
+            )
+            if (
+                existing.status == "archived"
+                and effective_profile == existing.stored.settings.profile
+            ):
                 return _archive_snapshot(
                     existing.stored.ids,
                     aweme_id,
                     existing.stored.relative_directory,
                     "archived",
                     existing.stored.settings,
+                    artifacts=existing.stored.artifacts,
                 )
             if existing.status == "location_unavailable":
                 raise AppError(
@@ -201,13 +223,19 @@ class ManagedArchive:
                     409,
                 )
             root = existing.stored.root
-            settings = existing.stored.settings
+            settings = replace(
+                settings,
+                archive_root=existing.stored.root,
+                naming_template=existing.stored.settings.naming_template,
+                profile=effective_profile,
+            )
             existing_relative_directory = existing.stored.relative_directory
             valid_artifacts = existing.valid_artifacts
 
         ids = TaskIds(uuid4().hex, uuid4().hex, uuid4().hex)
         prepared: PreparedArchive | None = None
         promotion_started = False
+        operation_result = "success"
         try:
             self._store.create_running(ids, aweme_id, settings)
             resolved = await self._work_access.fetch_work(aweme_id)
@@ -241,7 +269,9 @@ class ManagedArchive:
                     valid_artifacts,
                     registered_artifacts,
                     base_name,
+                    settings.profile,
                 )
+                operation_result = prepared.result
                 self._store.prepare_promotion(
                     ids,
                     aweme_id,
@@ -252,7 +282,7 @@ class ManagedArchive:
                 promotion_started = True
                 for part_path, final_path in prepared.promotions:
                     self._file_promoter.promote(part_path, final_path)
-                self._store.finish_promotion(ids, aweme_id)
+                self._store.finish_promotion(ids, aweme_id, operation_result)
         except Exception:
             if not promotion_started:
                 try:
@@ -266,8 +296,10 @@ class ManagedArchive:
             ids,
             aweme_id,
             relative_directory,
-            "archived",
+            "archived" if operation_result == "success" else "needs_repair",
             settings,
+            result=operation_result,
+            artifacts=prepared.artifacts if prepared is not None else (),
         )
 
     def get_work_archive(self, aweme_id: str) -> ArchiveItemSnapshot | None:
@@ -278,6 +310,16 @@ class ManagedArchive:
             aweme_id=aweme_id,
             status=existing.status,
             relative_directory=existing.stored.relative_directory,
+            audio_outcome=_artifact_outcome(
+                existing.stored.settings.profile.include_audio,
+                existing.stored.artifacts,
+                "audio",
+            ),
+            description_outcome=_artifact_outcome(
+                existing.stored.settings.profile.include_description,
+                existing.stored.artifacts,
+                "description",
+            ),
         )
 
     def open_work_folder(self, aweme_id: str) -> None:
@@ -336,11 +378,12 @@ class ManagedArchive:
                 return _AuditedArchive(stored, "needs_repair", {})
             return _AuditedArchive(stored, "location_unavailable", {})
 
-        status = (
-            "archived"
-            if set(valid_artifacts) == {"video", "cover", "metadata"}
-            else "needs_repair"
-        )
+        expected_artifacts = {"video", "cover", "metadata"}
+        if stored.settings.profile.include_audio:
+            expected_artifacts.add("audio")
+        if stored.settings.profile.include_description:
+            expected_artifacts.add("description")
+        status = "archived" if set(valid_artifacts) == expected_artifacts else "needs_repair"
         if stored.status != status:
             self._store.set_archive_status(aweme_id, status)
         return _AuditedArchive(stored, status, valid_artifacts)
@@ -378,17 +421,45 @@ def _archive_snapshot(
     relative_directory: Path,
     status: str,
     settings: OperationSettingsSnapshot,
+    *,
+    result: str = "success",
+    artifacts: tuple[ArtifactRecord, ...] = (),
 ) -> ArchiveOperationSnapshot:
     def task(task_id: str) -> TaskSnapshot:
-        return TaskSnapshot(task_id, "finished", "idle", "success")
+        return TaskSnapshot(task_id, "finished", "idle", result)
 
     return ArchiveOperationSnapshot(
         operation=task(ids.operation),
         source_task=task(ids.source),
         work_task=task(ids.work),
-        archive_item=ArchiveItemSnapshot(aweme_id, status, relative_directory),
+        archive_item=ArchiveItemSnapshot(
+            aweme_id,
+            status,
+            relative_directory,
+            _artifact_outcome(settings.profile.include_audio, artifacts, "audio"),
+            _artifact_outcome(
+                settings.profile.include_description,
+                artifacts,
+                "description",
+            ),
+        ),
         settings=settings,
     )
+
+
+def _artifact_outcome(
+    requested: bool,
+    artifacts: tuple[ArtifactRecord, ...],
+    kind: str,
+) -> str:
+    if not requested:
+        return "not_requested"
+    artifact = next((item for item in artifacts if item.kind == kind), None)
+    if artifact is None:
+        return "missing"
+    if artifact.status in {"archived", "promoting"}:
+        return "ready"
+    return artifact.status
 
 
 @asynccontextmanager

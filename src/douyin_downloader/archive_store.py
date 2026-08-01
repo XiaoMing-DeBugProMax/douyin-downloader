@@ -177,19 +177,25 @@ class ArchiveStore:
                 ),
             )
 
-    def finish_promotion(self, ids: TaskIds, aweme_id: str) -> None:
+    def finish_promotion(
+        self,
+        ids: TaskIds,
+        aweme_id: str,
+        result: str = "success",
+    ) -> None:
+        item_status = "archived" if result == "success" else "needs_repair"
         with self._connection() as connection:
             connection.execute(
-                "UPDATE archive_items SET status='archived' "
+                "UPDATE archive_items SET status=? "
                 "WHERE aweme_id=? AND operation_id=?",
-                (aweme_id, ids.operation),
+                (item_status, aweme_id, ids.operation),
             )
             connection.execute(
                 "UPDATE archive_artifacts SET status='archived', "
-                "part_relative_path=NULL WHERE aweme_id=?",
+                "part_relative_path=NULL WHERE aweme_id=? AND status='promoting'",
                 (aweme_id,),
             )
-            _set_task_results(connection, ids, "success")
+            _set_task_results(connection, ids, result)
 
     def fail(self, ids: TaskIds) -> None:
         try:
