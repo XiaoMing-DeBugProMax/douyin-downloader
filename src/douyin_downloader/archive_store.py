@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import cast
 
 from douyin_downloader.archive_artifacts import ArtifactKind, ArtifactRecord
+from douyin_downloader.database import ensure_issue5_schema
 from douyin_downloader.settings import (
     ArchiveProfile,
     NamingTemplate,
@@ -237,7 +238,7 @@ class ArchiveStore:
             _set_task_results(connection, promotion.ids, "failed")
 
     def _connect(self) -> sqlite3.Connection:
-        self._database_path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_issue5_schema(self._database_path)
         connection = sqlite3.connect(self._database_path)
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute(
@@ -256,42 +257,6 @@ class ArchiveStore:
             )
             """
         )
-        operation_columns = {
-            str(row[1])
-            for row in connection.execute("PRAGMA table_info(archive_operations)")
-        }
-        migrations = {
-            "naming_template": (
-                "ALTER TABLE archive_operations ADD COLUMN naming_template "
-                "TEXT NOT NULL DEFAULT '{aweme_id}'"
-            ),
-            "profile_audio": (
-                "ALTER TABLE archive_operations ADD COLUMN profile_audio "
-                "INTEGER NOT NULL DEFAULT 0"
-            ),
-            "profile_description": (
-                "ALTER TABLE archive_operations ADD COLUMN profile_description "
-                "INTEGER NOT NULL DEFAULT 0"
-            ),
-            "download_concurrency": (
-                "ALTER TABLE archive_operations ADD COLUMN download_concurrency "
-                "INTEGER NOT NULL DEFAULT 3"
-            ),
-            "retry_limit": (
-                "ALTER TABLE archive_operations ADD COLUMN retry_limit "
-                "INTEGER NOT NULL DEFAULT 3"
-            ),
-        }
-        missing_migrations = tuple(
-            statement
-            for column, statement in migrations.items()
-            if column not in operation_columns
-        )
-        if missing_migrations:
-            self._backup_before_settings_snapshot_migration(connection)
-            with connection:
-                for statement in missing_migrations:
-                    connection.execute(statement)
         connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS source_tasks (
@@ -331,28 +296,6 @@ class ArchiveStore:
             """
         )
         return connection
-
-    def _backup_before_settings_snapshot_migration(
-        self,
-        connection: sqlite3.Connection,
-    ) -> None:
-        connection.commit()
-        backup_path = self._database_path.with_name(
-            f"{self._database_path.stem}.pre-settings-snapshot.bak"
-        )
-        part_path = backup_path.with_name(f"{backup_path.name}.part")
-        part_path.unlink(missing_ok=True)
-        backup = sqlite3.connect(part_path)
-        try:
-            try:
-                connection.backup(backup)
-                backup.commit()
-            finally:
-                backup.close()
-            part_path.replace(backup_path)
-        except BaseException:
-            part_path.unlink(missing_ok=True)
-            raise
 
     def _load_artifacts(self, aweme_id: str) -> tuple[ArtifactRecord, ...]:
         with self._connection() as connection:

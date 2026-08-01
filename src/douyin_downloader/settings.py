@@ -10,6 +10,7 @@ from pathlib import Path
 from string import Formatter
 
 from douyin_downloader.archive_paths import is_reparse_point
+from douyin_downloader.database import ensure_issue5_schema
 from douyin_downloader.domain import AppError, ResolvedWork
 
 _DEFAULT_NAMING_TEMPLATE = "{aweme_id}"
@@ -178,33 +179,9 @@ class SettingsModule:
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
-        self._database_path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_issue5_schema(self._database_path)
         connection = sqlite3.connect(self._database_path)
         try:
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS current_settings (
-                    settings_id INTEGER PRIMARY KEY CHECK (settings_id = 1),
-                    archive_root TEXT,
-                    naming_template TEXT NOT NULL,
-                    profile_audio INTEGER NOT NULL CHECK (profile_audio IN (0, 1)),
-                    profile_description INTEGER NOT NULL
-                        CHECK (profile_description IN (0, 1)),
-                    download_concurrency INTEGER NOT NULL
-                        CHECK (download_concurrency BETWEEN 1 AND 5),
-                    retry_limit INTEGER NOT NULL CHECK (retry_limit BETWEEN 0 AND 3)
-                )
-                """
-            )
-            connection.execute(
-                """
-                INSERT OR IGNORE INTO current_settings
-                    (settings_id, archive_root, naming_template, profile_audio,
-                     profile_description, download_concurrency, retry_limit)
-                VALUES (1, NULL, ?, 0, 0, 3, 3)
-                """,
-                (_DEFAULT_NAMING_TEMPLATE,),
-            )
             with connection:
                 yield connection
         finally:

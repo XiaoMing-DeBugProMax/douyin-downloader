@@ -1,3 +1,4 @@
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -81,6 +82,52 @@ async def test_settings_database_failure_does_not_remove_quick_download_services
         assert app.state.services.settings is None
         assert app.state.services.managed_archive is None
         assert app.state.services.parse_service is not None
+
+
+@pytest.mark.asyncio
+async def test_production_composition_backs_up_untouched_database_before_issue5_migration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "archive.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            CREATE TABLE archive_operations (
+                operation_id TEXT PRIMARY KEY,
+                lifecycle TEXT NOT NULL,
+                phase TEXT NOT NULL,
+                result TEXT NOT NULL,
+                root_path TEXT NOT NULL
+            )
+            """
+        )
+
+    class TemporaryRuntimeStore:
+        app_dir = tmp_path
+
+    monkeypatch.setattr(app_module, "RuntimeStore", TemporaryRuntimeStore)
+    app = create_app(testing=True)
+
+    async with app.router.lifespan_context(app):
+        assert app.state.services.settings is not None
+        assert app.state.services.managed_archive is not None
+
+    backup = tmp_path / "archive.pre-settings-snapshot.bak"
+    assert backup.is_file()
+    with sqlite3.connect(backup) as connection:
+        tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        legacy_columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(archive_operations)")
+        }
+    assert "current_settings" not in tables
+    assert "naming_template" not in legacy_columns
 
 
 @pytest.mark.asyncio
