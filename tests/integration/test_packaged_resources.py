@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from PyInstaller.archive.readers import CArchiveReader
 
 from douyin_downloader.resources import (
     app_icon_path,
@@ -69,3 +70,42 @@ def test_packaging_manifest_never_collects_f2_dependency_data() -> None:
     assert "F2_DATA" not in manifest
     assert "importlib.resources" not in adapter
     assert "conf.yaml" not in adapter
+
+
+def test_packaging_manifest_requires_audited_ffmpeg_and_compliance_material() -> None:
+    project_root = Path(__file__).parents[2]
+    spec = (project_root / "douyin_downloader.spec").read_text(encoding="utf-8")
+    build = (project_root / "scripts" / "build.ps1").read_text(encoding="utf-8")
+
+    assert "FFMPEG_BINARIES" in spec
+    assert '"ffmpeg"' in spec
+    assert "audit.json" in spec
+    assert "third_party" in spec
+    assert "manifest.json" in spec
+    assert "NOTICE.md" in spec
+    assert "provision_ffmpeg.py" in build
+    assert "--output" in build
+
+
+def test_current_package_contains_only_required_media_tools_when_available() -> None:
+    project_root = Path(__file__).parents[2]
+    artifacts = tuple((project_root / "dist").glob("*.exe"))
+    if not artifacts:
+        pytest.skip("current packaged executable is not available")
+    artifact = artifacts[0]
+    packaging_inputs = (
+        project_root / "douyin_downloader.spec",
+        project_root / "scripts" / "provision_ffmpeg.py",
+    )
+    if artifact.stat().st_mtime < max(path.stat().st_mtime for path in packaging_inputs):
+        pytest.skip("current packaged executable predates the packaging inputs")
+    archive = CArchiveReader(str(artifact))
+    names = {name.replace("\\", "/").casefold() for name in archive.toc}
+
+    assert "ffmpeg/ffmpeg.exe" in names
+    assert "ffmpeg/ffprobe.exe" in names
+    assert "ffmpeg/ffplay.exe" not in names
+    assert "third-party/ffmpeg/audit.json" in names
+    assert "third-party/ffmpeg/manifest.json" in names
+    assert "third-party/ffmpeg/notice.md" in names
+    assert "third-party/ffmpeg/licenses/license.txt" in names

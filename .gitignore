@@ -19,6 +19,7 @@ htmlcov/
 
 .venv/
 venv/
+.deps/
 .env
 .env.*
 !.env.example

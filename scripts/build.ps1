@@ -1,6 +1,7 @@
 $ErrorActionPreference = 'Stop'
 
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$env:PYTHONPATH = Join-Path $projectRoot 'src'
 $python = Join-Path $projectRoot '.venv\Scripts\python.exe'
 $spec = Join-Path $projectRoot 'douyin_downloader.spec'
 $exeName = (-join (0x6296, 0x97F3, 0x89C6, 0x9891, 0x4E0B, 0x8F7D | ForEach-Object {
@@ -28,6 +29,11 @@ try {
     Invoke-Python @('-m', 'mypy', 'src')
     Invoke-Python @((Join-Path $PSScriptRoot 'check_sensitive.py'))
     Invoke-Python @((Join-Path $PSScriptRoot 'build_icon.py'))
+    Invoke-Python @(
+        (Join-Path $PSScriptRoot 'provision_ffmpeg.py'),
+        '--output',
+        (Join-Path $projectRoot '.deps\ffmpeg')
+    )
     Invoke-Python @('-m', 'PyInstaller', '--clean', '--noconfirm', $spec)
 
     if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {

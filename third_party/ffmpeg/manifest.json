@@ -1,0 +1,14 @@
+{
+  "supplier": "BtbN/FFmpeg-Builds",
+  "release_tag": "autobuild-2026-08-01-13-21",
+  "archive_url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-01-13-21/ffmpeg-n8.1.2-34-g9b6c8969e0-win64-lgpl-shared-8.1.zip",
+  "archive_sha256": "3bba81dcfd017a6ea1627905549769913948831ef10f3e7df7541f736067bff8",
+  "version_marker": "n8.1.2-34-g9b6c8969e0",
+  "ffmpeg_commit": "9b6c8969e05b4f0b29f0f85cd501be6b3e582e6b",
+  "build_source_commit": "a99e8230eae00d1cee38f23076a7a1f55cd984e2",
+  "license_policy": "LGPL build; --enable-gpl and --enable-nonfree are forbidden",
+  "corresponding_source": {
+    "ffmpeg": "https://github.com/FFmpeg/FFmpeg/archive/9b6c8969e05b4f0b29f0f85cd501be6b3e582e6b.tar.gz",
+    "build_scripts": "https://github.com/BtbN/FFmpeg-Builds/archive/a99e8230eae00d1cee38f23076a7a1f55cd984e2.tar.gz"
+  }
+}
