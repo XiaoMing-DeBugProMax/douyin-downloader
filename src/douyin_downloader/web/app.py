@@ -20,6 +20,7 @@ from douyin_downloader.parse_service import ParseService
 from douyin_downloader.resources import static_directory, static_resource_path
 from douyin_downloader.runtime import RuntimeStore
 from douyin_downloader.session import COOKIE_NAME, SessionManager
+from douyin_downloader.settings import SettingsModule
 from douyin_downloader.store import ParseStore
 from douyin_downloader.url_resolver import ShareResolver
 from douyin_downloader.web.routes import AppServices, build_router
@@ -38,12 +39,15 @@ async def _application_lifespan(app: FastAPI) -> AsyncIterator[None]:
     work_access = F2WorkAccess()
     try:
         database_path = RuntimeStore().app_dir / "archive.db"
+        settings = SettingsModule(database_path)
+        settings.current()
         managed_archive: ManagedArchive | None = ManagedArchive(
             database_path=database_path,
             work_access=work_access,
             media_access=HttpMediaAccess(client),
         )
     except (OSError, RuntimeError):
+        settings = None
         managed_archive = None
     app.state.services = AppServices(
         parse_service=ParseService(
@@ -53,6 +57,7 @@ async def _application_lifespan(app: FastAPI) -> AsyncIterator[None]:
         ),
         media_client=client,
         managed_archive=managed_archive,
+        settings=settings,
         directory_chooser=WindowsDirectoryChooser(),
     )
     try:

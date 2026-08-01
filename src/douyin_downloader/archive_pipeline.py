@@ -41,13 +41,21 @@ class ArchiveArtifactPipeline:
         operation_id: str,
         resolved: ResolvedWork,
         valid_artifacts: dict[str, ArtifactRecord],
+        registered_artifacts: dict[str, ArtifactRecord],
+        base_name: str,
     ) -> PreparedArchive:
         part_paths: list[Path] = []
         promotions: list[tuple[Path, Path]] = []
         try:
             video = valid_artifacts.get("video")
             if video is None:
-                video_relative = Path(f"{aweme_id}.mp4")
+                registered_video = registered_artifacts.get("video")
+                video_relative = (
+                    registered_video.relative_path
+                    if registered_video is not None
+                    else Path(f"{base_name}.mp4")
+                )
+                video_final = registered_path(output_directory, video_relative)
                 video_part = output_directory / f"{aweme_id}.{operation_id}.mp4.part"
                 part_paths.append(video_part)
                 playback = resolved.preferred_playback_source()
@@ -70,7 +78,7 @@ class ArchiveArtifactPipeline:
                     "video/mp4",
                 )
                 video = _pending(video, video_part)
-                promotions.append((video_part, output_directory / video_relative))
+                promotions.append((video_part, video_final))
 
             cover = valid_artifacts.get("cover")
             if cover is None:
@@ -86,7 +94,14 @@ class ArchiveArtifactPipeline:
                     inspect_cover,
                     cover_part,
                 )
-                cover_relative = Path(f"cover{cover_suffix}")
+                registered_cover = registered_artifacts.get("cover")
+                cover_relative = (
+                    registered_cover.relative_path
+                    if registered_cover is not None
+                    and registered_cover.relative_path.suffix.lower() == cover_suffix
+                    else Path(f"{base_name}.cover{cover_suffix}")
+                )
+                cover_final = registered_path(output_directory, cover_relative)
                 cover = await run_in_thread_cancellation_safe(
                     artifact_digest,
                     "cover",
@@ -95,9 +110,15 @@ class ArchiveArtifactPipeline:
                     cover_mime,
                 )
                 cover = _pending(cover, cover_part)
-                promotions.append((cover_part, output_directory / cover_relative))
+                promotions.append((cover_part, cover_final))
 
-            metadata_relative = Path("metadata.json")
+            registered_metadata = registered_artifacts.get("metadata")
+            metadata_relative = (
+                registered_metadata.relative_path
+                if registered_metadata is not None
+                else Path(f"{base_name}.metadata.json")
+            )
+            metadata_final = registered_path(output_directory, metadata_relative)
             metadata_part = (
                 output_directory / f"{aweme_id}.{operation_id}.metadata.json.part"
             )
@@ -108,10 +129,11 @@ class ArchiveArtifactPipeline:
                 resolved,
                 operation_id,
                 (video, cover),
+                metadata_relative,
             )
             metadata = _pending(metadata, metadata_part)
             promotions.append(
-                (metadata_part, output_directory / metadata_relative)
+                (metadata_part, metadata_final)
             )
             return PreparedArchive(
                 artifacts=(video, cover, metadata),

@@ -5,7 +5,7 @@ import threading
 import weakref
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 from uuid import uuid4
@@ -33,6 +33,10 @@ from douyin_downloader.archive_store import (
 )
 from douyin_downloader.async_tools import run_in_thread_cancellation_safe
 from douyin_downloader.domain import AppError, ResolvedWork
+from douyin_downloader.settings import (
+    ArchiveProfile,
+    OperationSettingsSnapshot,
+)
 
 __all__ = [
     "ArchiveItemSnapshot",
@@ -50,6 +54,34 @@ __all__ = [
 class SingleArchiveRequest:
     aweme_id: str
     archive_root: Path
+    naming_template: str = "{aweme_id}"
+    profile: ArchiveProfile = field(default_factory=ArchiveProfile)
+    download_concurrency: int = 3
+    retry_limit: int = 3
+
+    @classmethod
+    def from_settings(
+        cls,
+        aweme_id: str,
+        settings: OperationSettingsSnapshot,
+    ) -> SingleArchiveRequest:
+        return cls(
+            aweme_id=aweme_id,
+            archive_root=settings.archive_root,
+            naming_template=settings.naming_template,
+            profile=settings.profile,
+            download_concurrency=settings.download_concurrency,
+            retry_limit=settings.retry_limit,
+        )
+
+    def settings_snapshot(self) -> OperationSettingsSnapshot:
+        return OperationSettingsSnapshot(
+            archive_root=self.archive_root,
+            naming_template=self.naming_template,
+            profile=self.profile,
+            download_concurrency=self.download_concurrency,
+            retry_limit=self.retry_limit,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +105,7 @@ class ArchiveOperationSnapshot:
     source_task: TaskSnapshot
     work_task: TaskSnapshot
     archive_item: ArchiveItemSnapshot
+    settings: OperationSettingsSnapshot
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,15 +154,30 @@ class ManagedArchive:
         root = root.resolve(strict=True)
         if not request.aweme_id.isdigit():
             raise AppError("INVALID_INPUT", "作品标识无效。", 400)
+        settings = request.settings_snapshot()
+        settings = OperationSettingsSnapshot(
+            archive_root=root,
+            naming_template=settings.naming_template,
+            profile=settings.profile,
+            download_concurrency=settings.download_concurrency,
+            retry_limit=settings.retry_limit,
+        )
+        if settings.profile.include_audio or settings.profile.include_description:
+            raise AppError(
+                "ARCHIVE_PROFILE_UNAVAILABLE",
+                "可选音轨与文案成果将在下一阶段启用，请暂时关闭后再归档。",
+                409,
+            )
 
         async with _hold_thread_lock(self._integrity_lock(request.aweme_id)):
-            return await self._archive_single_locked(request.aweme_id, root)
+            return await self._archive_single_locked(request.aweme_id, settings)
 
     async def _archive_single_locked(
         self,
         aweme_id: str,
-        root: Path,
+        settings: OperationSettingsSnapshot,
     ) -> ArchiveOperationSnapshot:
+        root = settings.archive_root
         existing = await run_in_thread_cancellation_safe(
             self._audit_archive_unlocked,
             aweme_id,
@@ -143,6 +191,7 @@ class ManagedArchive:
                     aweme_id,
                     existing.stored.relative_directory,
                     "archived",
+                    existing.stored.settings,
                 )
             if existing.status == "location_unavailable":
                 raise AppError(
@@ -151,6 +200,7 @@ class ManagedArchive:
                     409,
                 )
             root = existing.stored.root
+            settings = existing.stored.settings
             existing_relative_directory = existing.stored.relative_directory
             valid_artifacts = existing.valid_artifacts
 
@@ -158,7 +208,7 @@ class ManagedArchive:
         prepared: PreparedArchive | None = None
         promotion_started = False
         try:
-            self._store.create_running(ids, aweme_id, root)
+            self._store.create_running(ids, aweme_id, settings)
             resolved = await self._work_access.fetch_work(aweme_id)
             if resolved.snapshot.aweme_id != aweme_id:
                 raise AppError(
@@ -176,12 +226,20 @@ class ManagedArchive:
                 relative_directory,
                 create=True,
             ) as output_directory:
+                base_name = settings.artifact_base_name(resolved)
+                registered_artifacts: dict[str, ArtifactRecord] = (
+                    {artifact.kind: artifact for artifact in existing.stored.artifacts}
+                    if existing is not None
+                    else {}
+                )
                 prepared = await self._artifact_pipeline.prepare(
                     output_directory,
                     aweme_id,
                     ids.operation,
                     resolved,
                     valid_artifacts,
+                    registered_artifacts,
+                    base_name,
                 )
                 self._store.prepare_promotion(
                     ids,
@@ -203,7 +261,13 @@ class ManagedArchive:
                     self._store.fail(ids)
             raise
 
-        return _archive_snapshot(ids, aweme_id, relative_directory, "archived")
+        return _archive_snapshot(
+            ids,
+            aweme_id,
+            relative_directory,
+            "archived",
+            settings,
+        )
 
     def get_work_archive(self, aweme_id: str) -> ArchiveItemSnapshot | None:
         existing = self._audit_archive(aweme_id)
@@ -312,6 +376,7 @@ def _archive_snapshot(
     aweme_id: str,
     relative_directory: Path,
     status: str,
+    settings: OperationSettingsSnapshot,
 ) -> ArchiveOperationSnapshot:
     def task(task_id: str) -> TaskSnapshot:
         return TaskSnapshot(task_id, "finished", "idle", "success")
@@ -321,6 +386,7 @@ def _archive_snapshot(
         source_task=task(ids.source),
         work_task=task(ids.work),
         archive_item=ArchiveItemSnapshot(aweme_id, status, relative_directory),
+        settings=settings,
     )
 
 

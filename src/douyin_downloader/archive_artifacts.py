@@ -5,7 +5,7 @@ import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
-from typing import Literal, cast
+from typing import Literal
 
 from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -151,6 +151,7 @@ def write_metadata(
     resolved: ResolvedWork,
     operation_id: str,
     artifacts: tuple[ArtifactRecord, ...],
+    relative_path: Path,
 ) -> ArtifactRecord:
     generated_at = datetime.now(UTC)
     snapshot = resolved.snapshot
@@ -195,7 +196,7 @@ def write_metadata(
         ),
         artifacts=tuple(
             ArtifactMetadata(
-                kind=cast(Literal["video", "cover"], artifact.kind),
+                kind=_media_artifact_kind(artifact.kind),
                 path=artifact.relative_path.as_posix(),
                 size_bytes=artifact.size_bytes,
                 mime_type=artifact.mime_type,
@@ -219,7 +220,7 @@ def write_metadata(
     return artifact_digest(
         "metadata",
         path,
-        Path("metadata.json"),
+        relative_path,
         "application/json",
     )
 
@@ -236,3 +237,11 @@ def validate_metadata(path: Path, aweme_id: str) -> ArchiveMetadata:
     if kinds != {"video", "cover"}:
         raise archive_failed()
     return document
+
+
+def _media_artifact_kind(
+    kind: ArtifactKind,
+) -> Literal["video", "cover"]:
+    if kind == "video" or kind == "cover":
+        return kind
+    raise ValueError("metadata is not a media artifact")

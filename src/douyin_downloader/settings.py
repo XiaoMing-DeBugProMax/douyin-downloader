@@ -1,18 +1,27 @@
 from __future__ import annotations
 
+import re
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from string import Formatter
 
 from douyin_downloader.archive_paths import is_reparse_point
-from douyin_downloader.domain import AppError
+from douyin_downloader.domain import AppError, ResolvedWork
 
 _DEFAULT_NAMING_TEMPLATE = "{aweme_id}"
 _TEMPLATE_FIELDS = frozenset({"date", "author", "description", "aweme_id"})
 _MAX_TEMPLATE_LENGTH = 200
+_MAX_BASE_NAME_LENGTH = 120
+_WINDOWS_INVALID = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_WINDOWS_DEVICE_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{number}" for number in range(1, 10)}
+    | {f"LPT{number}" for number in range(1, 10)}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +46,24 @@ class OperationSettingsSnapshot:
     profile: ArchiveProfile
     download_concurrency: int
     retry_limit: int
+
+    def artifact_base_name(self, resolved: ResolvedWork) -> str:
+        snapshot = resolved.snapshot
+        published_at = snapshot.published_at
+        date = (
+            datetime.fromtimestamp(published_at, UTC).date().isoformat()
+            if published_at is not None
+            else "unknown-date"
+        )
+        rendered = self.naming_template.format_map(
+            {
+                "date": date,
+                "author": snapshot.author.nickname,
+                "description": snapshot.description,
+                "aweme_id": snapshot.aweme_id,
+            }
+        )
+        return _safe_windows_base_name(rendered, snapshot.aweme_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,3 +249,15 @@ def _template_invalid() -> AppError:
         "基础名称模板包含不支持的字段或路径字符。",
         400,
     )
+
+
+def _safe_windows_base_name(value: str, fallback: str) -> str:
+    normalized = _WINDOWS_INVALID.sub("_", value)
+    normalized = " ".join(normalized.split()).strip().rstrip(" .")
+    if normalized in {"", ".", ".."}:
+        normalized = fallback
+    normalized = normalized[:_MAX_BASE_NAME_LENGTH].rstrip(" .") or fallback
+    device_stem = normalized.split(".", 1)[0].upper()
+    if device_stem in _WINDOWS_DEVICE_NAMES:
+        normalized = f"_{normalized}"
+    return normalized

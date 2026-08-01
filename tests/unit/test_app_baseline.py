@@ -4,6 +4,7 @@ from httpx import ASGITransport, AsyncClient
 from douyin_downloader.archive import ManagedArchive
 from douyin_downloader.f2_adapter import F2VideoParser
 from douyin_downloader.launcher import main
+from douyin_downloader.settings import SettingsModule
 from douyin_downloader.url_resolver import ShareResolver
 from douyin_downloader.web.app import create_app
 
@@ -55,6 +56,7 @@ async def test_lifespan_composes_services_with_one_shared_client() -> None:
         assert parse_service._resolver._client is shared_client
         assert isinstance(parse_service._parser, F2VideoParser)
         assert isinstance(app.state.services.managed_archive, ManagedArchive)
+        assert isinstance(app.state.services.settings, SettingsModule)
 
     assert shared_client.is_closed
 

@@ -27,6 +27,7 @@ from douyin_downloader.domain import (
     ResolvedWork,
     WorkSnapshot,
 )
+from douyin_downloader.settings import ArchiveProfile, OperationSettingsSnapshot
 
 
 class UnexpectedWorkAccess:
@@ -341,8 +342,8 @@ async def test_default_archive_contains_valid_cover_and_filtered_metadata(
     )
 
     work_directory = root / result.archive_item.relative_directory
-    cover_path = work_directory / "cover.png"
-    metadata_path = work_directory / "metadata.json"
+    cover_path = work_directory / "7429378937383308594.cover.png"
+    metadata_path = work_directory / "7429378937383308594.metadata.json"
     with Image.open(cover_path) as cover:
         cover.verify()
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -377,6 +378,153 @@ async def test_default_archive_contains_valid_cover_and_filtered_metadata(
 
 
 @pytest.mark.asyncio
+async def test_custom_template_names_artifacts_without_changing_fixed_work_directory(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "library"
+    root.mkdir()
+    archive = ManagedArchive(
+        database_path=tmp_path / "archive.db",
+        work_access=StaticWorkAccess(),
+        media_access=StaticMediaAccess(valid_mp4()),
+    )
+    settings = OperationSettingsSnapshot(
+        archive_root=root,
+        naming_template="{date}-{author}-{aweme_id}",
+        profile=ArchiveProfile(),
+        download_concurrency=4,
+        retry_limit=2,
+    )
+
+    result = await archive.archive_single(
+        SingleArchiveRequest.from_settings("7429378937383308594", settings)
+    )
+
+    assert result.settings == settings
+    assert result.archive_item.relative_directory.parts[1:] == (
+        "2024",
+        "work-7429378937383308594",
+    )
+    assert result.archive_item.relative_directory.parts[0].startswith("author-")
+    work_path = root / result.archive_item.relative_directory
+    base_name = "2024-07-03-测试作者-7429378937383308594"
+    assert (work_path / f"{base_name}.mp4").is_file()
+    assert (work_path / f"{base_name}.cover.png").is_file()
+    metadata_path = work_path / f"{base_name}.metadata.json"
+    assert metadata_path.is_file()
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert {artifact["path"] for artifact in metadata["artifacts"]} == {
+        f"{base_name}.mp4",
+        f"{base_name}.cover.png",
+    }
+
+
+@pytest.mark.asyncio
+async def test_operation_settings_snapshot_survives_restart_and_new_defaults(
+    tmp_path: Path,
+) -> None:
+    first_root = tmp_path / "first-library"
+    second_root = tmp_path / "second-library"
+    first_root.mkdir()
+    second_root.mkdir()
+    database = tmp_path / "archive.db"
+    original_settings = OperationSettingsSnapshot(
+        archive_root=first_root,
+        naming_template="first-{aweme_id}",
+        profile=ArchiveProfile(),
+        download_concurrency=1,
+        retry_limit=0,
+    )
+    first = ManagedArchive(
+        database_path=database,
+        work_access=StaticWorkAccess(),
+        media_access=StaticMediaAccess(valid_mp4()),
+    )
+    created = await first.archive_single(
+        SingleArchiveRequest.from_settings("7429378937383308594", original_settings)
+    )
+
+    restarted = ManagedArchive(
+        database_path=database,
+        work_access=UnexpectedWorkAccess(),
+        media_access=UnexpectedMediaAccess(),
+    )
+    changed_defaults = OperationSettingsSnapshot(
+        archive_root=second_root,
+        naming_template="second-{aweme_id}",
+        profile=ArchiveProfile(),
+        download_concurrency=5,
+        retry_limit=3,
+    )
+    duplicate = await restarted.archive_single(
+        SingleArchiveRequest.from_settings("7429378937383308594", changed_defaults)
+    )
+
+    assert duplicate.operation.task_id == created.operation.task_id
+    assert duplicate.settings == original_settings
+    archived_video = (
+        first_root
+        / created.archive_item.relative_directory
+        / "first-7429378937383308594.mp4"
+    )
+    assert archived_video.is_file()
+    assert list(second_root.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_changed_root_applies_only_to_new_work(tmp_path: Path) -> None:
+    first_root = tmp_path / "first-library"
+    second_root = tmp_path / "second-library"
+    first_root.mkdir()
+    second_root.mkdir()
+    archive = ManagedArchive(
+        database_path=tmp_path / "archive.db",
+        work_access=StaticWorkAccess(),
+        media_access=StaticMediaAccess(valid_mp4()),
+    )
+
+    first = await archive.archive_single(
+        SingleArchiveRequest("7429378937383308594", first_root)
+    )
+    second = await archive.archive_single(
+        SingleArchiveRequest("7429378937383308595", second_root)
+    )
+
+    assert (first_root / first.archive_item.relative_directory).is_dir()
+    assert (second_root / second.archive_item.relative_directory).is_dir()
+    assert first.settings.archive_root == first_root
+    assert second.settings.archive_root == second_root
+
+
+@pytest.mark.asyncio
+async def test_unavailable_optional_profile_is_rejected_without_silent_completion(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "library"
+    root.mkdir()
+    archive = ManagedArchive(
+        database_path=tmp_path / "archive.db",
+        work_access=UnexpectedWorkAccess(),
+        media_access=UnexpectedMediaAccess(),
+    )
+    settings = OperationSettingsSnapshot(
+        archive_root=root,
+        naming_template="{aweme_id}",
+        profile=ArchiveProfile(include_audio=True),
+        download_concurrency=3,
+        retry_limit=3,
+    )
+
+    with pytest.raises(AppError) as raised:
+        await archive.archive_single(
+            SingleArchiveRequest.from_settings("7429378937383308594", settings)
+        )
+
+    assert raised.value.code == "ARCHIVE_PROFILE_UNAVAILABLE"
+    assert not (tmp_path / "archive.db").exists()
+
+
+@pytest.mark.asyncio
 async def test_missing_cover_is_reported_and_repaired_without_redownloading_video(
     tmp_path: Path,
 ) -> None:
@@ -394,7 +542,7 @@ async def test_missing_cover_is_reported_and_repaired_without_redownloading_vide
     work_directory = root / completed.archive_item.relative_directory
     video_path = work_directory / "7429378937383308594.mp4"
     original_video_hash = hashlib.sha256(video_path.read_bytes()).hexdigest()
-    (work_directory / "cover.png").unlink()
+    (work_directory / "7429378937383308594.cover.png").unlink()
 
     damaged = original.get_work_archive("7429378937383308594")
 
@@ -417,8 +565,8 @@ async def test_missing_cover_is_reported_and_repaired_without_redownloading_vide
         ("https://p3.douyinpic.com/cover.png",)
     ]
     assert hashlib.sha256(video_path.read_bytes()).hexdigest() == original_video_hash
-    assert (work_directory / "cover.png").is_file()
-    assert (work_directory / "metadata.json").is_file()
+    assert (work_directory / "7429378937383308594.cover.png").is_file()
+    assert (work_directory / "7429378937383308594.metadata.json").is_file()
 
 
 @pytest.mark.asyncio
@@ -437,7 +585,7 @@ async def test_corrupt_metadata_is_rebuilt_without_downloading_healthy_media(
         SingleArchiveRequest("7429378937383308594", root)
     )
     work_directory = root / completed.archive_item.relative_directory
-    metadata_path = work_directory / "metadata.json"
+    metadata_path = work_directory / "7429378937383308594.metadata.json"
     metadata_path.write_text("{}", encoding="utf-8")
 
     damaged = original.get_work_archive("7429378937383308594")
@@ -476,7 +624,7 @@ async def test_corrupt_video_is_repaired_without_redownloading_healthy_cover(
     )
     work_directory = root / completed.archive_item.relative_directory
     video_path = work_directory / "7429378937383308594.mp4"
-    cover_path = work_directory / "cover.png"
+    cover_path = work_directory / "7429378937383308594.cover.png"
     original_cover_hash = hashlib.sha256(cover_path.read_bytes()).hexdigest()
     video_path.write_bytes(b"damaged")
 
@@ -524,7 +672,7 @@ async def test_undecodable_cover_never_creates_a_complete_archive(
     assert list(root.rglob("*.part")) == []
     assert list(root.rglob("*.mp4")) == []
     assert list(root.rglob("cover.*")) == []
-    assert list(root.rglob("metadata.json")) == []
+    assert list(root.rglob("*.metadata.json")) == []
     assert archive.get_work_archive("7429378937383308594") is None
 
 
@@ -588,7 +736,7 @@ async def test_promotion_transaction_failure_removes_unregistered_parts(
     assert list(root.rglob("*.part")) == []
     assert list(root.rglob("*.mp4")) == []
     assert list(root.rglob("cover.*")) == []
-    assert list(root.rglob("metadata.json")) == []
+    assert list(root.rglob("*.metadata.json")) == []
     assert archive.get_work_archive("7429378937383308594") is None
 
 
@@ -750,8 +898,8 @@ async def test_missing_work_directory_is_repairable_when_root_is_available(
     )
     assert repaired.archive_item.status == "archived"
     assert (work_directory / "7429378937383308594.mp4").is_file()
-    assert (work_directory / "cover.png").is_file()
-    assert (work_directory / "metadata.json").is_file()
+    assert (work_directory / "7429378937383308594.cover.png").is_file()
+    assert (work_directory / "7429378937383308594.metadata.json").is_file()
 
 
 @pytest.mark.asyncio

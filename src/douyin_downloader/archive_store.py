@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import cast
 
 from douyin_downloader.archive_artifacts import ArtifactKind, ArtifactRecord
+from douyin_downloader.settings import ArchiveProfile, OperationSettingsSnapshot
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,6 +26,7 @@ class StoredArchive:
     relative_directory: Path
     status: str
     artifacts: tuple[ArtifactRecord, ...]
+    settings: OperationSettingsSnapshot
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,7 +49,10 @@ class ArchiveStore:
             row = connection.execute(
                 """
                 SELECT o.operation_id, s.source_task_id, w.work_task_id,
-                       i.root_path, i.relative_directory, i.status
+                       i.root_path, i.relative_directory, i.status,
+                       o.naming_template, o.profile_audio,
+                       o.profile_description, o.download_concurrency,
+                       o.retry_limit
                 FROM archive_items AS i
                 JOIN archive_operations AS o ON o.operation_id = i.operation_id
                 JOIN source_tasks AS s ON s.operation_id = o.operation_id
@@ -65,6 +70,13 @@ class ArchiveStore:
             relative_directory=Path(str(row[4])),
             status=str(row[5]),
             artifacts=self._load_artifacts(aweme_id),
+            settings=OperationSettingsSnapshot(
+                archive_root=Path(str(row[3])),
+                naming_template=str(row[6]),
+                profile=ArchiveProfile(bool(row[7]), bool(row[8])),
+                download_concurrency=int(row[9]),
+                retry_limit=int(row[10]),
+            ),
         )
 
     def set_archive_status(self, aweme_id: str, status: str) -> None:
@@ -78,13 +90,26 @@ class ArchiveStore:
         self,
         ids: TaskIds,
         aweme_id: str,
-        root: Path,
+        settings: OperationSettingsSnapshot,
     ) -> None:
         with self._connection() as connection:
             connection.execute(
-                "INSERT INTO archive_operations VALUES "
-                "(?, 'running', 'resolving', 'none', ?)",
-                (ids.operation, str(root)),
+                """
+                INSERT INTO archive_operations
+                    (operation_id, lifecycle, phase, result, root_path,
+                     naming_template, profile_audio, profile_description,
+                     download_concurrency, retry_limit)
+                VALUES (?, 'running', 'resolving', 'none', ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    ids.operation,
+                    str(settings.archive_root),
+                    settings.naming_template,
+                    int(settings.profile.include_audio),
+                    int(settings.profile.include_description),
+                    settings.download_concurrency,
+                    settings.retry_limit,
+                ),
             )
             connection.execute(
                 "INSERT INTO source_tasks VALUES "
@@ -211,15 +236,53 @@ class ArchiveStore:
         self._database_path.parent.mkdir(parents=True, exist_ok=True)
         connection = sqlite3.connect(self._database_path)
         connection.execute("PRAGMA foreign_keys = ON")
-        connection.executescript(
+        connection.execute(
             """
             CREATE TABLE IF NOT EXISTS archive_operations (
                 operation_id TEXT PRIMARY KEY,
                 lifecycle TEXT NOT NULL,
                 phase TEXT NOT NULL,
                 result TEXT NOT NULL,
-                root_path TEXT NOT NULL
-            );
+                root_path TEXT NOT NULL,
+                naming_template TEXT NOT NULL DEFAULT '{aweme_id}',
+                profile_audio INTEGER NOT NULL DEFAULT 0,
+                profile_description INTEGER NOT NULL DEFAULT 0,
+                download_concurrency INTEGER NOT NULL DEFAULT 3,
+                retry_limit INTEGER NOT NULL DEFAULT 3
+            )
+            """
+        )
+        operation_columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(archive_operations)")
+        }
+        migrations = {
+            "naming_template": (
+                "ALTER TABLE archive_operations ADD COLUMN naming_template "
+                "TEXT NOT NULL DEFAULT '{aweme_id}'"
+            ),
+            "profile_audio": (
+                "ALTER TABLE archive_operations ADD COLUMN profile_audio "
+                "INTEGER NOT NULL DEFAULT 0"
+            ),
+            "profile_description": (
+                "ALTER TABLE archive_operations ADD COLUMN profile_description "
+                "INTEGER NOT NULL DEFAULT 0"
+            ),
+            "download_concurrency": (
+                "ALTER TABLE archive_operations ADD COLUMN download_concurrency "
+                "INTEGER NOT NULL DEFAULT 3"
+            ),
+            "retry_limit": (
+                "ALTER TABLE archive_operations ADD COLUMN retry_limit "
+                "INTEGER NOT NULL DEFAULT 3"
+            ),
+        }
+        for column, statement in migrations.items():
+            if column not in operation_columns:
+                connection.execute(statement)
+        connection.executescript(
+            """
             CREATE TABLE IF NOT EXISTS source_tasks (
                 source_task_id TEXT PRIMARY KEY,
                 operation_id TEXT NOT NULL REFERENCES archive_operations(operation_id),

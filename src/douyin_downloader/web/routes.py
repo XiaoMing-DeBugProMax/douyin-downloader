@@ -7,7 +7,7 @@ from urllib.parse import quote
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from starlette.responses import Response, StreamingResponse
 
 from douyin_downloader.archive import (
@@ -19,6 +19,12 @@ from douyin_downloader.domain import AppError
 from douyin_downloader.media import UpstreamStream, open_first_available, safe_video_filename
 from douyin_downloader.parse_service import ParseService
 from douyin_downloader.session import SessionManager, require_local_session, require_same_origin
+from douyin_downloader.settings import (
+    ArchiveProfile,
+    CurrentSettings,
+    OperationSettingsSnapshot,
+    SettingsUpdate,
+)
 
 
 class ManagedArchiveModule(Protocol):
@@ -36,11 +42,22 @@ class DirectoryChooser(Protocol):
     def choose_directory(self) -> Path | None: ...
 
 
+class SettingsModuleInterface(Protocol):
+    def current(self) -> CurrentSettings: ...
+
+    def update(self, changes: SettingsUpdate) -> CurrentSettings: ...
+
+    def set_archive_root(self, archive_root: Path) -> CurrentSettings: ...
+
+    def capture(self) -> OperationSettingsSnapshot: ...
+
+
 @dataclass(slots=True)
 class AppServices:
     parse_service: ParseService
     media_client: httpx.AsyncClient
     managed_archive: ManagedArchiveModule | None = None
+    settings: SettingsModuleInterface | None = None
     directory_chooser: DirectoryChooser | None = None
 
 
@@ -79,6 +96,30 @@ class ArchiveWorkResponse(BaseModel):
     can_open_folder: bool
 
 
+class ArchiveProfileModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    include_audio: bool
+    include_description: bool
+
+
+class SettingsUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    naming_template: str
+    profile: ArchiveProfileModel
+    download_concurrency: int
+    retry_limit: int
+
+
+class SettingsResponse(BaseModel):
+    archive_root: str | None
+    naming_template: str
+    profile: ArchiveProfileModel
+    download_concurrency: int
+    retry_limit: int
+
+
 def content_disposition_filename(filename: str) -> str:
     ascii_fallback = filename.encode("ascii", "ignore").decode("ascii")
     if not ascii_fallback.removesuffix(".mp4").strip(" .-"):
@@ -98,6 +139,26 @@ def _managed_archive(request: Request) -> ManagedArchiveModule:
     if archive is None:
         raise AppError("ARCHIVE_UNAVAILABLE", "本地归档暂时不可用，快速下载仍可使用。", 503)
     return archive
+
+
+def _settings_module(request: Request) -> SettingsModuleInterface:
+    settings = _services(request).settings
+    if settings is None:
+        raise AppError("SETTINGS_UNAVAILABLE", "设置暂时不可用。", 503)
+    return settings
+
+
+def _settings_response(settings: CurrentSettings) -> SettingsResponse:
+    return SettingsResponse(
+        archive_root=str(settings.archive_root) if settings.archive_root is not None else None,
+        naming_template=settings.naming_template,
+        profile=ArchiveProfileModel(
+            include_audio=settings.profile.include_audio,
+            include_description=settings.profile.include_description,
+        ),
+        download_concurrency=settings.download_concurrency,
+        retry_limit=settings.retry_limit,
+    )
 
 
 def streaming_cover_response(upstream: UpstreamStream) -> StreamingResponse:
@@ -179,16 +240,31 @@ def build_router() -> APIRouter:
         services = _services(request)
         video = services.parse_service.store.get(payload.parse_token)
         archive = _managed_archive(request)
-        if services.directory_chooser is None:
-            raise AppError("ARCHIVE_UNAVAILABLE", "本地归档暂时不可用，快速下载仍可使用。", 503)
-        archive_root = await asyncio.to_thread(services.directory_chooser.choose_directory)
-        if archive_root is None:
-            raise AppError("ARCHIVE_SELECTION_CANCELLED", "已取消选择归档目录。", 409)
-        result = await archive.archive_single(
-            SingleArchiveRequest(
-                aweme_id=video.aweme_id,
-                archive_root=archive_root,
+        settings_module = _settings_module(request)
+        try:
+            settings = settings_module.capture()
+        except AppError as error:
+            if error.code != "ARCHIVE_ROOT_REQUIRED":
+                raise
+            if services.directory_chooser is None:
+                raise AppError(
+                    "ARCHIVE_UNAVAILABLE",
+                    "本地归档暂时不可用，快速下载仍可使用。",
+                    503,
+                ) from error
+            archive_root = await asyncio.to_thread(
+                services.directory_chooser.choose_directory
             )
+            if archive_root is None:
+                raise AppError(
+                    "ARCHIVE_SELECTION_CANCELLED",
+                    "已取消选择归档目录。",
+                    409,
+                ) from error
+            settings_module.set_archive_root(archive_root)
+            settings = settings_module.capture()
+        result = await archive.archive_single(
+            SingleArchiveRequest.from_settings(video.aweme_id, settings)
         )
         return ArchiveResponse(
             operation_id=result.operation.task_id,
@@ -196,6 +272,60 @@ def build_router() -> APIRouter:
             status=result.archive_item.status,
             can_open_folder=True,
         )
+
+    @router.get(
+        "/api/settings",
+        response_model=SettingsResponse,
+        dependencies=[Depends(require_local_session)],
+    )
+    async def get_settings(request: Request) -> SettingsResponse:
+        current = await asyncio.to_thread(_settings_module(request).current)
+        return _settings_response(current)
+
+    @router.put(
+        "/api/settings",
+        response_model=SettingsResponse,
+        dependencies=[Depends(require_local_session), Depends(require_same_origin)],
+    )
+    async def update_settings(
+        payload: SettingsUpdateRequest,
+        request: Request,
+    ) -> SettingsResponse:
+        updated = await asyncio.to_thread(
+            _settings_module(request).update,
+            SettingsUpdate(
+                naming_template=payload.naming_template,
+                profile=ArchiveProfile(
+                    include_audio=payload.profile.include_audio,
+                    include_description=payload.profile.include_description,
+                ),
+                download_concurrency=payload.download_concurrency,
+                retry_limit=payload.retry_limit,
+            ),
+        )
+        return _settings_response(updated)
+
+    @router.post(
+        "/api/settings/archive-root/select",
+        response_model=SettingsResponse,
+        dependencies=[Depends(require_local_session), Depends(require_same_origin)],
+    )
+    async def select_settings_archive_root(request: Request) -> SettingsResponse:
+        services = _services(request)
+        if services.directory_chooser is None:
+            raise AppError("SETTINGS_UNAVAILABLE", "设置暂时不可用。", 503)
+        selected = await asyncio.to_thread(services.directory_chooser.choose_directory)
+        if selected is None:
+            raise AppError(
+                "ARCHIVE_SELECTION_CANCELLED",
+                "已取消选择归档目录。",
+                409,
+            )
+        updated = await asyncio.to_thread(
+            _settings_module(request).set_archive_root,
+            selected,
+        )
+        return _settings_response(updated)
 
     @router.get(
         "/api/archive/work/{aweme_id}",

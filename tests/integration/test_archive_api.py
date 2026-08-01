@@ -14,6 +14,7 @@ from douyin_downloader.archive import (
 from douyin_downloader.domain import ParsedVideo, ResolvedShare
 from douyin_downloader.parse_service import ParseService
 from douyin_downloader.session import SessionManager
+from douyin_downloader.settings import SettingsModule
 from douyin_downloader.store import ParseStore
 from douyin_downloader.web.app import create_app
 from douyin_downloader.web.routes import AppServices
@@ -63,6 +64,7 @@ class RecordingManagedArchive:
             source_task=task,
             work_task=task,
             archive_item=item,
+            settings=request.settings_snapshot(),
         )
 
     def get_work_archive(self, aweme_id: str) -> ArchiveItemSnapshot | None:
@@ -89,6 +91,7 @@ async def test_archive_route_uses_parse_token_without_exposing_paths_or_media_ur
     store = ParseStore()
     parse_token = store.put(VIDEO)
     managed_archive = RecordingManagedArchive()
+    settings = SettingsModule(tmp_path / "archive.db")
     event_loop_thread_id = threading.get_ident()
     sessions = SessionManager()
     async with httpx.AsyncClient(
@@ -99,6 +102,7 @@ async def test_archive_route_uses_parse_token_without_exposing_paths_or_media_ur
                 parse_service=ParseService(UnusedResolver(), UnusedParser(), store),
                 media_client=media_client,
                 managed_archive=managed_archive,
+                settings=settings,
                 directory_chooser=StaticDirectoryChooser(tmp_path),
             ),
             session_manager=sessions,
@@ -130,7 +134,7 @@ async def test_archive_route_uses_parse_token_without_exposing_paths_or_media_ur
         "can_open_folder": True,
     }
     assert managed_archive.requests == [
-        SingleArchiveRequest(VIDEO.aweme_id, tmp_path)
+        SingleArchiveRequest.from_settings(VIDEO.aweme_id, settings.capture())
     ]
     assert str(tmp_path) not in response.text
     assert "douyinvod.com" not in response.text
