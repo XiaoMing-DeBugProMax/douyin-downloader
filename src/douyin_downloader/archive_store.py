@@ -8,7 +8,11 @@ from pathlib import Path
 from typing import cast
 
 from douyin_downloader.archive_artifacts import ArtifactKind, ArtifactRecord
-from douyin_downloader.settings import ArchiveProfile, OperationSettingsSnapshot
+from douyin_downloader.settings import (
+    ArchiveProfile,
+    NamingTemplate,
+    OperationSettingsSnapshot,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,7 +76,7 @@ class ArchiveStore:
             artifacts=self._load_artifacts(aweme_id),
             settings=OperationSettingsSnapshot(
                 archive_root=Path(str(row[3])),
-                naming_template=str(row[6]),
+                naming_template=NamingTemplate(str(row[6])),
                 profile=ArchiveProfile(bool(row[7]), bool(row[8])),
                 download_concurrency=int(row[9]),
                 retry_limit=int(row[10]),
@@ -104,7 +108,7 @@ class ArchiveStore:
                 (
                     ids.operation,
                     str(settings.archive_root),
-                    settings.naming_template,
+                    str(settings.naming_template),
                     int(settings.profile.include_audio),
                     int(settings.profile.include_description),
                     settings.download_concurrency,
@@ -278,9 +282,16 @@ class ArchiveStore:
                 "INTEGER NOT NULL DEFAULT 3"
             ),
         }
-        for column, statement in migrations.items():
-            if column not in operation_columns:
-                connection.execute(statement)
+        missing_migrations = tuple(
+            statement
+            for column, statement in migrations.items()
+            if column not in operation_columns
+        )
+        if missing_migrations:
+            self._backup_before_settings_snapshot_migration(connection)
+            with connection:
+                for statement in missing_migrations:
+                    connection.execute(statement)
         connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS source_tasks (
@@ -320,6 +331,28 @@ class ArchiveStore:
             """
         )
         return connection
+
+    def _backup_before_settings_snapshot_migration(
+        self,
+        connection: sqlite3.Connection,
+    ) -> None:
+        connection.commit()
+        backup_path = self._database_path.with_name(
+            f"{self._database_path.stem}.pre-settings-snapshot.bak"
+        )
+        part_path = backup_path.with_name(f"{backup_path.name}.part")
+        part_path.unlink(missing_ok=True)
+        backup = sqlite3.connect(part_path)
+        try:
+            try:
+                connection.backup(backup)
+                backup.commit()
+            finally:
+                backup.close()
+            part_path.replace(backup_path)
+        except BaseException:
+            part_path.unlink(missing_ok=True)
+            raise
 
     def _load_artifacts(self, aweme_id: str) -> tuple[ArtifactRecord, ...]:
         with self._connection() as connection:

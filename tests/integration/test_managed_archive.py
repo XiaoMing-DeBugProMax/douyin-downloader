@@ -525,6 +525,47 @@ async def test_unavailable_optional_profile_is_rejected_without_silent_completio
 
 
 @pytest.mark.asyncio
+async def test_existing_database_is_backed_up_before_settings_snapshot_migration(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "archive.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            CREATE TABLE archive_operations (
+                operation_id TEXT PRIMARY KEY,
+                lifecycle TEXT NOT NULL,
+                phase TEXT NOT NULL,
+                result TEXT NOT NULL,
+                root_path TEXT NOT NULL
+            )
+            """
+        )
+    root = tmp_path / "library"
+    root.mkdir()
+    archive = ManagedArchive(
+        database_path=database,
+        work_access=StaticWorkAccess(),
+        media_access=StaticMediaAccess(valid_mp4()),
+    )
+
+    result = await archive.archive_single(
+        SingleArchiveRequest("7429378937383308594", root)
+    )
+
+    backup = tmp_path / "archive.pre-settings-snapshot.bak"
+    assert result.archive_item.status == "archived"
+    assert backup.is_file()
+    with sqlite3.connect(backup) as connection:
+        assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+        legacy_columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(archive_operations)")
+        }
+    assert "naming_template" not in legacy_columns
+
+
+@pytest.mark.asyncio
 async def test_missing_cover_is_reported_and_repaired_without_redownloading_video(
     tmp_path: Path,
 ) -> None:

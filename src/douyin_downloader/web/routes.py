@@ -22,6 +22,7 @@ from douyin_downloader.session import SessionManager, require_local_session, req
 from douyin_downloader.settings import (
     ArchiveProfile,
     CurrentSettings,
+    NamingTemplate,
     OperationSettingsSnapshot,
     SettingsUpdate,
 )
@@ -242,7 +243,7 @@ def build_router() -> APIRouter:
         archive = _managed_archive(request)
         settings_module = _settings_module(request)
         try:
-            settings = settings_module.capture()
+            settings = await asyncio.to_thread(settings_module.capture)
         except AppError as error:
             if error.code != "ARCHIVE_ROOT_REQUIRED":
                 raise
@@ -261,8 +262,8 @@ def build_router() -> APIRouter:
                     "已取消选择归档目录。",
                     409,
                 ) from error
-            settings_module.set_archive_root(archive_root)
-            settings = settings_module.capture()
+            await asyncio.to_thread(settings_module.set_archive_root, archive_root)
+            settings = await asyncio.to_thread(settings_module.capture)
         result = await archive.archive_single(
             SingleArchiveRequest.from_settings(video.aweme_id, settings)
         )
@@ -294,7 +295,7 @@ def build_router() -> APIRouter:
         updated = await asyncio.to_thread(
             _settings_module(request).update,
             SettingsUpdate(
-                naming_template=payload.naming_template,
+                naming_template=NamingTemplate(payload.naming_template),
                 profile=ArchiveProfile(
                     include_audio=payload.profile.include_audio,
                     include_description=payload.profile.include_description,

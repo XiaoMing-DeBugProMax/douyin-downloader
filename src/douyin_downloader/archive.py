@@ -35,6 +35,7 @@ from douyin_downloader.async_tools import run_in_thread_cancellation_safe
 from douyin_downloader.domain import AppError, ResolvedWork
 from douyin_downloader.settings import (
     ArchiveProfile,
+    NamingTemplate,
     OperationSettingsSnapshot,
 )
 
@@ -54,7 +55,7 @@ __all__ = [
 class SingleArchiveRequest:
     aweme_id: str
     archive_root: Path
-    naming_template: str = "{aweme_id}"
+    naming_template: NamingTemplate = field(default_factory=NamingTemplate)
     profile: ArchiveProfile = field(default_factory=ArchiveProfile)
     download_concurrency: int = 3
     retry_limit: int = 3

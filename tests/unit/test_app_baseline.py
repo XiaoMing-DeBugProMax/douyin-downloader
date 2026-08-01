@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 from httpx import ASGITransport, AsyncClient
 
@@ -6,6 +8,7 @@ from douyin_downloader.f2_adapter import F2VideoParser
 from douyin_downloader.launcher import main
 from douyin_downloader.settings import SettingsModule
 from douyin_downloader.url_resolver import ShareResolver
+from douyin_downloader.web import app as app_module
 from douyin_downloader.web.app import create_app
 
 
@@ -59,6 +62,25 @@ async def test_lifespan_composes_services_with_one_shared_client() -> None:
         assert isinstance(app.state.services.settings, SettingsModule)
 
     assert shared_client.is_closed
+
+
+@pytest.mark.asyncio
+async def test_settings_database_failure_does_not_remove_quick_download_services(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "archive.db").write_bytes(b"not a sqlite database")
+
+    class TemporaryRuntimeStore:
+        app_dir = tmp_path
+
+    monkeypatch.setattr(app_module, "RuntimeStore", TemporaryRuntimeStore)
+    app = create_app(testing=True)
+
+    async with app.router.lifespan_context(app):
+        assert app.state.services.settings is None
+        assert app.state.services.managed_archive is None
+        assert app.state.services.parse_service is not None
 
 
 @pytest.mark.asyncio

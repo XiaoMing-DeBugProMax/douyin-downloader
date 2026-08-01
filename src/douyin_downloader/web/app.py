@@ -1,3 +1,4 @@
+import sqlite3
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from uuid import uuid4
@@ -46,7 +47,7 @@ async def _application_lifespan(app: FastAPI) -> AsyncIterator[None]:
             work_access=work_access,
             media_access=HttpMediaAccess(client),
         )
-    except (OSError, RuntimeError):
+    except (OSError, RuntimeError, sqlite3.Error):
         settings = None
         managed_archive = None
     app.state.services = AppServices(
@@ -111,13 +112,21 @@ def create_app(
         )
 
     @app.exception_handler(RequestValidationError)
-    async def validation_error_handler(_: Request, __: RequestValidationError) -> JSONResponse:
+    async def validation_error_handler(
+        request: Request,
+        _: RequestValidationError,
+    ) -> JSONResponse:
+        message = (
+            "设置值无效，请检查后重试。"
+            if request.url.path.startswith("/api/settings")
+            else "没有识别到抖音链接，请粘贴完整分享文案。"
+        )
         return JSONResponse(
             status_code=400,
             content={
                 "error": {
                     "code": "INVALID_INPUT",
-                    "message": "没有识别到抖音链接，请粘贴完整分享文案。",
+                    "message": message,
                 }
             },
         )

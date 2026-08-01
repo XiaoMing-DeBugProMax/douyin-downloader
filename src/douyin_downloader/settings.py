@@ -24,28 +24,12 @@ _WINDOWS_DEVICE_NAMES = frozenset(
 )
 
 
-@dataclass(frozen=True, slots=True)
-class ArchiveProfile:
-    include_audio: bool = False
-    include_description: bool = False
+class NamingTemplate(str):
+    """A validated artifact base-name template that cannot express paths."""
 
-
-@dataclass(frozen=True, slots=True)
-class CurrentSettings:
-    archive_root: Path | None
-    naming_template: str
-    profile: ArchiveProfile
-    download_concurrency: int
-    retry_limit: int
-
-
-@dataclass(frozen=True, slots=True)
-class OperationSettingsSnapshot:
-    archive_root: Path
-    naming_template: str
-    profile: ArchiveProfile
-    download_concurrency: int
-    retry_limit: int
+    def __new__(cls, value: str = _DEFAULT_NAMING_TEMPLATE) -> NamingTemplate:
+        _validate_naming_template(value)
+        return super().__new__(cls, value)
 
     def artifact_base_name(self, resolved: ResolvedWork) -> str:
         snapshot = resolved.snapshot
@@ -55,7 +39,7 @@ class OperationSettingsSnapshot:
             if published_at is not None
             else "unknown-date"
         )
-        rendered = self.naming_template.format_map(
+        rendered = self.format_map(
             {
                 "date": date,
                 "author": snapshot.author.nickname,
@@ -67,11 +51,56 @@ class OperationSettingsSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
-class SettingsUpdate:
-    naming_template: str
+class ArchiveProfile:
+    include_audio: bool = False
+    include_description: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class CurrentSettings:
+    archive_root: Path | None
+    naming_template: NamingTemplate
     profile: ArchiveProfile
     download_concurrency: int
     retry_limit: int
+
+
+@dataclass(frozen=True, slots=True)
+class OperationSettingsSnapshot:
+    archive_root: Path
+    naming_template: NamingTemplate
+    profile: ArchiveProfile
+    download_concurrency: int
+    retry_limit: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.naming_template, NamingTemplate):
+            object.__setattr__(
+                self,
+                "naming_template",
+                NamingTemplate(self.naming_template),
+            )
+        _validate_runtime_values(self.download_concurrency, self.retry_limit)
+
+    def artifact_base_name(self, resolved: ResolvedWork) -> str:
+        return self.naming_template.artifact_base_name(resolved)
+
+
+@dataclass(frozen=True, slots=True)
+class SettingsUpdate:
+    naming_template: NamingTemplate
+    profile: ArchiveProfile
+    download_concurrency: int
+    retry_limit: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.naming_template, NamingTemplate):
+            object.__setattr__(
+                self,
+                "naming_template",
+                NamingTemplate(self.naming_template),
+            )
+        _validate_runtime_values(self.download_concurrency, self.retry_limit)
 
 
 class SettingsModule:
@@ -94,7 +123,7 @@ class SettingsModule:
             raise RuntimeError("current settings row was not initialized")
         return CurrentSettings(
             archive_root=Path(str(row[0])) if row[0] is not None else None,
-            naming_template=str(row[1]),
+            naming_template=NamingTemplate(str(row[1])),
             profile=ArchiveProfile(bool(row[2]), bool(row[3])),
             download_concurrency=int(row[4]),
             retry_limit=int(row[5]),
@@ -112,7 +141,7 @@ class SettingsModule:
                 WHERE settings_id = 1
                 """,
                 (
-                    changes.naming_template,
+                    str(changes.naming_template),
                     int(changes.profile.include_audio),
                     int(changes.profile.include_description),
                     changes.download_concurrency,
@@ -183,21 +212,23 @@ class SettingsModule:
 
 
 def _validate_update(changes: SettingsUpdate) -> None:
-    if not 1 <= changes.download_concurrency <= 5:
+    _validate_runtime_values(changes.download_concurrency, changes.retry_limit)
+    _validate_naming_template(changes.naming_template)
+
+
+def _validate_runtime_values(download_concurrency: int, retry_limit: int) -> None:
+    if type(download_concurrency) is not int or not 1 <= download_concurrency <= 5:
         raise AppError(
             "SETTINGS_INVALID",
             "下载并发必须是 1 到 5 之间的整数。",
             400,
         )
-    if not 0 <= changes.retry_limit <= 3:
+    if type(retry_limit) is not int or not 0 <= retry_limit <= 3:
         raise AppError(
             "SETTINGS_INVALID",
             "失败重试必须是 0 到 3 之间的整数。",
             400,
         )
-    _validate_naming_template(changes.naming_template)
-
-
 def _validate_naming_template(template: str) -> None:
     if (
         not template

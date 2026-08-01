@@ -156,5 +156,6 @@ async def test_settings_mutations_reject_invalid_values_paths_and_cross_origin(
 
     assert invalid.status_code == 400
     assert invalid.json()["error"]["code"] == "INVALID_INPUT"
+    assert "设置" in invalid.json()["error"]["message"]
     assert settings.current().archive_root is None
     assert cross_origin.status_code == 403

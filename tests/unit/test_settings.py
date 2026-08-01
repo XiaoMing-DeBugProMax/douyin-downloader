@@ -71,6 +71,22 @@ def test_download_concurrency_outside_one_to_five_is_rejected(
     assert "并发" in raised.value.message
 
 
+def test_boolean_is_not_accepted_as_a_concurrency_integer(tmp_path: Path) -> None:
+    settings = SettingsModule(tmp_path / "archive.db")
+
+    with pytest.raises(AppError) as raised:
+        settings.update(
+            SettingsUpdate(
+                naming_template="{aweme_id}",
+                profile=ArchiveProfile(),
+                download_concurrency=True,
+                retry_limit=3,
+            )
+        )
+
+    assert raised.value.code == "SETTINGS_INVALID"
+
+
 @pytest.mark.parametrize("value", [-1, 4, 100])
 def test_retry_limit_outside_zero_to_three_is_rejected(
     tmp_path: Path,
@@ -252,6 +268,21 @@ def test_snapshot_bounds_dangerous_lengths_and_falls_back_when_render_is_empty(
     assert len(long_name) == 120
     assert long_name == "汉" * 120
     assert empty_name == "7429378937383308594"
+
+
+def test_direct_operation_snapshot_cannot_bypass_template_validation(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(AppError) as raised:
+        OperationSettingsSnapshot(
+            archive_root=tmp_path,
+            naming_template="{author.__class__}/../{aweme_id}",
+            profile=ArchiveProfile(),
+            download_concurrency=3,
+            retry_limit=3,
+        )
+
+    assert raised.value.code == "SETTINGS_INVALID"
 
 
 def resolved_work(
