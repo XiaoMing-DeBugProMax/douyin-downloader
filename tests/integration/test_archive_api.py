@@ -53,6 +53,9 @@ class RecordingManagedArchive:
         self.open_thread_ids: list[int] = []
         self.task_operations: tuple[TaskCenterOperationSnapshot, ...] = ()
         self.cleared_operations: list[str] = []
+        self.paused_tasks: list[str] = []
+        self.resumed_tasks: list[str] = []
+        self.cancelled_tasks: list[tuple[str, bool]] = []
 
     async def archive_single(
         self,
@@ -87,6 +90,23 @@ class RecordingManagedArchive:
 
     def clear_task_operation(self, operation_id: str) -> None:
         self.cleared_operations.append(operation_id)
+
+    async def pause_task(self, task_id: str) -> TaskCenterOperationSnapshot:
+        self.paused_tasks.append(task_id)
+        return self.task_operations[0]
+
+    async def resume_task(self, task_id: str) -> TaskCenterOperationSnapshot:
+        self.resumed_tasks.append(task_id)
+        return self.task_operations[0]
+
+    async def cancel_task(
+        self,
+        task_id: str,
+        *,
+        retain_parts: bool,
+    ) -> TaskCenterOperationSnapshot:
+        self.cancelled_tasks.append((task_id, retain_parts))
+        return self.task_operations[0]
 
 
 class StaticDirectoryChooser:
@@ -341,3 +361,79 @@ async def test_task_routes_project_safe_three_level_history_and_clear_it(
     assert str(tmp_path) not in response.text
     assert clear_response.status_code == 204
     assert managed_archive.cleared_operations == ["operation-1"]
+
+
+@pytest.mark.asyncio
+async def test_task_control_routes_require_origin_and_explicit_cancel_choice(
+    tmp_path: Path,
+) -> None:
+    managed_archive = RecordingManagedArchive()
+    progress = TaskProgressSnapshot(completed_items=0, total_items=1)
+    work = TaskCenterWorkSnapshot(
+        TaskSnapshot("work-1", "running", "downloading", "none", None, progress),
+        VIDEO.aweme_id,
+    )
+    source = TaskCenterSourceSnapshot(
+        TaskSnapshot("source-1", "running", "downloading", "none", None, progress),
+        (work,),
+    )
+    managed_archive.task_operations = (
+        TaskCenterOperationSnapshot(
+            TaskSnapshot(
+                "operation-1",
+                "running",
+                "downloading",
+                "none",
+                None,
+                progress,
+            ),
+            (source,),
+        ),
+    )
+    sessions = SessionManager()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(404))
+    ) as media_client:
+        app = create_app(
+            services=AppServices(
+                parse_service=ParseService(UnusedResolver(), UnusedParser(), ParseStore()),
+                media_client=media_client,
+                managed_archive=managed_archive,
+            ),
+            session_manager=sessions,
+            testing=True,
+        )
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://testserver",
+        ) as client:
+            client.cookies.set("douyin_local_session", sessions.cookie_token)
+            headers = {"origin": "http://testserver"}
+            pause = await client.post("/api/tasks/work-1/pause", headers=headers)
+            resume = await client.post("/api/tasks/work-1/resume", headers=headers)
+            cancel = await client.post(
+                "/api/tasks/work-1/cancel",
+                headers=headers,
+                json={"retain_parts": True},
+            )
+            missing_choice = await client.post(
+                "/api/tasks/work-1/cancel",
+                headers=headers,
+                json={},
+            )
+            cross_origin = await client.post(
+                "/api/tasks/work-1/pause",
+                headers={"origin": "https://example.com"},
+            )
+
+    assert pause.status_code == 200
+    assert pause.json()["task"]["task_id"] == "operation-1"
+    assert resume.status_code == 200
+    assert cancel.status_code == 200
+    assert missing_choice.status_code == 400
+    assert cross_origin.status_code == 403
+    assert managed_archive.paused_tasks == ["work-1"]
+    assert managed_archive.resumed_tasks == ["work-1"]
+    assert managed_archive.cancelled_tasks == [("work-1", True)]
+    assert "douyinvod.com" not in cancel.text
+    assert str(tmp_path) not in cancel.text

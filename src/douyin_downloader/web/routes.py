@@ -43,6 +43,17 @@ class ManagedArchiveModule(Protocol):
 
     def clear_task_operation(self, operation_id: str) -> None: ...
 
+    async def pause_task(self, task_id: str) -> TaskCenterOperationSnapshot: ...
+
+    async def resume_task(self, task_id: str) -> TaskCenterOperationSnapshot: ...
+
+    async def cancel_task(
+        self,
+        task_id: str,
+        *,
+        retain_parts: bool,
+    ) -> TaskCenterOperationSnapshot: ...
+
 
 class DirectoryChooser(Protocol):
     def choose_directory(self) -> Path | None: ...
@@ -184,6 +195,12 @@ class TaskOperationResponse(BaseModel):
 
 class TaskOperationsResponse(BaseModel):
     operations: list[TaskOperationResponse]
+
+
+class CancelTaskRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    retain_parts: bool
 
 
 def content_disposition_filename(filename: str) -> str:
@@ -471,4 +488,46 @@ def build_router() -> APIRouter:
         )
         return Response(status_code=204)
 
+    @router.post(
+        "/api/tasks/{task_id}/pause",
+        response_model=TaskOperationResponse,
+        dependencies=[Depends(require_local_session), Depends(require_same_origin)],
+    )
+    async def pause_task(task_id: str, request: Request) -> TaskOperationResponse:
+        _validate_task_id(task_id)
+        operation = await _managed_archive(request).pause_task(task_id)
+        return TaskOperationResponse.model_validate(operation)
+
+    @router.post(
+        "/api/tasks/{task_id}/resume",
+        response_model=TaskOperationResponse,
+        dependencies=[Depends(require_local_session), Depends(require_same_origin)],
+    )
+    async def resume_task(task_id: str, request: Request) -> TaskOperationResponse:
+        _validate_task_id(task_id)
+        operation = await _managed_archive(request).resume_task(task_id)
+        return TaskOperationResponse.model_validate(operation)
+
+    @router.post(
+        "/api/tasks/{task_id}/cancel",
+        response_model=TaskOperationResponse,
+        dependencies=[Depends(require_local_session), Depends(require_same_origin)],
+    )
+    async def cancel_task(
+        task_id: str,
+        payload: CancelTaskRequest,
+        request: Request,
+    ) -> TaskOperationResponse:
+        _validate_task_id(task_id)
+        operation = await _managed_archive(request).cancel_task(
+            task_id,
+            retain_parts=payload.retain_parts,
+        )
+        return TaskOperationResponse.model_validate(operation)
+
     return router
+
+
+def _validate_task_id(task_id: str) -> None:
+    if not task_id or len(task_id) > 200:
+        raise AppError("INVALID_INPUT", "任务标识无效。", 400)

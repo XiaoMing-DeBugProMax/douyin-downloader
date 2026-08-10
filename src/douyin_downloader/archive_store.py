@@ -154,7 +154,76 @@ class ArchiveStore:
                 ORDER BY rowid
                 """
             ).fetchall()
+        return self._stored_task_operations(operation_rows, source_rows, work_rows)
 
+    def load_task_operation(self, task_id: str) -> StoredTaskOperation | None:
+        if not self._database_path.is_file():
+            return None
+        with self._connection() as connection:
+            owner = connection.execute(
+                """
+                SELECT operation_id
+                FROM archive_operations
+                WHERE operation_id=? AND history_visible=1
+                UNION ALL
+                SELECT operation_id
+                FROM source_tasks
+                WHERE source_task_id=?
+                UNION ALL
+                SELECT s.operation_id
+                FROM work_tasks AS w
+                JOIN source_tasks AS s ON s.source_task_id=w.source_task_id
+                WHERE w.work_task_id=?
+                LIMIT 1
+                """,
+                (task_id, task_id, task_id),
+            ).fetchone()
+            if owner is None:
+                return None
+            operation_id = str(owner[0])
+            operation_rows = connection.execute(
+                """
+                SELECT operation_id, lifecycle, phase, result, error_code,
+                       completed_bytes, total_bytes, speed_bytes_per_second,
+                       eta_seconds
+                FROM archive_operations
+                WHERE operation_id=? AND history_visible=1
+                """,
+                (operation_id,),
+            ).fetchall()
+            source_rows = connection.execute(
+                """
+                SELECT source_task_id, lifecycle, phase, result, error_code,
+                       completed_bytes, total_bytes, speed_bytes_per_second,
+                       eta_seconds, operation_id
+                FROM source_tasks
+                WHERE operation_id=?
+                ORDER BY rowid
+                """,
+                (operation_id,),
+            ).fetchall()
+            work_rows = connection.execute(
+                """
+                SELECT w.work_task_id, w.lifecycle, w.phase, w.result,
+                       w.error_code, w.completed_bytes, w.total_bytes,
+                       w.speed_bytes_per_second, w.eta_seconds,
+                       w.source_task_id, w.aweme_id
+                FROM work_tasks AS w
+                JOIN source_tasks AS s ON s.source_task_id=w.source_task_id
+                WHERE s.operation_id=?
+                ORDER BY w.rowid
+                """,
+                (operation_id,),
+            ).fetchall()
+        operations = self._stored_task_operations(operation_rows, source_rows, work_rows)
+        return operations[0] if operations else None
+
+    @staticmethod
+    def _stored_task_operations(
+        operation_rows: list[tuple[object, ...]],
+        source_rows: list[tuple[object, ...]],
+        work_rows: list[tuple[object, ...]],
+    ) -> tuple[StoredTaskOperation, ...]:
         work_by_source: dict[str, list[StoredWorkTask]] = {}
         for row in work_rows:
             source_id = str(row[9])
@@ -318,6 +387,43 @@ class ArchiveStore:
             connection.execute(
                 "UPDATE work_tasks SET phase=?, completed_bytes=?, total_bytes=?, "
                 "speed_bytes_per_second=?, eta_seconds=? "
+                "WHERE work_task_id=?",
+                (*values, ids.work),
+            )
+
+    def set_task_lifecycle(self, ids: TaskIds, lifecycle: str) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                "UPDATE archive_operations SET lifecycle=? WHERE operation_id=?",
+                (lifecycle, ids.operation),
+            )
+            connection.execute(
+                "UPDATE source_tasks SET lifecycle=? WHERE source_task_id=?",
+                (lifecycle, ids.source),
+            )
+            connection.execute(
+                "UPDATE work_tasks SET lifecycle=? WHERE work_task_id=?",
+                (lifecycle, ids.work),
+            )
+
+    def cancel(self, ids: TaskIds) -> None:
+        with self._connection() as connection:
+            values = ("cancelled", "idle", "cancelled", None)
+            connection.execute(
+                "UPDATE archive_operations SET lifecycle=?, phase=?, result=?, "
+                "error_code=?, speed_bytes_per_second=NULL, eta_seconds=NULL "
+                "WHERE operation_id=?",
+                (*values, ids.operation),
+            )
+            connection.execute(
+                "UPDATE source_tasks SET lifecycle=?, phase=?, result=?, "
+                "error_code=?, speed_bytes_per_second=NULL, eta_seconds=NULL "
+                "WHERE source_task_id=?",
+                (*values, ids.source),
+            )
+            connection.execute(
+                "UPDATE work_tasks SET lifecycle=?, phase=?, result=?, "
+                "error_code=?, speed_bytes_per_second=NULL, eta_seconds=NULL "
                 "WHERE work_task_id=?",
                 (*values, ids.work),
             )

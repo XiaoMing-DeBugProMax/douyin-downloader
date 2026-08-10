@@ -217,6 +217,19 @@
       </section>
     </main>
 
+    <dialog id="task-cancel-dialog" class="task-cancel-dialog" aria-labelledby="task-cancel-title">
+      <form method="dialog">
+        <p class="eyebrow">CANCEL TASK</p>
+        <h2 id="task-cancel-title">取消任务</h2>
+        <p>请选择如何处理尚未完成的临时部分。已校验并登记的归档结果不会被删除。</p>
+        <div class="task-cancel-actions">
+          <button id="task-cancel-retain" class="button button-secondary" type="button">保留未完成部分</button>
+          <button id="task-cancel-delete" class="button button-danger" type="button">删除未完成部分</button>
+          <button class="button button-quiet" type="submit" value="close">返回</button>
+        </div>
+      </form>
+    </dialog>
+
     <script src="/assets/app.js" defer></script>
   </body>
 </html>

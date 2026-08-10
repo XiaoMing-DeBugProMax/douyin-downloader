@@ -43,6 +43,9 @@ const tasksStatus = document.querySelector("#tasks-status");
 const tasksError = document.querySelector("#tasks-error");
 const tasksEmpty = document.querySelector("#tasks-empty");
 const tasksList = document.querySelector("#tasks-list");
+const taskCancelDialog = document.querySelector("#task-cancel-dialog");
+const taskCancelRetain = document.querySelector("#task-cancel-retain");
+const taskCancelDelete = document.querySelector("#task-cancel-delete");
 
 let currentParse = null;
 let isParsing = false;
@@ -52,6 +55,7 @@ let currentDescriptionOutcome = "not_requested";
 let settingsLoaded = false;
 let tasksLoading = false;
 let tasksRefreshTimer = null;
+let pendingCancelTaskId = null;
 
 function storedTheme() {
   try {
@@ -318,10 +322,67 @@ function taskError(error) {
   return node;
 }
 
+async function controlTask(taskId, action, button, retainParts = null) {
+  button.disabled = true;
+  tasksError.textContent = "";
+  const options = { method: "POST" };
+  if (retainParts !== null) {
+    options.headers = { "Content-Type": "application/json" };
+    options.body = JSON.stringify({ retain_parts: retainParts });
+  }
+  try {
+    const response = await fetch(
+      `/api/tasks/${encodeURIComponent(taskId)}/${action}`,
+      options,
+    );
+    if (!response.ok) {
+      tasksError.textContent = await responseErrorMessage(response);
+      return;
+    }
+    await loadTasks(true);
+  } catch (_) {
+    tasksError.textContent = UNKNOWN_ERROR;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function openCancelDialog(taskId) {
+  pendingCancelTaskId = taskId;
+  taskCancelDialog.showModal();
+}
+
+function taskControlActions(task) {
+  const actions = createElement("div", "task-control-actions");
+  if (task.lifecycle === "running") {
+    const pause = createElement("button", "button button-secondary task-pause", "暂停");
+    pause.type = "button";
+    pause.addEventListener("click", () => controlTask(task.task_id, "pause", pause));
+    actions.append(pause);
+  } else if (task.lifecycle === "paused") {
+    const resume = createElement("button", "button button-primary task-resume", "继续");
+    resume.type = "button";
+    resume.addEventListener("click", () => controlTask(task.task_id, "resume", resume));
+    actions.append(resume);
+  }
+  if (task.lifecycle === "running" || task.lifecycle === "paused") {
+    const cancel = createElement("button", "button button-quiet task-cancel", "取消");
+    cancel.type = "button";
+    cancel.addEventListener("click", () => openCancelDialog(task.task_id));
+    actions.append(cancel);
+  }
+  return actions;
+}
+
 function renderWorkTask(work) {
   const node = createElement("article", "task-work");
-  node.append(
+  const heading = createElement("div", "task-work-heading");
+  heading.append(
     createElement("h4", "", `作品 ${work.aweme_id}`),
+    taskControlActions(work.task),
+  );
+  node.append(
+    heading,
     taskStateFields(work.task),
     taskProgress(work.task),
   );
@@ -384,6 +445,8 @@ function renderTaskOperation(operation) {
     clear.type = "button";
     clear.addEventListener("click", () => clearTaskOperation(operation.task.task_id, clear));
     heading.append(clear);
+  } else {
+    heading.append(taskControlActions(operation.task));
   }
   card.append(heading, taskStateFields(operation.task), taskProgress(operation.task));
   if (operation.task.error) card.append(taskError(operation.task.error));
@@ -438,6 +501,24 @@ async function loadTasks(force = false) {
 }
 
 tasksRefresh.addEventListener("click", () => loadTasks(true));
+
+async function confirmTaskCancellation(retainParts, button) {
+  const taskId = pendingCancelTaskId;
+  if (taskId === null) return;
+  pendingCancelTaskId = null;
+  taskCancelDialog.close();
+  await controlTask(taskId, "cancel", button, retainParts);
+}
+
+taskCancelRetain.addEventListener("click", () => {
+  confirmTaskCancellation(true, taskCancelRetain);
+});
+taskCancelDelete.addEventListener("click", () => {
+  confirmTaskCancellation(false, taskCancelDelete);
+});
+taskCancelDialog.addEventListener("close", () => {
+  pendingCancelTaskId = null;
+});
 
 function renderSettings(payload) {
   settingsRoot.value = typeof payload.archive_root === "string" ? payload.archive_root : "";

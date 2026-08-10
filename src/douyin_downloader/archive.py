@@ -47,6 +47,7 @@ from douyin_downloader.settings import (
     NamingTemplate,
     OperationSettingsSnapshot,
 )
+from douyin_downloader.task_control import TaskCancellation
 
 __all__ = [
     "ArchiveItemSnapshot",
@@ -170,12 +171,63 @@ class _AuditedArchive:
     valid_artifacts: dict[str, ArtifactRecord]
 
 
+class _TaskController:
+    def __init__(self, store: ArchiveStore, ids: TaskIds) -> None:
+        self._store = store
+        self._ids = ids
+        self._pause_requested = False
+        self._continue = asyncio.Event()
+        self._continue.set()
+        self._paused = asyncio.Event()
+        self._resumed = asyncio.Event()
+        self._cancel_requested: bool | None = None
+        self._stopped = asyncio.Event()
+
+    async def pause(self) -> None:
+        if not self._pause_requested:
+            self._pause_requested = True
+            self._continue.clear()
+        await self._paused.wait()
+
+    async def resume(self) -> None:
+        if not self._pause_requested:
+            return
+        self._resumed.clear()
+        self._pause_requested = False
+        self._continue.set()
+        await self._resumed.wait()
+
+    async def cancel(self, *, retain_parts: bool) -> None:
+        if self._cancel_requested is None:
+            self._cancel_requested = retain_parts
+        self._continue.set()
+        await self._stopped.wait()
+
+    def mark_stopped(self) -> None:
+        self._stopped.set()
+
+    async def checkpoint(self) -> None:
+        if self._cancel_requested is not None:
+            raise TaskCancellation(retain_parts=self._cancel_requested)
+        if not self._pause_requested:
+            return
+        await asyncio.to_thread(self._store.set_task_lifecycle, self._ids, "paused")
+        self._paused.set()
+        await self._continue.wait()
+        self._paused.clear()
+        if self._cancel_requested is not None:
+            raise TaskCancellation(retain_parts=self._cancel_requested)
+        await asyncio.to_thread(self._store.set_task_lifecycle, self._ids, "running")
+        self._resumed.set()
+
+
 class _TaskProgressRecorder:
     def __init__(
         self,
         store: ArchiveStore,
         ids: TaskIds,
         remote_artifact_count: int,
+        controller: _TaskController,
     ) -> None:
         self._store = store
         self._ids = ids
@@ -188,6 +240,7 @@ class _TaskProgressRecorder:
         self._sample_count = 0
         self._speed_bytes_per_second: float | None = None
         self._eta_seconds: int | None = None
+        self._controller = controller
 
     async def set_phase(self, phase: str) -> None:
         self._phase = phase
@@ -195,6 +248,7 @@ class _TaskProgressRecorder:
             self._speed_bytes_per_second = None
             self._eta_seconds = None
         await self._persist()
+        await self._controller.checkpoint()
 
     async def remote_started(self, expected_size: int | None) -> None:
         self._remaining_remote_artifacts -= 1
@@ -203,6 +257,7 @@ class _TaskProgressRecorder:
         else:
             self._known_total += expected_size
         await self._persist()
+        await self._controller.checkpoint()
 
     async def advance_bytes(self, count: int) -> None:
         self._completed_bytes += count
@@ -223,6 +278,7 @@ class _TaskProgressRecorder:
                 else None
             )
         await self._persist()
+        await self._controller.checkpoint()
 
     async def _persist(self) -> None:
         total_bytes = self._reliable_total()
@@ -277,6 +333,7 @@ class ManagedArchive:
             threading.Lock,
         ] = weakref.WeakValueDictionary()
         self._integrity_locks_guard = threading.Lock()
+        self._task_controls: dict[str, _TaskController] = {}
 
     async def archive_single(
         self,
@@ -358,15 +415,20 @@ class ManagedArchive:
         prepared: PreparedArchive | None = None
         promotion_started = False
         operation_result = "success"
+        controller: _TaskController | None = None
         try:
             self._store.create_running(ids, aweme_id, settings)
+            controller = _TaskController(self._store, ids)
+            self._register_task_control(ids, controller)
             progress = _TaskProgressRecorder(
                 self._store,
                 ids,
                 int("video" not in valid_artifacts)
                 + int("cover" not in valid_artifacts),
+                controller,
             )
             resolved = await self._work_access.fetch_work(aweme_id)
+            await controller.checkpoint()
             if resolved.snapshot.aweme_id != aweme_id:
                 raise AppError(
                     "UPSTREAM_BLOCKED",
@@ -413,6 +475,12 @@ class ManagedArchive:
                 for part_path, final_path in prepared.promotions:
                     self._file_promoter.promote(part_path, final_path)
                 self._store.finish_promotion(ids, aweme_id, operation_result)
+        except TaskCancellation as cancellation:
+            if not promotion_started:
+                if prepared is not None and not cancellation.retain_parts:
+                    prepared.discard_parts()
+                self._store.cancel(ids)
+            raise AppError("TASK_CANCELLED", "归档任务已取消。", 409) from cancellation
         except Exception as error:
             if not promotion_started:
                 try:
@@ -421,6 +489,10 @@ class ManagedArchive:
                 finally:
                     self._store.fail(ids, _task_error_code(error))
             raise
+        finally:
+            if controller is not None:
+                controller.mark_stopped()
+                self._unregister_task_control(ids)
 
         return _archive_snapshot(
             ids,
@@ -457,6 +529,35 @@ class ManagedArchive:
             _task_center_snapshot(operation)
             for operation in self._store.list_task_operations()
         )
+
+    async def pause_task(self, task_id: str) -> TaskCenterOperationSnapshot:
+        controller = self._task_controls.get(task_id)
+        if controller is None:
+            raise AppError("TASK_CONTROL_UNAVAILABLE", "该任务当前不能暂停。", 409)
+        await controller.pause()
+        return self._task_operation_for(task_id)
+
+    async def resume_task(self, task_id: str) -> TaskCenterOperationSnapshot:
+        controller = self._task_controls.get(task_id)
+        if controller is None:
+            raise AppError("TASK_CONTROL_UNAVAILABLE", "该任务当前不能继续。", 409)
+        await controller.resume()
+        return self._task_operation_for(task_id)
+
+    async def cancel_task(
+        self,
+        task_id: str,
+        *,
+        retain_parts: bool,
+    ) -> TaskCenterOperationSnapshot:
+        controller = self._task_controls.get(task_id)
+        if controller is None:
+            operation = self._task_operation_for(task_id)
+            if operation.task.lifecycle == "cancelled":
+                return operation
+            raise AppError("TASK_CONTROL_UNAVAILABLE", "该任务当前不能取消。", 409)
+        await controller.cancel(retain_parts=retain_parts)
+        return self._task_operation_for(task_id)
 
     def clear_task_operation(self, operation_id: str) -> None:
         outcome = self._store.clear_task_operation(operation_id)
@@ -496,6 +597,24 @@ class ManagedArchive:
                 self._folder_opener.open_folder(output_directory)
         except OSError as error:
             raise AppError("ARCHIVE_OPEN_FAILED", "无法打开归档文件夹。", 500) from error
+
+    def _register_task_control(
+        self,
+        ids: TaskIds,
+        controller: _TaskController,
+    ) -> None:
+        for task_id in (ids.operation, ids.source, ids.work):
+            self._task_controls[task_id] = controller
+
+    def _unregister_task_control(self, ids: TaskIds) -> None:
+        for task_id in (ids.operation, ids.source, ids.work):
+            self._task_controls.pop(task_id, None)
+
+    def _task_operation_for(self, task_id: str) -> TaskCenterOperationSnapshot:
+        operation = self._store.load_task_operation(task_id)
+        if operation is None:
+            raise AppError("TASK_NOT_FOUND", "没有找到该任务记录。", 404)
+        return _task_center_snapshot(operation)
 
     def _audit_archive(self, aweme_id: str) -> _AuditedArchive | None:
         with self._integrity_lock(aweme_id):

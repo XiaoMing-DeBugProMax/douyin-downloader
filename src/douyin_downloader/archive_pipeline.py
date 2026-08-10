@@ -21,6 +21,7 @@ from douyin_downloader.async_tools import run_in_thread_cancellation_safe
 from douyin_downloader.audio_artifacts import AudioArtifactError, AudioArtifactTool
 from douyin_downloader.domain import AppError, ResolvedWork
 from douyin_downloader.settings import ArchiveProfile
+from douyin_downloader.task_control import TaskCancellation
 
 _AUDIO_FAILURE_STATUSES = frozenset(
     {"probe_failed", "extract_failed", "validation_failed"}
@@ -267,8 +268,9 @@ class ArchiveArtifactPipeline:
                     else "success"
                 ),
             )
-        except Exception:
-            _discard_paths(part_paths)
+        except Exception as error:
+            if not isinstance(error, TaskCancellation) or not error.retain_parts:
+                _discard_paths(part_paths)
             raise
 
     def audit(

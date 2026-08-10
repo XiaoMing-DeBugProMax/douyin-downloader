@@ -607,6 +607,100 @@ def test_task_center_shows_three_levels_errors_progress_and_terminal_cleanup(
     expect(cards.filter(has_text="active-operation")).to_have_count(1)
 
 
+def test_task_controls_pause_resume_and_confirm_part_retention(
+    page: Page,
+    local_app_url: str,
+) -> None:
+    def task(task_id: str) -> dict[str, object]:
+        return {
+            "task_id": task_id,
+            "lifecycle": "running",
+            "phase": "downloading",
+            "result": "none",
+            "progress": {
+                "completed_items": 0,
+                "total_items": 1,
+                "completed_bytes": 512,
+                "total_bytes": 1024,
+                "percentage": 50.0,
+                "speed_bytes_per_second": 256.0,
+                "eta_seconds": 2,
+            },
+            "error": None,
+        }
+
+    operation = {
+        "task": task("operation-1"),
+        "source_tasks": [
+            {
+                "task": task("source-1"),
+                "work_tasks": [
+                    {"aweme_id": "7429378937383308594", "task": task("work-1")}
+                ],
+            }
+        ],
+    }
+    control_requests: list[tuple[str, object | None]] = []
+
+    def set_lifecycle(lifecycle: str) -> None:
+        tasks = [
+            operation["task"],
+            operation["source_tasks"][0]["task"],
+            operation["source_tasks"][0]["work_tasks"][0]["task"],
+        ]
+        for current in tasks:
+            current["lifecycle"] = lifecycle
+            if lifecycle == "cancelled":
+                current["phase"] = "idle"
+                current["result"] = "cancelled"
+
+    def handle_tasks(route: Route) -> None:
+        request = route.request
+        if request.method == "GET":
+            route.fulfill(status=200, json={"operations": [operation]})
+            return
+        action = request.url.rsplit("/", 1)[-1]
+        payload = request.post_data_json if action == "cancel" else None
+        control_requests.append((request.url, payload))
+        set_lifecycle({"pause": "paused", "resume": "running", "cancel": "cancelled"}[action])
+        route.fulfill(status=200, json=operation)
+
+    page.route("**/api/tasks**", handle_tasks)
+    page.goto(local_app_url)
+    page.get_by_role("tab", name="任务中心", exact=True).click()
+
+    card = page.locator(".task-operation")
+    card.get_by_role("button", name="暂停").click()
+    expect(card.locator(":scope > .task-state-fields")).to_contain_text("已暂停")
+    assert control_requests[-1][0].endswith("/api/tasks/operation-1/pause")
+
+    request_count = len(control_requests)
+    page.get_by_role("tab", name="本地档案库", exact=True).click()
+    page.get_by_role("tab", name="任务中心", exact=True).click()
+    expect(card.locator(":scope > .task-state-fields")).to_contain_text("已暂停")
+    assert len(control_requests) == request_count
+
+    card.locator(".task-work-details summary").click()
+    card.locator(".task-work").get_by_role("button", name="继续").click()
+    expect(card.locator(":scope > .task-state-fields")).to_contain_text("活动")
+    assert control_requests[-1][0].endswith("/api/tasks/work-1/resume")
+
+    card.get_by_role("button", name="取消").first.click()
+    dialog = page.get_by_role("dialog", name="取消任务")
+    expect(dialog).to_be_visible()
+    expect(dialog.get_by_role("button", name="保留未完成部分")).to_be_visible()
+    expect(dialog.get_by_role("button", name="删除未完成部分")).to_be_visible()
+    dialog.get_by_role("button", name="保留未完成部分").click()
+
+    expect(card.locator(":scope > .task-state-fields")).to_contain_text("已取消")
+    assert control_requests[-1][0].endswith("/api/tasks/operation-1/cancel")
+    assert control_requests[-1][1] == {"retain_parts": True}
+    expect(card.get_by_role("button", name="清理记录")).to_be_visible()
+    expect(card.get_by_role("button", name="暂停")).to_have_count(0)
+    expect(card.get_by_role("button", name="继续")).to_have_count(0)
+    expect(card.get_by_role("button", name="取消")).to_have_count(0)
+
+
 def test_light_theme_small_text_meets_wcag_aa(page: Page, local_app_url: str) -> None:
     page.goto(local_app_url)
     for selector, background, pseudo in (

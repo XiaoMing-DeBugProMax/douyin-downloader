@@ -412,11 +412,66 @@ a {
   gap: 16px;
 }
 
+.task-control-actions,
+.task-cancel-actions,
+.task-work-heading {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.task-control-actions {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.task-control-actions .button {
+  min-height: 38px;
+  padding: 8px 14px;
+}
+
 .task-heading h1,
 .task-operation h2,
 .task-source h3,
 .task-work h4 {
   margin: 0;
+}
+
+.task-work-heading {
+  align-items: flex-start;
+  justify-content: space-between;
+}
+
+.task-cancel-dialog {
+  width: min(520px, calc(100% - 32px));
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  background: var(--panel);
+  color: var(--text);
+  box-shadow: var(--shadow);
+}
+
+.task-cancel-dialog::backdrop {
+  background: rgb(15 23 42 / 56%);
+}
+
+.task-cancel-dialog form {
+  padding: 24px;
+}
+
+.task-cancel-dialog h2 {
+  margin: 0;
+}
+
+.task-cancel-dialog form > p:not(.eyebrow) {
+  margin: 12px 0 0;
+  color: var(--muted-readable);
+}
+
+.task-cancel-actions {
+  flex-wrap: wrap;
+  margin-top: 22px;
 }
 
 .task-heading > div > p:last-child {
@@ -569,7 +624,8 @@ a {
 
 @media (max-width: 560px) {
   .task-heading,
-  .task-operation-heading {
+  .task-operation-heading,
+  .task-work-heading {
     align-items: stretch;
     flex-direction: column;
   }
@@ -800,6 +856,12 @@ textarea:focus {
   border: 1px solid var(--line);
   background: var(--panel-soft);
   color: var(--text);
+}
+
+.button-danger {
+  border: 1px solid var(--error);
+  background: transparent;
+  color: var(--error);
 }
 
 .button-quiet {
