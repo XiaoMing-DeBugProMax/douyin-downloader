@@ -287,7 +287,8 @@ function taskStateFields(task) {
   return fields;
 }
 
-function taskProgress(progress) {
+function taskProgress(task) {
+  const progress = task.progress;
   const node = createElement("p", "task-progress");
   const parts = [
     `${progress.completed_items} / ${progress.total_items} 个作品`,
@@ -296,10 +297,13 @@ function taskProgress(progress) {
       : `${formatBytes(progress.completed_bytes)} / ${formatBytes(progress.total_bytes)}`,
   ];
   if (progress.percentage !== null) parts.push(`${progress.percentage}%`);
-  if (progress.speed_bytes_per_second !== null) {
+  const estimatesAreCurrent = task.lifecycle === "running" && task.phase === "downloading";
+  if (estimatesAreCurrent && progress.speed_bytes_per_second !== null) {
     parts.push(`${formatBytes(progress.speed_bytes_per_second)}/s`);
   }
-  if (progress.eta_seconds !== null) parts.push(`ETA ${progress.eta_seconds} 秒`);
+  if (estimatesAreCurrent && progress.eta_seconds !== null) {
+    parts.push(`ETA ${progress.eta_seconds} 秒`);
+  }
   node.textContent = parts.join(" · ");
   return node;
 }
@@ -319,7 +323,7 @@ function renderWorkTask(work) {
   node.append(
     createElement("h4", "", `作品 ${work.aweme_id}`),
     taskStateFields(work.task),
-    taskProgress(work.task.progress),
+    taskProgress(work.task),
   );
   if (work.task.error) node.append(taskError(work.task.error));
   return node;
@@ -330,7 +334,7 @@ function renderSourceTask(source, index) {
   node.append(
     createElement("h3", "", `来源任务 ${index + 1}`),
     taskStateFields(source.task),
-    taskProgress(source.task.progress),
+    taskProgress(source.task),
   );
   if (source.task.error) node.append(taskError(source.task.error));
   const details = createElement("details", "task-work-details");
@@ -381,7 +385,7 @@ function renderTaskOperation(operation) {
     clear.addEventListener("click", () => clearTaskOperation(operation.task.task_id, clear));
     heading.append(clear);
   }
-  card.append(heading, taskStateFields(operation.task), taskProgress(operation.task.progress));
+  card.append(heading, taskStateFields(operation.task), taskProgress(operation.task));
   if (operation.task.error) card.append(taskError(operation.task.error));
   const sources = createElement("div", "task-source-list");
   operation.source_tasks.forEach((source, index) => {

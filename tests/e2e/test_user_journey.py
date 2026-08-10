@@ -532,6 +532,25 @@ def test_task_center_shows_three_levels_errors_progress_and_terminal_cleanup(
             },
             "source_tasks": [],
         },
+        {
+            "task": {
+                "task_id": "active-operation",
+                "lifecycle": "running",
+                "phase": "downloading",
+                "result": "none",
+                "progress": {
+                    "completed_items": 0,
+                    "total_items": 1,
+                    "completed_bytes": 1024,
+                    "total_bytes": 2048,
+                    "percentage": 50.0,
+                    "speed_bytes_per_second": 256.0,
+                    "eta_seconds": 4,
+                },
+                "error": None,
+            },
+            "source_tasks": [],
+        },
     ]
 
     def handle_tasks(route: Route) -> None:
@@ -551,7 +570,7 @@ def test_task_center_shows_three_levels_errors_progress_and_terminal_cleanup(
     page.get_by_role("tab", name="任务中心", exact=True).click()
 
     cards = page.locator(".task-operation")
-    expect(cards).to_have_count(2)
+    expect(cards).to_have_count(3)
     failed = cards.filter(has_text="failed-operation")
     operation_state = failed.locator(".task-state-fields").first
     operation_progress = failed.locator(".task-progress").first
@@ -575,11 +594,17 @@ def test_task_center_shows_three_levels_errors_progress_and_terminal_cleanup(
 
     successful = cards.filter(has_text="successful-operation")
     expect(successful.locator(".task-progress")).to_contain_text("100%")
-    expect(successful.locator(".task-progress")).to_contain_text("256 B/s")
-    expect(successful.locator(".task-progress")).to_contain_text("ETA 0 秒")
+    expect(successful.locator(".task-progress")).not_to_contain_text("B/s")
+    expect(successful.locator(".task-progress")).not_to_contain_text("ETA")
+    active = cards.filter(has_text="active-operation")
+    expect(active.locator(".task-progress")).to_contain_text("50%")
+    expect(active.locator(".task-progress")).to_contain_text("256 B/s")
+    expect(active.locator(".task-progress")).to_contain_text("ETA 4 秒")
+    expect(active.locator(".task-clear")).to_have_count(0)
     successful.locator(".task-clear").click()
-    expect(cards).to_have_count(1)
-    expect(cards).to_contain_text("failed-operation")
+    expect(cards).to_have_count(2)
+    expect(cards.filter(has_text="failed-operation")).to_have_count(1)
+    expect(cards.filter(has_text="active-operation")).to_have_count(1)
 
 
 def test_light_theme_small_text_meets_wcag_aa(page: Page, local_app_url: str) -> None:
