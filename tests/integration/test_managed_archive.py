@@ -7,6 +7,7 @@ import sqlite3
 import struct
 import threading
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -159,7 +160,6 @@ class StaticMediaAccess:
             expected_size=len(self.payload),
             chunks=chunks(),
         )
-
     async def open_cover(self, cdn_mirror_urls: tuple[str, ...]) -> RemoteArtifact:
         self.cover_requests.append(cdn_mirror_urls)
 
@@ -170,6 +170,15 @@ class StaticMediaAccess:
             content_type="image/png",
             expected_size=len(self.cover_payload),
             chunks=chunks(),
+        )
+
+
+class EmptyDescriptionWorkAccess(StaticWorkAccess):
+    async def fetch_work(self, aweme_id: str) -> ResolvedWork:
+        resolved = await super().fetch_work(aweme_id)
+        return replace(
+            resolved,
+            snapshot=replace(resolved.snapshot, description=""),
         )
 
 
@@ -1266,6 +1275,44 @@ async def test_restart_preserves_optional_audio_failure_result(tmp_path: Path) -
             "SELECT result FROM archive_operations"
         ).fetchone()
     assert operation_result == ("partial_success",)
+    assert list(root.rglob("*.part")) == []
+
+
+@pytest.mark.asyncio
+async def test_restart_recovers_an_empty_description_artifact(tmp_path: Path) -> None:
+    root = tmp_path / "library"
+    root.mkdir()
+    database = tmp_path / "archive.db"
+    interrupted = ManagedArchive(
+        database_path=database,
+        work_access=EmptyDescriptionWorkAccess(),
+        media_access=StaticMediaAccess(valid_mp4()),
+        file_promoter=CrashAfterPromotingFile(),
+    )
+
+    with pytest.raises(SimulatedProcessCrash):
+        await interrupted.archive_single(
+            SingleArchiveRequest(
+                "7429378937383308594",
+                root,
+                profile=ArchiveProfile(include_description=True),
+            )
+        )
+
+    restarted = ManagedArchive(
+        database_path=database,
+        work_access=UnexpectedWorkAccess(),
+        media_access=UnexpectedMediaAccess(),
+    )
+    recovered = restarted.get_work_archive("7429378937383308594")
+
+    assert recovered is not None
+    assert recovered.status == "archived"
+    assert recovered.description_outcome == "ready"
+    work_directory = root / recovered.relative_directory
+    description_files = list(work_directory.glob("*.txt"))
+    assert len(description_files) == 1
+    assert description_files[0].read_bytes() == b""
     assert list(root.rglob("*.part")) == []
 
 

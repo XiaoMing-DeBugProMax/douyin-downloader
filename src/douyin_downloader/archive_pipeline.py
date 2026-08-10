@@ -497,7 +497,13 @@ def _inspect_local_artifact(
         mime_type = "text/plain; charset=utf-8"
     else:
         raise archive_failed()
-    digest = artifact_digest(kind, path, relative_path, mime_type)
+    digest = artifact_digest(
+        kind,
+        path,
+        relative_path,
+        mime_type,
+        allow_empty=kind == "description",
+    )
     if registration is not None and (
         digest.size_bytes != registration.size_bytes
         or digest.mime_type != registration.mime_type
@@ -548,6 +554,7 @@ def _validate_registered_artifact(
         path,
         registration.relative_path,
         registration.mime_type,
+        allow_empty=registration.kind == "description",
     )
     if (
         digest.size_bytes != registration.size_bytes

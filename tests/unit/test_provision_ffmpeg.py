@@ -135,7 +135,10 @@ def test_cached_distribution_rejects_files_outside_the_pinned_manifest(
         },
     }
 
+    calls: list[tuple[str, ...]] = []
+
     def identify(argv: tuple[str, ...]) -> CompletedProcess[str]:
+        calls.append(argv)
         output = (
             "ffmpeg version n8.1.2-34-g9b6c8969e0\n"
             if argv[-1] == "-version"
@@ -153,3 +156,4 @@ def test_cached_distribution_rejects_files_outside_the_pinned_manifest(
 
     with pytest.raises(ProvisionError, match="pinned manifest"):
         provision_from_archive(archive, output, manifest, runner=identify)
+    assert len(calls) == 4
