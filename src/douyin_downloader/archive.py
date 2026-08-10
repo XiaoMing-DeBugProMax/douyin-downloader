@@ -191,6 +191,9 @@ class _TaskProgressRecorder:
 
     async def set_phase(self, phase: str) -> None:
         self._phase = phase
+        if phase != "downloading":
+            self._speed_bytes_per_second = None
+            self._eta_seconds = None
         await self._persist()
 
     async def remote_started(self, expected_size: int | None) -> None:
@@ -257,6 +260,7 @@ class ManagedArchive:
         file_promoter: FilePromoter | None = None,
     ) -> None:
         self._store = ArchiveStore(database_path)
+        self._store.interrupt_running_tasks()
         self._work_access = work_access
         self._artifact_pipeline = ArchiveArtifactPipeline(
             media_access,
@@ -616,11 +620,7 @@ def _task_center_snapshot(
                 percentage=(
                     round(stored.completed_bytes / stored.total_bytes * 100, 1)
                     if stored.total_bytes is not None and stored.total_bytes > 0
-                    else (
-                        100.0
-                        if total_items > 0 and completed_items == total_items
-                        else None
-                    )
+                    else None
                 ),
             ),
         )
@@ -679,6 +679,21 @@ _TASK_ERRORS = {
         "ARCHIVE_FAILED",
         "归档成果未能通过完整性检查。",
         "请检查磁盘空间和归档位置后重试。",
+    ),
+    "UNSUPPORTED_CONTENT": TaskErrorSnapshot(
+        "UNSUPPORTED_CONTENT",
+        "当前作品类型暂不支持归档。",
+        "请选择公开的单视频作品后重试。",
+    ),
+    "DOWNLOAD_FAILED": TaskErrorSnapshot(
+        "DOWNLOAD_FAILED",
+        "媒体下载失败。",
+        "请重新解析或稍后重试此归档操作。",
+    ),
+    "ARCHIVE_PATH_INVALID": TaskErrorSnapshot(
+        "ARCHIVE_PATH_INVALID",
+        "归档路径无效或已改变。",
+        "请检查归档位置后重试。",
     ),
 }
 

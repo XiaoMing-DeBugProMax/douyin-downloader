@@ -83,8 +83,8 @@ _TASK_CENTER_MIGRATIONS = (
 )
 
 
-def ensure_issue5_schema(database_path: Path) -> None:
-    """Back up an existing database, then apply all Issue #5 changes atomically."""
+def ensure_archive_schema(database_path: Path) -> None:
+    """Back up an existing database, then apply archive migrations atomically."""
 
     database_path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(database_path)

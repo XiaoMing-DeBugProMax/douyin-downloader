@@ -10,7 +10,7 @@ from pathlib import Path
 from string import Formatter
 
 from douyin_downloader.archive_paths import is_reparse_point
-from douyin_downloader.database import ensure_issue5_schema
+from douyin_downloader.database import ensure_archive_schema
 from douyin_downloader.domain import AppError, ResolvedWork
 
 _DEFAULT_NAMING_TEMPLATE = "{aweme_id}"
@@ -179,7 +179,7 @@ class SettingsModule:
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
-        ensure_issue5_schema(self._database_path)
+        ensure_archive_schema(self._database_path)
         connection = sqlite3.connect(self._database_path)
         try:
             with connection:

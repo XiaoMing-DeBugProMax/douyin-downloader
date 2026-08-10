@@ -414,6 +414,7 @@ a {
 
 .task-heading h1,
 .task-operation h2,
+.task-source h3,
 .task-work h4 {
   margin: 0;
 }
@@ -524,14 +525,22 @@ a {
 }
 
 .task-source {
-  padding: 0 14px 14px;
+  padding: 14px;
   border: 1px solid var(--line);
   border-radius: 14px;
   background: var(--panel-soft);
 }
 
-.task-source summary {
-  padding: 14px 0;
+.task-source h3 {
+  font-size: 16px;
+}
+
+.task-work-details {
+  margin-top: 14px;
+}
+
+.task-work-details summary {
+  padding: 8px 0 0;
   cursor: pointer;
   font-weight: 750;
 }

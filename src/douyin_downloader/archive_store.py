@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import cast
 
 from douyin_downloader.archive_artifacts import ArtifactKind, ArtifactRecord
-from douyin_downloader.database import ensure_issue5_schema
+from douyin_downloader.database import ensure_archive_schema
 from douyin_downloader.settings import (
     ArchiveProfile,
     NamingTemplate,
@@ -138,19 +138,18 @@ class ArchiveStore:
             ).fetchall()
             source_rows = connection.execute(
                 """
-                SELECT source_task_id, operation_id, lifecycle, phase, result,
-                       error_code, completed_bytes, total_bytes,
-                       speed_bytes_per_second, eta_seconds
+                SELECT source_task_id, lifecycle, phase, result, error_code,
+                       completed_bytes, total_bytes, speed_bytes_per_second,
+                       eta_seconds, operation_id
                 FROM source_tasks
                 ORDER BY rowid
                 """
             ).fetchall()
             work_rows = connection.execute(
                 """
-                SELECT work_task_id, source_task_id, aweme_id,
-                       lifecycle, phase, result, error_code,
+                SELECT work_task_id, lifecycle, phase, result, error_code,
                        completed_bytes, total_bytes, speed_bytes_per_second,
-                       eta_seconds
+                       eta_seconds, source_task_id, aweme_id
                 FROM work_tasks
                 ORDER BY rowid
                 """
@@ -158,64 +157,28 @@ class ArchiveStore:
 
         work_by_source: dict[str, list[StoredWorkTask]] = {}
         for row in work_rows:
-            source_id = str(row[1])
+            source_id = str(row[9])
             work_by_source.setdefault(source_id, []).append(
                 StoredWorkTask(
-                    task=StoredTask(
-                        task_id=str(row[0]),
-                        lifecycle=str(row[3]),
-                        phase=str(row[4]),
-                        result=str(row[5]),
-                        error_code=str(row[6]) if row[6] is not None else None,
-                        completed_bytes=int(row[7]),
-                        total_bytes=int(row[8]) if row[8] is not None else None,
-                        speed_bytes_per_second=(
-                            float(row[9]) if row[9] is not None else None
-                        ),
-                        eta_seconds=int(row[10]) if row[10] is not None else None,
-                    ),
-                    aweme_id=str(row[2]),
+                    task=_stored_task(row),
+                    aweme_id=str(row[10]),
                 )
             )
 
         sources_by_operation: dict[str, list[StoredSourceTask]] = {}
         for row in source_rows:
             source_id = str(row[0])
-            operation_id = str(row[1])
+            operation_id = str(row[9])
             sources_by_operation.setdefault(operation_id, []).append(
                 StoredSourceTask(
-                    task=StoredTask(
-                        task_id=source_id,
-                        lifecycle=str(row[2]),
-                        phase=str(row[3]),
-                        result=str(row[4]),
-                        error_code=str(row[5]) if row[5] is not None else None,
-                        completed_bytes=int(row[6]),
-                        total_bytes=int(row[7]) if row[7] is not None else None,
-                        speed_bytes_per_second=(
-                            float(row[8]) if row[8] is not None else None
-                        ),
-                        eta_seconds=int(row[9]) if row[9] is not None else None,
-                    ),
+                    task=_stored_task(row),
                     work_tasks=tuple(work_by_source.get(source_id, ())),
                 )
             )
 
         return tuple(
             StoredTaskOperation(
-                task=StoredTask(
-                    task_id=str(row[0]),
-                    lifecycle=str(row[1]),
-                    phase=str(row[2]),
-                    result=str(row[3]),
-                    error_code=str(row[4]) if row[4] is not None else None,
-                    completed_bytes=int(row[5]),
-                    total_bytes=int(row[6]) if row[6] is not None else None,
-                    speed_bytes_per_second=(
-                        float(row[7]) if row[7] is not None else None
-                    ),
-                    eta_seconds=int(row[8]) if row[8] is not None else None,
-                ),
+                task=_stored_task(row),
                 source_tasks=tuple(sources_by_operation.get(str(row[0]), ())),
             )
             for row in operation_rows
@@ -300,6 +263,27 @@ class ArchiveStore:
                 (operation_id,),
             )
         return "cleared"
+
+    def interrupt_running_tasks(self) -> None:
+        if not self._database_path.is_file():
+            return
+        with self._connection() as connection:
+            connection.executescript(
+                """
+                UPDATE archive_operations
+                SET lifecycle='interrupted', phase='idle',
+                    speed_bytes_per_second=NULL, eta_seconds=NULL
+                WHERE lifecycle='running';
+                UPDATE source_tasks
+                SET lifecycle='interrupted', phase='idle',
+                    speed_bytes_per_second=NULL, eta_seconds=NULL
+                WHERE lifecycle='running';
+                UPDATE work_tasks
+                SET lifecycle='interrupted', phase='idle',
+                    speed_bytes_per_second=NULL, eta_seconds=NULL
+                WHERE lifecycle='running';
+                """
+            )
 
     def update_progress(
         self,
@@ -460,7 +444,7 @@ class ArchiveStore:
             )
 
     def _connect(self) -> sqlite3.Connection:
-        ensure_issue5_schema(self._database_path)
+        ensure_archive_schema(self._database_path)
         connection = sqlite3.connect(self._database_path)
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute(
@@ -570,6 +554,20 @@ class ArchiveStore:
             connection.close()
 
 
+def _stored_task(row: tuple[object, ...]) -> StoredTask:
+    return StoredTask(
+        task_id=str(row[0]),
+        lifecycle=str(row[1]),
+        phase=str(row[2]),
+        result=str(row[3]),
+        error_code=str(row[4]) if row[4] is not None else None,
+        completed_bytes=int(str(row[5])),
+        total_bytes=int(str(row[6])) if row[6] is not None else None,
+        speed_bytes_per_second=float(str(row[7])) if row[7] is not None else None,
+        eta_seconds=int(str(row[8])) if row[8] is not None else None,
+    )
+
+
 def _set_task_results(
     connection: sqlite3.Connection,
     ids: TaskIds,
@@ -578,17 +576,20 @@ def _set_task_results(
 ) -> None:
     values = ("finished", "idle", result)
     connection.execute(
-        "UPDATE archive_operations SET lifecycle=?, phase=?, result=?, error_code=? "
+        "UPDATE archive_operations SET lifecycle=?, phase=?, result=?, error_code=?, "
+        "speed_bytes_per_second=NULL, eta_seconds=NULL "
         "WHERE operation_id=?",
         (*values, error_code, ids.operation),
     )
     connection.execute(
-        "UPDATE source_tasks SET lifecycle=?, phase=?, result=?, error_code=? "
+        "UPDATE source_tasks SET lifecycle=?, phase=?, result=?, error_code=?, "
+        "speed_bytes_per_second=NULL, eta_seconds=NULL "
         "WHERE source_task_id=?",
         (*values, error_code, ids.source),
     )
     connection.execute(
-        "UPDATE work_tasks SET lifecycle=?, phase=?, result=?, error_code=? "
+        "UPDATE work_tasks SET lifecycle=?, phase=?, result=?, error_code=?, "
+        "speed_bytes_per_second=NULL, eta_seconds=NULL "
         "WHERE work_task_id=?",
         (*values, error_code, ids.work),
     )

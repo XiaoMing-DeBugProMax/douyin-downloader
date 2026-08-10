@@ -18,6 +18,11 @@ class FailingWorkAccess:
         raise AppError("UPSTREAM_BLOCKED", "解析服务暂时不可用，请稍后重试。", 502)
 
 
+class UnsupportedWorkAccess:
+    async def fetch_work(self, aweme_id: str) -> None:
+        raise AppError("UNSUPPORTED_CONTENT", "private upstream details", 422)
+
+
 class UnexpectedMediaAccess:
     async def open_video(self, cdn_mirror_urls: tuple[str, ...]) -> None:
         raise AssertionError(cdn_mirror_urls)
@@ -159,6 +164,30 @@ async def test_failed_task_exposes_only_stable_actionable_error_details(
     assert error.code == "UPSTREAM_BLOCKED"
     assert error.message == "解析服务暂时不可用。"
     assert error.suggestion == "请稍后重试此归档操作。"
+    assert operation.task.progress.percentage is None
+
+
+@pytest.mark.asyncio
+async def test_known_failure_keeps_its_safe_specific_error_code(tmp_path: Path) -> None:
+    root = tmp_path / "library"
+    root.mkdir()
+    archive = ManagedArchive(
+        database_path=tmp_path / "archive.db",
+        work_access=UnsupportedWorkAccess(),  # type: ignore[arg-type]
+        media_access=UnexpectedMediaAccess(),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(AppError):
+        await archive.archive_single(
+            SingleArchiveRequest("7429378937383308594", root)
+        )
+
+    error = archive.list_task_operations()[0].task.error
+    assert error is not None
+    assert error.code == "UNSUPPORTED_CONTENT"
+    assert error.message == "当前作品类型暂不支持归档。"
+    assert error.suggestion == "请选择公开的单视频作品后重试。"
+    assert "private" not in f"{error.message} {error.suggestion}"
 
 
 @pytest.mark.asyncio
@@ -228,7 +257,6 @@ async def test_running_download_persists_bytes_without_inventing_a_total(
         media.release.set()
         await running
 
-
 @pytest.mark.asyncio
 async def test_reliable_download_sample_exposes_total_percentage_speed_and_eta(
     tmp_path: Path,
@@ -261,6 +289,10 @@ async def test_reliable_download_sample_exposes_total_percentage_speed_and_eta(
     finally:
         media.release.set()
         await running
+
+    finished_progress = archive.list_task_operations()[0].task.progress
+    assert finished_progress.speed_bytes_per_second is None
+    assert finished_progress.eta_seconds is None
 
 
 @pytest.mark.asyncio
@@ -311,6 +343,46 @@ async def test_active_task_history_cannot_be_cleared(tmp_path: Path) -> None:
             archive.clear_task_operation(operation_id)
         assert error.value.code == "TASK_HISTORY_ACTIVE"
         assert len(archive.list_task_operations()) == 1
+    finally:
+        work_access.release.set()
+        with pytest.raises(AppError):
+            await running
+
+
+@pytest.mark.asyncio
+async def test_restart_marks_running_history_interrupted_and_protects_it(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "library"
+    root.mkdir()
+    work_access = BlockingFailingWorkAccess()
+    database = tmp_path / "archive.db"
+    archive = ManagedArchive(
+        database_path=database,
+        work_access=work_access,  # type: ignore[arg-type]
+        media_access=UnexpectedMediaAccess(),  # type: ignore[arg-type]
+    )
+    running = asyncio.create_task(
+        archive.archive_single(
+            SingleArchiveRequest("7429378937383308594", root)
+        )
+    )
+    await work_access.started.wait()
+    restarted = ManagedArchive(
+        database_path=database,
+        work_access=FailingWorkAccess(),  # type: ignore[arg-type]
+        media_access=UnexpectedMediaAccess(),  # type: ignore[arg-type]
+    )
+    operation = restarted.list_task_operations()[0]
+    try:
+        assert operation.task.lifecycle == "interrupted"
+        assert operation.task.phase == "idle"
+        assert operation.task.result == "none"
+        assert operation.source_tasks[0].task.lifecycle == "interrupted"
+        assert operation.source_tasks[0].work_tasks[0].task.lifecycle == "interrupted"
+        with pytest.raises(AppError) as error:
+            restarted.clear_task_operation(operation.task.task_id)
+        assert error.value.code == "TASK_HISTORY_ACTIVE"
     finally:
         work_access.release.set()
         with pytest.raises(AppError):

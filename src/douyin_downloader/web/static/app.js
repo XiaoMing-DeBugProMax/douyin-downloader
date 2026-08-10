@@ -326,14 +326,22 @@ function renderWorkTask(work) {
 }
 
 function renderSourceTask(source, index) {
-  const details = createElement("details", "task-source");
-  const summary = createElement("summary", "", `来源任务 ${index + 1}`);
-  details.append(summary, taskStateFields(source.task), taskProgress(source.task.progress));
-  if (source.task.error) details.append(taskError(source.task.error));
+  const node = createElement("article", "task-source");
+  node.append(
+    createElement("h3", "", `来源任务 ${index + 1}`),
+    taskStateFields(source.task),
+    taskProgress(source.task.progress),
+  );
+  if (source.task.error) node.append(taskError(source.task.error));
+  const details = createElement("details", "task-work-details");
+  details.append(
+    createElement("summary", "", `展开 ${source.work_tasks.length} 个作品明细`),
+  );
   const works = createElement("div", "task-work-list");
   for (const work of source.work_tasks) works.append(renderWorkTask(work));
   details.append(works);
-  return details;
+  node.append(details);
+  return node;
 }
 
 function taskIsTerminal(task) {

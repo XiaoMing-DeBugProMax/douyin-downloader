@@ -566,8 +566,11 @@ def test_task_center_shows_three_levels_errors_progress_and_terminal_cleanup(
         "请稍后重试此归档操作。"
     )
     source = failed.locator(".task-source")
-    expect(source).not_to_have_attribute("open", "")
-    source.locator("summary").click()
+    work_details = source.locator(".task-work-details")
+    expect(work_details).not_to_have_attribute("open", "")
+    expect(source.locator(":scope > .task-state-fields")).to_be_visible()
+    expect(source.locator(":scope > .task-progress")).to_be_visible()
+    work_details.locator("summary").click()
     expect(source.locator(".task-work")).to_contain_text("7429378937383308594")
 
     successful = cards.filter(has_text="successful-operation")
