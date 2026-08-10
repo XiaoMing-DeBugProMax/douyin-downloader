@@ -43,6 +43,37 @@ class PendingPromotion:
     artifacts: tuple[ArtifactRecord, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class StoredTask:
+    task_id: str
+    lifecycle: str
+    phase: str
+    result: str
+    error_code: str | None
+    completed_bytes: int
+    total_bytes: int | None
+    speed_bytes_per_second: float | None
+    eta_seconds: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class StoredWorkTask:
+    task: StoredTask
+    aweme_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class StoredSourceTask:
+    task: StoredTask
+    work_tasks: tuple[StoredWorkTask, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class StoredTaskOperation:
+    task: StoredTask
+    source_tasks: tuple[StoredSourceTask, ...]
+
+
 class ArchiveStore:
     def __init__(self, database_path: Path) -> None:
         self._database_path = database_path
@@ -91,6 +122,105 @@ class ArchiveStore:
                 (status, aweme_id),
             )
 
+    def list_task_operations(self) -> tuple[StoredTaskOperation, ...]:
+        if not self._database_path.is_file():
+            return ()
+        with self._connection() as connection:
+            operation_rows = connection.execute(
+                """
+                SELECT operation_id, lifecycle, phase, result, error_code,
+                       completed_bytes, total_bytes, speed_bytes_per_second,
+                       eta_seconds
+                FROM archive_operations
+                WHERE history_visible = 1
+                ORDER BY rowid DESC
+                """
+            ).fetchall()
+            source_rows = connection.execute(
+                """
+                SELECT source_task_id, operation_id, lifecycle, phase, result,
+                       error_code, completed_bytes, total_bytes,
+                       speed_bytes_per_second, eta_seconds
+                FROM source_tasks
+                ORDER BY rowid
+                """
+            ).fetchall()
+            work_rows = connection.execute(
+                """
+                SELECT work_task_id, source_task_id, aweme_id,
+                       lifecycle, phase, result, error_code,
+                       completed_bytes, total_bytes, speed_bytes_per_second,
+                       eta_seconds
+                FROM work_tasks
+                ORDER BY rowid
+                """
+            ).fetchall()
+
+        work_by_source: dict[str, list[StoredWorkTask]] = {}
+        for row in work_rows:
+            source_id = str(row[1])
+            work_by_source.setdefault(source_id, []).append(
+                StoredWorkTask(
+                    task=StoredTask(
+                        task_id=str(row[0]),
+                        lifecycle=str(row[3]),
+                        phase=str(row[4]),
+                        result=str(row[5]),
+                        error_code=str(row[6]) if row[6] is not None else None,
+                        completed_bytes=int(row[7]),
+                        total_bytes=int(row[8]) if row[8] is not None else None,
+                        speed_bytes_per_second=(
+                            float(row[9]) if row[9] is not None else None
+                        ),
+                        eta_seconds=int(row[10]) if row[10] is not None else None,
+                    ),
+                    aweme_id=str(row[2]),
+                )
+            )
+
+        sources_by_operation: dict[str, list[StoredSourceTask]] = {}
+        for row in source_rows:
+            source_id = str(row[0])
+            operation_id = str(row[1])
+            sources_by_operation.setdefault(operation_id, []).append(
+                StoredSourceTask(
+                    task=StoredTask(
+                        task_id=source_id,
+                        lifecycle=str(row[2]),
+                        phase=str(row[3]),
+                        result=str(row[4]),
+                        error_code=str(row[5]) if row[5] is not None else None,
+                        completed_bytes=int(row[6]),
+                        total_bytes=int(row[7]) if row[7] is not None else None,
+                        speed_bytes_per_second=(
+                            float(row[8]) if row[8] is not None else None
+                        ),
+                        eta_seconds=int(row[9]) if row[9] is not None else None,
+                    ),
+                    work_tasks=tuple(work_by_source.get(source_id, ())),
+                )
+            )
+
+        return tuple(
+            StoredTaskOperation(
+                task=StoredTask(
+                    task_id=str(row[0]),
+                    lifecycle=str(row[1]),
+                    phase=str(row[2]),
+                    result=str(row[3]),
+                    error_code=str(row[4]) if row[4] is not None else None,
+                    completed_bytes=int(row[5]),
+                    total_bytes=int(row[6]) if row[6] is not None else None,
+                    speed_bytes_per_second=(
+                        float(row[7]) if row[7] is not None else None
+                    ),
+                    eta_seconds=int(row[8]) if row[8] is not None else None,
+                ),
+                source_tasks=tuple(sources_by_operation.get(str(row[0]), ())),
+            )
+            for row in operation_rows
+        )
+
     def create_running(
         self,
         ids: TaskIds,
@@ -117,14 +247,95 @@ class ArchiveStore:
                 ),
             )
             connection.execute(
-                "INSERT INTO source_tasks VALUES "
-                "(?, ?, 'running', 'resolving', 'none')",
+                "INSERT INTO source_tasks "
+                "(source_task_id, operation_id, lifecycle, phase, result, error_code) "
+                "VALUES (?, ?, 'running', 'resolving', 'none', NULL)",
                 (ids.source, ids.operation),
             )
             connection.execute(
-                "INSERT INTO work_tasks VALUES "
-                "(?, ?, ?, 'running', 'resolving', 'none')",
+                "INSERT INTO work_tasks "
+                "(work_task_id, source_task_id, aweme_id, lifecycle, phase, result, "
+                "error_code) VALUES (?, ?, ?, 'running', 'resolving', 'none', NULL)",
                 (ids.work, ids.source, aweme_id),
+            )
+
+    def clear_task_operation(self, operation_id: str) -> str:
+        with self._connection() as connection:
+            operation = connection.execute(
+                "SELECT lifecycle, history_visible FROM archive_operations "
+                "WHERE operation_id=?",
+                (operation_id,),
+            ).fetchone()
+            if operation is None or not bool(operation[1]):
+                return "not_found"
+            lifecycles = [str(operation[0])]
+            lifecycles.extend(
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT lifecycle FROM source_tasks WHERE operation_id=?",
+                    (operation_id,),
+                )
+            )
+            lifecycles.extend(
+                str(row[0])
+                for row in connection.execute(
+                    """
+                    SELECT w.lifecycle
+                    FROM work_tasks AS w
+                    JOIN source_tasks AS s
+                      ON s.source_task_id = w.source_task_id
+                    WHERE s.operation_id=?
+                    """,
+                    (operation_id,),
+                )
+            )
+            if any(
+                lifecycle not in {"finished", "cancelled"}
+                for lifecycle in lifecycles
+            ):
+                return "active"
+            connection.execute(
+                "UPDATE archive_operations SET history_visible=0 "
+                "WHERE operation_id=?",
+                (operation_id,),
+            )
+        return "cleared"
+
+    def update_progress(
+        self,
+        ids: TaskIds,
+        *,
+        phase: str,
+        completed_bytes: int,
+        total_bytes: int | None,
+        speed_bytes_per_second: float | None,
+        eta_seconds: int | None,
+    ) -> None:
+        with self._connection() as connection:
+            values = (
+                phase,
+                completed_bytes,
+                total_bytes,
+                speed_bytes_per_second,
+                eta_seconds,
+            )
+            connection.execute(
+                "UPDATE archive_operations SET phase=?, completed_bytes=?, "
+                "total_bytes=?, speed_bytes_per_second=?, eta_seconds=? "
+                "WHERE operation_id=?",
+                (*values, ids.operation),
+            )
+            connection.execute(
+                "UPDATE source_tasks SET phase=?, completed_bytes=?, total_bytes=?, "
+                "speed_bytes_per_second=?, eta_seconds=? "
+                "WHERE source_task_id=?",
+                (*values, ids.source),
+            )
+            connection.execute(
+                "UPDATE work_tasks SET phase=?, completed_bytes=?, total_bytes=?, "
+                "speed_bytes_per_second=?, eta_seconds=? "
+                "WHERE work_task_id=?",
+                (*values, ids.work),
             )
 
     def prepare_promotion(
@@ -197,10 +408,10 @@ class ArchiveStore:
             )
             _set_task_results(connection, ids, result)
 
-    def fail(self, ids: TaskIds) -> None:
+    def fail(self, ids: TaskIds, error_code: str = "ARCHIVE_FAILED") -> None:
         try:
             with self._connection() as connection:
-                _set_task_results(connection, ids, "failed")
+                _set_task_results(connection, ids, "failed", error_code)
         except sqlite3.Error:
             pass
 
@@ -241,7 +452,12 @@ class ArchiveStore:
                 "part_relative_path=NULL WHERE aweme_id=?",
                 (promotion.aweme_id,),
             )
-            _set_task_results(connection, promotion.ids, "failed")
+            _set_task_results(
+                connection,
+                promotion.ids,
+                "failed",
+                "ARCHIVE_FAILED",
+            )
 
     def _connect(self) -> sqlite3.Connection:
         ensure_issue5_schema(self._database_path)
@@ -260,6 +476,12 @@ class ArchiveStore:
                 profile_description INTEGER NOT NULL DEFAULT 0,
                 download_concurrency INTEGER NOT NULL DEFAULT 3,
                 retry_limit INTEGER NOT NULL DEFAULT 3
+                ,history_visible INTEGER NOT NULL DEFAULT 1
+                ,error_code TEXT
+                ,completed_bytes INTEGER NOT NULL DEFAULT 0
+                ,total_bytes INTEGER
+                ,speed_bytes_per_second REAL
+                ,eta_seconds INTEGER
             )
             """
         )
@@ -271,6 +493,11 @@ class ArchiveStore:
                 lifecycle TEXT NOT NULL,
                 phase TEXT NOT NULL,
                 result TEXT NOT NULL
+                ,error_code TEXT
+                ,completed_bytes INTEGER NOT NULL DEFAULT 0
+                ,total_bytes INTEGER
+                ,speed_bytes_per_second REAL
+                ,eta_seconds INTEGER
             );
             CREATE TABLE IF NOT EXISTS work_tasks (
                 work_task_id TEXT PRIMARY KEY,
@@ -279,6 +506,11 @@ class ArchiveStore:
                 lifecycle TEXT NOT NULL,
                 phase TEXT NOT NULL,
                 result TEXT NOT NULL
+                ,error_code TEXT
+                ,completed_bytes INTEGER NOT NULL DEFAULT 0
+                ,total_bytes INTEGER
+                ,speed_bytes_per_second REAL
+                ,eta_seconds INTEGER
             );
             CREATE TABLE IF NOT EXISTS archive_items (
                 aweme_id TEXT PRIMARY KEY,
@@ -342,18 +574,21 @@ def _set_task_results(
     connection: sqlite3.Connection,
     ids: TaskIds,
     result: str,
+    error_code: str | None = None,
 ) -> None:
     values = ("finished", "idle", result)
     connection.execute(
-        "UPDATE archive_operations SET lifecycle=?, phase=?, result=? "
+        "UPDATE archive_operations SET lifecycle=?, phase=?, result=?, error_code=? "
         "WHERE operation_id=?",
-        (*values, ids.operation),
+        (*values, error_code, ids.operation),
     )
     connection.execute(
-        "UPDATE source_tasks SET lifecycle=?, phase=?, result=? WHERE source_task_id=?",
-        (*values, ids.source),
+        "UPDATE source_tasks SET lifecycle=?, phase=?, result=?, error_code=? "
+        "WHERE source_task_id=?",
+        (*values, error_code, ids.source),
     )
     connection.execute(
-        "UPDATE work_tasks SET lifecycle=?, phase=?, result=? WHERE work_task_id=?",
-        (*values, ids.work),
+        "UPDATE work_tasks SET lifecycle=?, phase=?, result=?, error_code=? "
+        "WHERE work_task_id=?",
+        (*values, error_code, ids.work),
     )

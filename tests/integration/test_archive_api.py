@@ -9,6 +9,11 @@ from douyin_downloader.archive import (
     ArchiveItemSnapshot,
     ArchiveOperationSnapshot,
     SingleArchiveRequest,
+    TaskCenterOperationSnapshot,
+    TaskCenterSourceSnapshot,
+    TaskCenterWorkSnapshot,
+    TaskErrorSnapshot,
+    TaskProgressSnapshot,
     TaskSnapshot,
 )
 from douyin_downloader.domain import ParsedVideo, ResolvedShare
@@ -46,6 +51,8 @@ class RecordingManagedArchive:
         self.opened: list[str] = []
         self.status_thread_ids: list[int] = []
         self.open_thread_ids: list[int] = []
+        self.task_operations: tuple[TaskCenterOperationSnapshot, ...] = ()
+        self.cleared_operations: list[str] = []
 
     async def archive_single(
         self,
@@ -74,6 +81,12 @@ class RecordingManagedArchive:
     def open_work_folder(self, aweme_id: str) -> None:
         self.open_thread_ids.append(threading.get_ident())
         self.opened.append(aweme_id)
+
+    def list_task_operations(self) -> tuple[TaskCenterOperationSnapshot, ...]:
+        return self.task_operations
+
+    def clear_task_operation(self, operation_id: str) -> None:
+        self.cleared_operations.append(operation_id)
 
 
 class StaticDirectoryChooser:
@@ -189,3 +202,142 @@ async def test_location_unavailable_archive_cannot_open_folder(tmp_path: Path) -
         "description_outcome": "not_requested",
         "can_open_folder": False,
     }
+
+
+@pytest.mark.asyncio
+async def test_task_routes_project_safe_three_level_history_and_clear_it(
+    tmp_path: Path,
+) -> None:
+    managed_archive = RecordingManagedArchive()
+    progress = TaskProgressSnapshot(
+        completed_items=1,
+        total_items=1,
+        completed_bytes=512,
+        total_bytes=1024,
+        percentage=50.0,
+        speed_bytes_per_second=256.0,
+        eta_seconds=2,
+    )
+    error = TaskErrorSnapshot(
+        "UPSTREAM_BLOCKED",
+        "解析服务暂时不可用。",
+        "请稍后重试此归档操作。",
+    )
+    work = TaskCenterWorkSnapshot(
+        TaskSnapshot("work-1", "finished", "idle", "failed", error, progress),
+        VIDEO.aweme_id,
+    )
+    source = TaskCenterSourceSnapshot(
+        TaskSnapshot("source-1", "finished", "idle", "failed", error, progress),
+        (work,),
+    )
+    managed_archive.task_operations = (
+        TaskCenterOperationSnapshot(
+            TaskSnapshot("operation-1", "finished", "idle", "failed", error, progress),
+            (source,),
+        ),
+    )
+    sessions = SessionManager()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(404))
+    ) as media_client:
+        app = create_app(
+            services=AppServices(
+                parse_service=ParseService(UnusedResolver(), UnusedParser(), ParseStore()),
+                media_client=media_client,
+                managed_archive=managed_archive,
+            ),
+            session_manager=sessions,
+            testing=True,
+        )
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://testserver",
+        ) as client:
+            client.cookies.set("douyin_local_session", sessions.cookie_token)
+            response = await client.get("/api/tasks")
+            clear_response = await client.delete(
+                "/api/tasks/operation-1",
+                headers={"origin": "http://testserver"},
+            )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "operations": [
+            {
+                "task": {
+                    "task_id": "operation-1",
+                    "lifecycle": "finished",
+                    "phase": "idle",
+                    "result": "failed",
+                    "progress": {
+                        "completed_items": 1,
+                        "total_items": 1,
+                        "completed_bytes": 512,
+                        "total_bytes": 1024,
+                        "percentage": 50.0,
+                        "speed_bytes_per_second": 256.0,
+                        "eta_seconds": 2,
+                    },
+                    "error": {
+                        "code": "UPSTREAM_BLOCKED",
+                        "message": "解析服务暂时不可用。",
+                        "suggestion": "请稍后重试此归档操作。",
+                    },
+                },
+                "source_tasks": [
+                    {
+                        "task": {
+                            "task_id": "source-1",
+                            "lifecycle": "finished",
+                            "phase": "idle",
+                            "result": "failed",
+                            "progress": {
+                                "completed_items": 1,
+                                "total_items": 1,
+                                "completed_bytes": 512,
+                                "total_bytes": 1024,
+                                "percentage": 50.0,
+                                "speed_bytes_per_second": 256.0,
+                                "eta_seconds": 2,
+                            },
+                            "error": {
+                                "code": "UPSTREAM_BLOCKED",
+                                "message": "解析服务暂时不可用。",
+                                "suggestion": "请稍后重试此归档操作。",
+                            },
+                        },
+                        "work_tasks": [
+                            {
+                                "task": {
+                                    "task_id": "work-1",
+                                    "lifecycle": "finished",
+                                    "phase": "idle",
+                                    "result": "failed",
+                                    "progress": {
+                                        "completed_items": 1,
+                                        "total_items": 1,
+                                        "completed_bytes": 512,
+                                        "total_bytes": 1024,
+                                        "percentage": 50.0,
+                                        "speed_bytes_per_second": 256.0,
+                                        "eta_seconds": 2,
+                                    },
+                                    "error": {
+                                        "code": "UPSTREAM_BLOCKED",
+                                        "message": "解析服务暂时不可用。",
+                                        "suggestion": "请稍后重试此归档操作。",
+                                    },
+                                },
+                                "aweme_id": VIDEO.aweme_id,
+                            }
+                        ],
+                    }
+                ],
+            }
+        ]
+    }
+    assert "douyinvod.com" not in response.text
+    assert str(tmp_path) not in response.text
+    assert clear_response.status_code == 204
+    assert managed_archive.cleared_operations == ["operation-1"]

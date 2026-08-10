@@ -142,10 +142,21 @@
         <p>主页、合集与其他公开来源的批量采集将在后续规格中接入。</p>
       </section>
 
-      <section id="tasks-workspace" class="workspace-panel placeholder-workspace" role="tabpanel" aria-labelledby="tab-tasks" hidden>
-        <p class="eyebrow">TASK CENTER</p>
-        <h1>任务中心</h1>
-        <p>持久任务、进度与失败重试将在本周期后续功能中开放。</p>
+      <section id="tasks-workspace" class="workspace-panel task-workspace" role="tabpanel" aria-labelledby="tab-tasks" hidden>
+        <div class="workspace-heading task-heading">
+          <div>
+            <p class="eyebrow">TASK CENTER</p>
+            <h1>任务中心</h1>
+            <p>查看归档操作、来源任务和作品任务的持久状态。</p>
+          </div>
+          <button id="tasks-refresh" class="button button-secondary" type="button">刷新</button>
+        </div>
+        <div class="tasks-feedback">
+          <p id="tasks-status" role="status" aria-live="polite"></p>
+          <p id="tasks-error" role="alert"></p>
+        </div>
+        <p id="tasks-empty" class="tasks-empty" hidden>还没有归档任务。</p>
+        <div id="tasks-list" class="tasks-list" aria-label="归档任务历史"></div>
       </section>
 
       <section id="library-workspace" class="workspace-panel placeholder-workspace" role="tabpanel" aria-labelledby="tab-library" hidden>

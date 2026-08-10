@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import threading
+import time
 import weakref
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -29,6 +31,8 @@ from douyin_downloader.archive_pipeline import (
 from douyin_downloader.archive_store import (
     ArchiveStore,
     StoredArchive,
+    StoredTask,
+    StoredTaskOperation,
     TaskIds,
 )
 from douyin_downloader.async_tools import run_in_thread_cancellation_safe
@@ -47,6 +51,11 @@ from douyin_downloader.settings import (
 __all__ = [
     "ArchiveItemSnapshot",
     "ArchiveOperationSnapshot",
+    "TaskCenterOperationSnapshot",
+    "TaskCenterSourceSnapshot",
+    "TaskCenterWorkSnapshot",
+    "TaskErrorSnapshot",
+    "TaskProgressSnapshot",
     "HttpMediaAccess",
     "ManagedArchive",
     "RemoteArtifact",
@@ -91,11 +100,49 @@ class SingleArchiveRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class TaskErrorSnapshot:
+    code: str
+    message: str
+    suggestion: str
+
+
+@dataclass(frozen=True, slots=True)
+class TaskProgressSnapshot:
+    completed_items: int = 0
+    total_items: int = 1
+    completed_bytes: int = 0
+    total_bytes: int | None = None
+    percentage: float | None = None
+    speed_bytes_per_second: float | None = None
+    eta_seconds: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class TaskSnapshot:
     task_id: str
     lifecycle: str
     phase: str
     result: str
+    error: TaskErrorSnapshot | None = None
+    progress: TaskProgressSnapshot = field(default_factory=TaskProgressSnapshot)
+
+
+@dataclass(frozen=True, slots=True)
+class TaskCenterWorkSnapshot:
+    task: TaskSnapshot
+    aweme_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class TaskCenterSourceSnapshot:
+    task: TaskSnapshot
+    work_tasks: tuple[TaskCenterWorkSnapshot, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class TaskCenterOperationSnapshot:
+    task: TaskSnapshot
+    source_tasks: tuple[TaskCenterSourceSnapshot, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,6 +168,77 @@ class _AuditedArchive:
     stored: StoredArchive
     status: str
     valid_artifacts: dict[str, ArtifactRecord]
+
+
+class _TaskProgressRecorder:
+    def __init__(
+        self,
+        store: ArchiveStore,
+        ids: TaskIds,
+        remote_artifact_count: int,
+    ) -> None:
+        self._store = store
+        self._ids = ids
+        self._remaining_remote_artifacts = remote_artifact_count
+        self._known_total = 0
+        self._all_sizes_known = True
+        self._completed_bytes = 0
+        self._phase = "resolving"
+        self._first_byte_at: float | None = None
+        self._sample_count = 0
+        self._speed_bytes_per_second: float | None = None
+        self._eta_seconds: int | None = None
+
+    async def set_phase(self, phase: str) -> None:
+        self._phase = phase
+        await self._persist()
+
+    async def remote_started(self, expected_size: int | None) -> None:
+        self._remaining_remote_artifacts -= 1
+        if expected_size is None:
+            self._all_sizes_known = False
+        else:
+            self._known_total += expected_size
+        await self._persist()
+
+    async def advance_bytes(self, count: int) -> None:
+        self._completed_bytes += count
+        now = time.monotonic()
+        if self._first_byte_at is None:
+            self._first_byte_at = now
+        self._sample_count += 1
+        elapsed = now - self._first_byte_at
+        total_bytes = self._reliable_total()
+        if self._sample_count >= 2 and elapsed >= 0.25:
+            self._speed_bytes_per_second = self._completed_bytes / elapsed
+            self._eta_seconds = (
+                math.ceil(
+                    max(total_bytes - self._completed_bytes, 0)
+                    / self._speed_bytes_per_second
+                )
+                if total_bytes is not None and self._speed_bytes_per_second > 0
+                else None
+            )
+        await self._persist()
+
+    async def _persist(self) -> None:
+        total_bytes = self._reliable_total()
+        await asyncio.to_thread(
+            self._store.update_progress,
+            self._ids,
+            phase=self._phase,
+            completed_bytes=self._completed_bytes,
+            total_bytes=total_bytes,
+            speed_bytes_per_second=self._speed_bytes_per_second,
+            eta_seconds=self._eta_seconds,
+        )
+
+    def _reliable_total(self) -> int | None:
+        return (
+            self._known_total
+            if self._remaining_remote_artifacts == 0 and self._all_sizes_known
+            else None
+        )
 
 
 class WorkAccess(Protocol):
@@ -238,6 +356,12 @@ class ManagedArchive:
         operation_result = "success"
         try:
             self._store.create_running(ids, aweme_id, settings)
+            progress = _TaskProgressRecorder(
+                self._store,
+                ids,
+                int("video" not in valid_artifacts)
+                + int("cover" not in valid_artifacts),
+            )
             resolved = await self._work_access.fetch_work(aweme_id)
             if resolved.snapshot.aweme_id != aweme_id:
                 raise AppError(
@@ -270,8 +394,10 @@ class ManagedArchive:
                     registered_artifacts,
                     base_name,
                     settings.profile,
+                    progress,
                 )
                 operation_result = prepared.result
+                await progress.set_phase("promoting")
                 self._store.prepare_promotion(
                     ids,
                     aweme_id,
@@ -283,13 +409,13 @@ class ManagedArchive:
                 for part_path, final_path in prepared.promotions:
                     self._file_promoter.promote(part_path, final_path)
                 self._store.finish_promotion(ids, aweme_id, operation_result)
-        except Exception:
+        except Exception as error:
             if not promotion_started:
                 try:
                     if prepared is not None:
                         prepared.discard_parts()
                 finally:
-                    self._store.fail(ids)
+                    self._store.fail(ids, _task_error_code(error))
             raise
 
         return _archive_snapshot(
@@ -321,6 +447,23 @@ class ManagedArchive:
                 "description",
             ),
         )
+
+    def list_task_operations(self) -> tuple[TaskCenterOperationSnapshot, ...]:
+        return tuple(
+            _task_center_snapshot(operation)
+            for operation in self._store.list_task_operations()
+        )
+
+    def clear_task_operation(self, operation_id: str) -> None:
+        outcome = self._store.clear_task_operation(operation_id)
+        if outcome == "not_found":
+            raise AppError("TASK_NOT_FOUND", "没有找到该任务记录。", 404)
+        if outcome == "active":
+            raise AppError(
+                "TASK_HISTORY_ACTIVE",
+                "活动、暂停或已中断的任务不能清理。",
+                409,
+            )
 
     def open_work_folder(self, aweme_id: str) -> None:
         existing = self._audit_archive(aweme_id)
@@ -446,6 +589,110 @@ def _archive_snapshot(
         ),
         settings=settings,
     )
+
+
+def _task_center_snapshot(
+    operation: StoredTaskOperation,
+) -> TaskCenterOperationSnapshot:
+    def task(
+        stored: StoredTask,
+        *,
+        completed_items: int,
+        total_items: int,
+    ) -> TaskSnapshot:
+        return TaskSnapshot(
+            stored.task_id,
+            stored.lifecycle,
+            stored.phase,
+            stored.result,
+            _task_error(stored.error_code),
+            TaskProgressSnapshot(
+                completed_items=completed_items,
+                total_items=total_items,
+                completed_bytes=stored.completed_bytes,
+                total_bytes=stored.total_bytes,
+                speed_bytes_per_second=stored.speed_bytes_per_second,
+                eta_seconds=stored.eta_seconds,
+                percentage=(
+                    round(stored.completed_bytes / stored.total_bytes * 100, 1)
+                    if stored.total_bytes is not None and stored.total_bytes > 0
+                    else (
+                        100.0
+                        if total_items > 0 and completed_items == total_items
+                        else None
+                    )
+                ),
+            ),
+        )
+
+    source_snapshots: list[TaskCenterSourceSnapshot] = []
+    for source in operation.source_tasks:
+        work_snapshots = tuple(
+            TaskCenterWorkSnapshot(
+                task=task(
+                    work.task,
+                    completed_items=int(work.task.lifecycle == "finished"),
+                    total_items=1,
+                ),
+                aweme_id=work.aweme_id,
+            )
+            for work in source.work_tasks
+        )
+        source_snapshots.append(
+            TaskCenterSourceSnapshot(
+                task=task(
+                    source.task,
+                    completed_items=sum(
+                        item.task.progress.completed_items for item in work_snapshots
+                    ),
+                    total_items=len(work_snapshots),
+                ),
+                work_tasks=work_snapshots,
+            )
+        )
+    total_items = sum(source.task.progress.total_items for source in source_snapshots)
+    completed_items = sum(
+        source.task.progress.completed_items for source in source_snapshots
+    )
+    return TaskCenterOperationSnapshot(
+        task=task(
+            operation.task,
+            completed_items=completed_items,
+            total_items=total_items,
+        ),
+        source_tasks=tuple(source_snapshots),
+    )
+
+
+_TASK_ERRORS = {
+    "UPSTREAM_BLOCKED": TaskErrorSnapshot(
+        "UPSTREAM_BLOCKED",
+        "解析服务暂时不可用。",
+        "请稍后重试此归档操作。",
+    ),
+    "VIDEO_NOT_FOUND": TaskErrorSnapshot(
+        "VIDEO_NOT_FOUND",
+        "没有找到该作品。",
+        "请确认作品仍公开可访问后重试。",
+    ),
+    "ARCHIVE_FAILED": TaskErrorSnapshot(
+        "ARCHIVE_FAILED",
+        "归档成果未能通过完整性检查。",
+        "请检查磁盘空间和归档位置后重试。",
+    ),
+}
+
+
+def _task_error_code(error: Exception) -> str:
+    if isinstance(error, AppError) and error.code in _TASK_ERRORS:
+        return error.code
+    return "ARCHIVE_FAILED"
+
+
+def _task_error(code: str | None) -> TaskErrorSnapshot | None:
+    if code is None:
+        return None
+    return _TASK_ERRORS.get(code, _TASK_ERRORS["ARCHIVE_FAILED"])
 
 
 def _artifact_outcome(

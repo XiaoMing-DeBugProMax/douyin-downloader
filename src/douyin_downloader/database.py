@@ -26,6 +26,62 @@ _OPERATION_SNAPSHOT_MIGRATIONS = {
     ),
 }
 
+_TASK_CENTER_MIGRATIONS = (
+    (
+        "archive_operations",
+        "history_visible",
+        "ALTER TABLE archive_operations ADD COLUMN history_visible "
+        "INTEGER NOT NULL DEFAULT 1",
+    ),
+    (
+        "archive_operations",
+        "error_code",
+        "ALTER TABLE archive_operations ADD COLUMN error_code TEXT",
+    ),
+    (
+        "source_tasks",
+        "error_code",
+        "ALTER TABLE source_tasks ADD COLUMN error_code TEXT",
+    ),
+    (
+        "work_tasks",
+        "error_code",
+        "ALTER TABLE work_tasks ADD COLUMN error_code TEXT",
+    ),
+    *(
+        (
+            table,
+            "completed_bytes",
+            f"ALTER TABLE {table} ADD COLUMN completed_bytes INTEGER NOT NULL DEFAULT 0",
+        )
+        for table in ("archive_operations", "source_tasks", "work_tasks")
+    ),
+    *(
+        (
+            table,
+            "total_bytes",
+            f"ALTER TABLE {table} ADD COLUMN total_bytes INTEGER",
+        )
+        for table in ("archive_operations", "source_tasks", "work_tasks")
+    ),
+    *(
+        (
+            table,
+            "speed_bytes_per_second",
+            f"ALTER TABLE {table} ADD COLUMN speed_bytes_per_second REAL",
+        )
+        for table in ("archive_operations", "source_tasks", "work_tasks")
+    ),
+    *(
+        (
+            table,
+            "eta_seconds",
+            f"ALTER TABLE {table} ADD COLUMN eta_seconds INTEGER",
+        )
+        for table in ("archive_operations", "source_tasks", "work_tasks")
+    ),
+)
+
 
 def ensure_issue5_schema(database_path: Path) -> None:
     """Back up an existing database, then apply all Issue #5 changes atomically."""
@@ -54,15 +110,34 @@ def ensure_issue5_schema(database_path: Path) -> None:
             for column, statement in _OPERATION_SNAPSHOT_MIGRATIONS.items()
             if "archive_operations" in tables and column not in operation_columns
         )
+        missing_task_migrations = tuple(
+            statement
+            for table, column, statement in _TASK_CENTER_MIGRATIONS
+            if table in tables
+            and column
+            not in {
+                str(row[1])
+                for row in connection.execute(f"PRAGMA table_info({table})")
+            }
+        )
         needs_settings_table = "current_settings" not in tables
         is_existing_database = bool(tables)
         if is_existing_database and (
-            needs_settings_table or missing_operation_migrations
+            needs_settings_table
+            or missing_operation_migrations
+            or missing_task_migrations
         ):
-            _backup_before_migration(database_path, connection)
+            backup_label = (
+                "settings-snapshot"
+                if needs_settings_table or missing_operation_migrations
+                else "task-center"
+            )
+            _backup_before_migration(database_path, connection, backup_label)
 
         with connection:
             for statement in missing_operation_migrations:
+                connection.execute(statement)
+            for statement in missing_task_migrations:
                 connection.execute(statement)
             connection.execute(
                 """
@@ -94,10 +169,11 @@ def ensure_issue5_schema(database_path: Path) -> None:
 def _backup_before_migration(
     database_path: Path,
     connection: sqlite3.Connection,
+    label: str,
 ) -> None:
     connection.commit()
     backup_path = database_path.with_name(
-        f"{database_path.stem}.pre-settings-snapshot.bak"
+        f"{database_path.stem}.pre-{label}.bak"
     )
     part_path = backup_path.with_name(f"{backup_path.name}.part")
     part_path.unlink(missing_ok=True)

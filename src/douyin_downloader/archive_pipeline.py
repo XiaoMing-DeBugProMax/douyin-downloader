@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Protocol
 
 from douyin_downloader.archive_adapters import MediaAccess, RemoteArtifact
 from douyin_downloader.archive_artifacts import (
@@ -24,6 +25,14 @@ from douyin_downloader.settings import ArchiveProfile
 _AUDIO_FAILURE_STATUSES = frozenset(
     {"probe_failed", "extract_failed", "validation_failed"}
 )
+
+
+class ArchiveProgress(Protocol):
+    async def set_phase(self, phase: str) -> None: ...
+
+    async def remote_started(self, expected_size: int | None) -> None: ...
+
+    async def advance_bytes(self, count: int) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +66,7 @@ class ArchiveArtifactPipeline:
         registered_artifacts: dict[str, ArtifactRecord],
         base_name: str,
         profile: ArchiveProfile,
+        progress: ArchiveProgress | None = None,
     ) -> PreparedArchive:
         part_paths: list[Path] = []
         promotions: list[tuple[Path, Path]] = []
@@ -73,12 +83,16 @@ class ArchiveArtifactPipeline:
                 video_part = output_directory / f"{aweme_id}.{operation_id}.mp4.part"
                 part_paths.append(video_part)
                 playback = resolved.preferred_playback_source()
+                await _set_phase(progress, "downloading")
                 remote = await self._media_access.open_video(
                     playback.cdn_mirror_urls
                 )
+                if progress is not None:
+                    await progress.remote_started(remote.expected_size)
                 if remote.content_type.split(";", 1)[0].lower() != "video/mp4":
                     raise archive_failed()
-                await _write_remote(remote, video_part)
+                await _write_remote(remote, video_part, progress)
+                await _set_phase(progress, "verifying")
                 await run_in_thread_cancellation_safe(
                     _validate_video_duration,
                     video_part,
@@ -104,12 +118,16 @@ class ArchiveArtifactPipeline:
             if cover is None:
                 if not resolved.cover_urls:
                     raise archive_failed()
+                await _set_phase(progress, "downloading")
                 remote = await self._media_access.open_cover(resolved.cover_urls)
+                if progress is not None:
+                    await progress.remote_started(remote.expected_size)
                 if not remote.content_type.lower().startswith("image/"):
                     raise archive_failed()
                 cover_part = output_directory / f"{aweme_id}.{operation_id}.cover.part"
                 part_paths.append(cover_part)
-                await _write_remote(remote, cover_part)
+                await _write_remote(remote, cover_part, progress)
+                await _set_phase(progress, "verifying")
                 cover_mime, cover_suffix = await run_in_thread_cancellation_safe(
                     inspect_cover,
                     cover_part,
@@ -134,6 +152,7 @@ class ArchiveArtifactPipeline:
 
             file_artifacts = [video, cover]
             if profile.include_audio:
+                await _set_phase(progress, "processing")
                 audio = valid_artifacts.get("audio")
                 if audio is None:
                     registered_audio = registered_artifacts.get("audio")
@@ -185,6 +204,7 @@ class ArchiveArtifactPipeline:
                             promotions.append((audio_part, audio_final))
                 file_artifacts.append(audio)
             if profile.include_description:
+                await _set_phase(progress, "processing")
                 description = valid_artifacts.get("description")
                 if description is None:
                     registered_description = registered_artifacts.get("description")
@@ -222,6 +242,7 @@ class ArchiveArtifactPipeline:
                 output_directory / f"{aweme_id}.{operation_id}.metadata.json.part"
             )
             part_paths.append(metadata_part)
+            await _set_phase(progress, "processing")
             metadata = await run_in_thread_cancellation_safe(
                 write_metadata,
                 metadata_part,
@@ -413,16 +434,27 @@ class ArchiveArtifactPipeline:
         )
 
 
-async def _write_remote(remote: RemoteArtifact, part_path: Path) -> None:
+async def _write_remote(
+    remote: RemoteArtifact,
+    part_path: Path,
+    progress: ArchiveProgress | None = None,
+) -> None:
     written = 0
     with part_path.open("wb") as output:
         async for chunk in remote.chunks:
             if chunk:
                 written += len(chunk)
                 output.write(chunk)
+                if progress is not None:
+                    await progress.advance_bytes(len(chunk))
         output.flush()
     if remote.expected_size is not None and written != remote.expected_size:
         raise archive_failed()
+
+
+async def _set_phase(progress: ArchiveProgress | None, phase: str) -> None:
+    if progress is not None:
+        await progress.set_phase(phase)
 
 
 def _pending(artifact: ArtifactRecord, part_path: Path) -> ArtifactRecord:

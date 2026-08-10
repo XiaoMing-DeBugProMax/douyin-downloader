@@ -445,6 +445,140 @@ def test_settings_workspace_persists_and_keeps_theme_and_keyboard_navigation(
     expect(page.locator("html")).to_have_attribute("data-theme", "dark")
 
 
+def test_task_center_shows_three_levels_errors_progress_and_terminal_cleanup(
+    page: Page,
+    local_app_url: str,
+) -> None:
+    operations = [
+        {
+            "task": {
+                "task_id": "failed-operation",
+                "lifecycle": "finished",
+                "phase": "idle",
+                "result": "failed",
+                "progress": {
+                    "completed_items": 1,
+                    "total_items": 1,
+                    "completed_bytes": 512,
+                    "total_bytes": None,
+                    "percentage": None,
+                    "speed_bytes_per_second": None,
+                    "eta_seconds": None,
+                },
+                "error": {
+                    "code": "UPSTREAM_BLOCKED",
+                    "message": "解析服务暂时不可用。",
+                    "suggestion": "请稍后重试此归档操作。",
+                },
+            },
+            "source_tasks": [
+                {
+                    "task": {
+                        "task_id": "failed-source",
+                        "lifecycle": "finished",
+                        "phase": "idle",
+                        "result": "failed",
+                        "progress": {
+                            "completed_items": 1,
+                            "total_items": 1,
+                            "completed_bytes": 512,
+                            "total_bytes": None,
+                            "percentage": None,
+                            "speed_bytes_per_second": None,
+                            "eta_seconds": None,
+                        },
+                        "error": None,
+                    },
+                    "work_tasks": [
+                        {
+                            "aweme_id": "7429378937383308594",
+                            "task": {
+                                "task_id": "failed-work",
+                                "lifecycle": "finished",
+                                "phase": "idle",
+                                "result": "failed",
+                                "progress": {
+                                    "completed_items": 1,
+                                    "total_items": 1,
+                                    "completed_bytes": 512,
+                                    "total_bytes": None,
+                                    "percentage": None,
+                                    "speed_bytes_per_second": None,
+                                    "eta_seconds": None,
+                                },
+                                "error": None,
+                            },
+                        }
+                    ],
+                }
+            ],
+        },
+        {
+            "task": {
+                "task_id": "successful-operation",
+                "lifecycle": "finished",
+                "phase": "idle",
+                "result": "success",
+                "progress": {
+                    "completed_items": 1,
+                    "total_items": 1,
+                    "completed_bytes": 1024,
+                    "total_bytes": 1024,
+                    "percentage": 100.0,
+                    "speed_bytes_per_second": 256.0,
+                    "eta_seconds": 0,
+                },
+                "error": None,
+            },
+            "source_tasks": [],
+        },
+    ]
+
+    def handle_tasks(route: Route) -> None:
+        if route.request.method == "DELETE":
+            operation_id = route.request.url.rsplit("/", 1)[-1]
+            operations[:] = [
+                operation
+                for operation in operations
+                if operation["task"]["task_id"] != operation_id
+            ]
+            route.fulfill(status=204)
+        else:
+            route.fulfill(status=200, json={"operations": operations})
+
+    page.route("**/api/tasks**", handle_tasks)
+    page.goto(local_app_url)
+    page.get_by_role("tab", name="任务中心", exact=True).click()
+
+    cards = page.locator(".task-operation")
+    expect(cards).to_have_count(2)
+    failed = cards.filter(has_text="failed-operation")
+    operation_state = failed.locator(".task-state-fields").first
+    operation_progress = failed.locator(".task-progress").first
+    expect(operation_state).to_contain_text("已结束")
+    expect(operation_state).to_contain_text("空闲")
+    expect(operation_state).to_contain_text("失败")
+    expect(operation_progress).to_contain_text("1 / 1 个作品")
+    expect(operation_progress).to_contain_text("512 B")
+    expect(operation_progress).not_to_contain_text("ETA")
+    expect(failed.locator(".task-error").first).to_contain_text("UPSTREAM_BLOCKED")
+    expect(failed.locator(".task-error").first).to_contain_text(
+        "请稍后重试此归档操作。"
+    )
+    source = failed.locator(".task-source")
+    expect(source).not_to_have_attribute("open", "")
+    source.locator("summary").click()
+    expect(source.locator(".task-work")).to_contain_text("7429378937383308594")
+
+    successful = cards.filter(has_text="successful-operation")
+    expect(successful.locator(".task-progress")).to_contain_text("100%")
+    expect(successful.locator(".task-progress")).to_contain_text("256 B/s")
+    expect(successful.locator(".task-progress")).to_contain_text("ETA 0 秒")
+    successful.locator(".task-clear").click()
+    expect(cards).to_have_count(1)
+    expect(cards).to_contain_text("failed-operation")
+
+
 def test_light_theme_small_text_meets_wcag_aa(page: Page, local_app_url: str) -> None:
     page.goto(local_app_url)
     for selector, background, pseudo in (

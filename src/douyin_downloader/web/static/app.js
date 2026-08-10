@@ -37,6 +37,12 @@ const settingsRetry = document.querySelector("#settings-retry");
 const settingsSave = document.querySelector("#settings-save");
 const settingsStatus = document.querySelector("#settings-status");
 const settingsError = document.querySelector("#settings-error");
+const tasksWorkspace = document.querySelector("#tasks-workspace");
+const tasksRefresh = document.querySelector("#tasks-refresh");
+const tasksStatus = document.querySelector("#tasks-status");
+const tasksError = document.querySelector("#tasks-error");
+const tasksEmpty = document.querySelector("#tasks-empty");
+const tasksList = document.querySelector("#tasks-list");
 
 let currentParse = null;
 let isParsing = false;
@@ -44,6 +50,8 @@ let currentArchiveState = "not_archived";
 let currentAudioOutcome = "not_requested";
 let currentDescriptionOutcome = "not_requested";
 let settingsLoaded = false;
+let tasksLoading = false;
+let tasksRefreshTimer = null;
 
 function storedTheme() {
   try {
@@ -171,6 +179,12 @@ function activateWorkspace(name) {
     panel.hidden = panel.id !== `${name}-workspace`;
   }
   if (name === "settings") loadSettings();
+  if (name === "tasks") {
+    loadTasks();
+  } else if (tasksRefreshTimer !== null) {
+    window.clearTimeout(tasksRefreshTimer);
+    tasksRefreshTimer = null;
+  }
 }
 
 for (const tab of workspaceTabs) {
@@ -219,6 +233,199 @@ async function responseError(response) {
 async function responseErrorMessage(response) {
   return (await responseError(response)).message;
 }
+
+const TASK_LIFECYCLES = {
+  running: "活动",
+  finished: "已结束",
+  paused: "已暂停",
+  interrupted: "已中断",
+  cancelled: "已取消",
+};
+const TASK_PHASES = {
+  resolving: "解析",
+  downloading: "下载",
+  verifying: "校验",
+  processing: "生成成果",
+  promoting: "登记成果",
+  idle: "空闲",
+};
+const TASK_RESULTS = {
+  none: "未结束",
+  success: "成功",
+  partial_success: "部分成功",
+  failed: "失败",
+  cancelled: "已取消",
+};
+
+function createElement(tag, className = "", text = "") {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text) node.textContent = text;
+  return node;
+}
+
+function formatBytes(value) {
+  const bytes = Number(value);
+  if (!Number.isFinite(bytes) || bytes < 0) return "未知";
+  if (bytes < 1024) return `${Math.round(bytes)} B`;
+  if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KiB`;
+  if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MiB`;
+  return `${(bytes / 1024 ** 3).toFixed(1)} GiB`;
+}
+
+function taskStateFields(task) {
+  const fields = createElement("dl", "task-state-fields");
+  for (const [label, value] of [
+    ["生命周期", TASK_LIFECYCLES[task.lifecycle] || task.lifecycle],
+    ["执行阶段", TASK_PHASES[task.phase] || task.phase],
+    ["最终结果", TASK_RESULTS[task.result] || task.result],
+  ]) {
+    const field = createElement("div");
+    field.append(createElement("dt", "", label), createElement("dd", "", value));
+    fields.append(field);
+  }
+  return fields;
+}
+
+function taskProgress(progress) {
+  const node = createElement("p", "task-progress");
+  const parts = [
+    `${progress.completed_items} / ${progress.total_items} 个作品`,
+    progress.total_bytes === null
+      ? formatBytes(progress.completed_bytes)
+      : `${formatBytes(progress.completed_bytes)} / ${formatBytes(progress.total_bytes)}`,
+  ];
+  if (progress.percentage !== null) parts.push(`${progress.percentage}%`);
+  if (progress.speed_bytes_per_second !== null) {
+    parts.push(`${formatBytes(progress.speed_bytes_per_second)}/s`);
+  }
+  if (progress.eta_seconds !== null) parts.push(`ETA ${progress.eta_seconds} 秒`);
+  node.textContent = parts.join(" · ");
+  return node;
+}
+
+function taskError(error) {
+  const node = createElement("div", "task-error");
+  node.append(
+    createElement("strong", "", error.code),
+    createElement("span", "", error.message),
+    createElement("span", "", error.suggestion),
+  );
+  return node;
+}
+
+function renderWorkTask(work) {
+  const node = createElement("article", "task-work");
+  node.append(
+    createElement("h4", "", `作品 ${work.aweme_id}`),
+    taskStateFields(work.task),
+    taskProgress(work.task.progress),
+  );
+  if (work.task.error) node.append(taskError(work.task.error));
+  return node;
+}
+
+function renderSourceTask(source, index) {
+  const details = createElement("details", "task-source");
+  const summary = createElement("summary", "", `来源任务 ${index + 1}`);
+  details.append(summary, taskStateFields(source.task), taskProgress(source.task.progress));
+  if (source.task.error) details.append(taskError(source.task.error));
+  const works = createElement("div", "task-work-list");
+  for (const work of source.work_tasks) works.append(renderWorkTask(work));
+  details.append(works);
+  return details;
+}
+
+function taskIsTerminal(task) {
+  return task.lifecycle === "finished" || task.lifecycle === "cancelled";
+}
+
+async function clearTaskOperation(operationId, button) {
+  button.disabled = true;
+  try {
+    const response = await fetch(`/api/tasks/${encodeURIComponent(operationId)}`, {
+      method: "DELETE",
+    });
+    if (!response.ok) {
+      tasksError.textContent = await responseErrorMessage(response);
+      return;
+    }
+    await loadTasks(true);
+  } catch (_) {
+    tasksError.textContent = UNKNOWN_ERROR;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function renderTaskOperation(operation) {
+  const card = createElement("article", "task-operation");
+  const heading = createElement("div", "task-operation-heading");
+  const title = createElement("div");
+  title.append(
+    createElement("p", "task-kind", "归档操作"),
+    createElement("h2", "task-id", operation.task.task_id),
+  );
+  heading.append(title);
+  if (taskIsTerminal(operation.task)) {
+    const clear = createElement("button", "button button-quiet task-clear", "清理记录");
+    clear.type = "button";
+    clear.addEventListener("click", () => clearTaskOperation(operation.task.task_id, clear));
+    heading.append(clear);
+  }
+  card.append(heading, taskStateFields(operation.task), taskProgress(operation.task.progress));
+  if (operation.task.error) card.append(taskError(operation.task.error));
+  const sources = createElement("div", "task-source-list");
+  operation.source_tasks.forEach((source, index) => {
+    sources.append(renderSourceTask(source, index));
+  });
+  card.append(sources);
+  return card;
+}
+
+function renderTasks(payload) {
+  tasksList.replaceChildren();
+  const operations = Array.isArray(payload?.operations) ? payload.operations : [];
+  tasksEmpty.hidden = operations.length !== 0;
+  for (const operation of operations) tasksList.append(renderTaskOperation(operation));
+  return operations;
+}
+
+function scheduleTaskRefresh(operations) {
+  if (tasksRefreshTimer !== null) window.clearTimeout(tasksRefreshTimer);
+  tasksRefreshTimer = null;
+  if (
+    !tasksWorkspace.hidden &&
+    operations.some((operation) => !taskIsTerminal(operation.task))
+  ) {
+    tasksRefreshTimer = window.setTimeout(() => loadTasks(true), 1000);
+  }
+}
+
+async function loadTasks(force = false) {
+  if (tasksLoading && !force) return;
+  tasksLoading = true;
+  tasksStatus.textContent = "正在读取任务历史…";
+  tasksError.textContent = "";
+  try {
+    const response = await fetch("/api/tasks");
+    if (!response.ok) {
+      tasksError.textContent = await responseErrorMessage(response);
+      tasksStatus.textContent = "";
+      return;
+    }
+    const operations = renderTasks(await response.json());
+    tasksStatus.textContent = operations.length ? `共 ${operations.length} 个归档操作。` : "";
+    scheduleTaskRefresh(operations);
+  } catch (_) {
+    tasksError.textContent = UNKNOWN_ERROR;
+    tasksStatus.textContent = "";
+  } finally {
+    tasksLoading = false;
+  }
+}
+
+tasksRefresh.addEventListener("click", () => loadTasks(true));
 
 function renderSettings(payload) {
   settingsRoot.value = typeof payload.archive_root === "string" ? payload.archive_root : "";

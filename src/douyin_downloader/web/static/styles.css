@@ -399,6 +399,181 @@ a {
   box-shadow: var(--shadow);
 }
 
+.task-workspace {
+  max-width: 760px;
+  margin: 0 auto;
+}
+
+.task-heading,
+.task-operation-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.task-heading h1,
+.task-operation h2,
+.task-work h4 {
+  margin: 0;
+}
+
+.task-heading > div > p:last-child {
+  margin: 10px 0 0;
+  color: var(--muted-readable);
+}
+
+.tasks-feedback {
+  min-height: 28px;
+  margin-top: 12px;
+}
+
+.tasks-feedback p {
+  margin: 0;
+}
+
+#tasks-error {
+  color: var(--error);
+}
+
+.tasks-empty {
+  margin: 22px 0 0;
+  padding: 26px;
+  border: 1px dashed var(--line);
+  border-radius: 18px;
+  color: var(--muted-readable);
+  text-align: center;
+}
+
+.tasks-list {
+  display: grid;
+  gap: 18px;
+}
+
+.task-operation {
+  min-width: 0;
+  padding: 22px;
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  background: var(--panel);
+  box-shadow: var(--shadow);
+}
+
+.task-kind {
+  margin: 0 0 5px;
+  color: var(--accent-readable);
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+}
+
+.task-id {
+  overflow-wrap: anywhere;
+  font-size: 18px;
+}
+
+.task-state-fields {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin: 16px 0 0;
+}
+
+.task-state-fields div {
+  min-width: 0;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: var(--panel-soft);
+}
+
+.task-state-fields dt {
+  color: var(--muted-readable);
+  font-size: 12px;
+}
+
+.task-state-fields dd {
+  margin: 3px 0 0;
+  font-weight: 700;
+}
+
+.task-progress {
+  margin: 14px 0 0;
+  color: var(--muted-readable);
+  font-variant-numeric: tabular-nums;
+}
+
+.task-error {
+  display: grid;
+  gap: 3px;
+  margin-top: 14px;
+  padding: 12px 14px;
+  border-left: 3px solid var(--error);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--error) 8%, var(--panel));
+  color: var(--error);
+}
+
+.task-error span:last-child {
+  color: var(--text);
+}
+
+.task-source-list {
+  display: grid;
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.task-source {
+  padding: 0 14px 14px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--panel-soft);
+}
+
+.task-source summary {
+  padding: 14px 0;
+  cursor: pointer;
+  font-weight: 750;
+}
+
+.task-source > .task-state-fields {
+  margin-top: 0;
+}
+
+.task-work-list {
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.task-work {
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel);
+}
+
+.task-work h4 {
+  overflow-wrap: anywhere;
+  font-size: 15px;
+}
+
+@media (max-width: 560px) {
+  .task-heading,
+  .task-operation-heading {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .task-state-fields {
+    grid-template-columns: 1fr;
+  }
+
+  .task-operation {
+    padding: 16px;
+  }
+}
+
 .settings-field {
   min-width: 0;
   margin: 0;

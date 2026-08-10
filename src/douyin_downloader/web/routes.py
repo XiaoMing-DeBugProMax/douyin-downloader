@@ -14,6 +14,7 @@ from douyin_downloader.archive import (
     ArchiveItemSnapshot,
     ArchiveOperationSnapshot,
     SingleArchiveRequest,
+    TaskCenterOperationSnapshot,
 )
 from douyin_downloader.domain import AppError
 from douyin_downloader.media import UpstreamStream, open_first_available, safe_video_filename
@@ -37,6 +38,10 @@ class ManagedArchiveModule(Protocol):
     def get_work_archive(self, aweme_id: str) -> ArchiveItemSnapshot | None: ...
 
     def open_work_folder(self, aweme_id: str) -> None: ...
+
+    def list_task_operations(self) -> tuple[TaskCenterOperationSnapshot, ...]: ...
+
+    def clear_task_operation(self, operation_id: str) -> None: ...
 
 
 class DirectoryChooser(Protocol):
@@ -123,6 +128,62 @@ class SettingsResponse(BaseModel):
     profile: ArchiveProfileModel
     download_concurrency: int
     retry_limit: int
+
+
+class TaskErrorResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    code: str
+    message: str
+    suggestion: str
+
+
+class TaskProgressResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    completed_items: int
+    total_items: int
+    completed_bytes: int
+    total_bytes: int | None
+    percentage: float | None
+    speed_bytes_per_second: float | None
+    eta_seconds: int | None
+
+
+class TaskNodeResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    task_id: str
+    lifecycle: str
+    phase: str
+    result: str
+    progress: TaskProgressResponse
+    error: TaskErrorResponse | None
+
+
+class WorkTaskResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    task: TaskNodeResponse
+    aweme_id: str
+
+
+class SourceTaskResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    task: TaskNodeResponse
+    work_tasks: list[WorkTaskResponse]
+
+
+class TaskOperationResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    task: TaskNodeResponse
+    source_tasks: list[SourceTaskResponse]
+
+
+class TaskOperationsResponse(BaseModel):
+    operations: list[TaskOperationResponse]
 
 
 def content_disposition_filename(filename: str) -> str:
@@ -377,6 +438,36 @@ def build_router() -> APIRouter:
         await asyncio.to_thread(
             _managed_archive(request).open_work_folder,
             aweme_id,
+        )
+        return Response(status_code=204)
+
+    @router.get(
+        "/api/tasks",
+        response_model=TaskOperationsResponse,
+        dependencies=[Depends(require_local_session)],
+    )
+    async def list_task_operations(request: Request) -> TaskOperationsResponse:
+        operations = await asyncio.to_thread(
+            _managed_archive(request).list_task_operations
+        )
+        return TaskOperationsResponse(
+            operations=[
+                TaskOperationResponse.model_validate(operation)
+                for operation in operations
+            ]
+        )
+
+    @router.delete(
+        "/api/tasks/{operation_id}",
+        status_code=204,
+        dependencies=[Depends(require_local_session), Depends(require_same_origin)],
+    )
+    async def clear_task_operation(operation_id: str, request: Request) -> Response:
+        if not operation_id or len(operation_id) > 200:
+            raise AppError("INVALID_INPUT", "任务标识无效。", 400)
+        await asyncio.to_thread(
+            _managed_archive(request).clear_task_operation,
+            operation_id,
         )
         return Response(status_code=204)
 
