@@ -4,6 +4,48 @@
   "archive_url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-01-13-21/ffmpeg-n8.1.2-34-g9b6c8969e0-win64-lgpl-shared-8.1.zip",
   "archive_sha256": "3bba81dcfd017a6ea1627905549769913948831ef10f3e7df7541f736067bff8",
   "version_marker": "n8.1.2-34-g9b6c8969e0",
+  "files": {
+    "bin/avcodec-62.dll": {
+      "size_bytes": 70876672,
+      "sha256": "df6d5452bac5827233e112a9ad21ff7b8acc35f99bb0de1a97e12327d3edccd3"
+    },
+    "bin/avdevice-62.dll": {
+      "size_bytes": 3699712,
+      "sha256": "bebed52f9caf848bacb13463e67e48018968bd20aaf78e76e29585bdb01d7e10"
+    },
+    "bin/avfilter-11.dll": {
+      "size_bytes": 29817856,
+      "sha256": "5875b0bf9f2598e78e8417195d451ff348eec14d8ac7ff236d4e23ec71d0a5e3"
+    },
+    "bin/avformat-62.dll": {
+      "size_bytes": 22070784,
+      "sha256": "9eaab4d320dd6a3c406bf4a1586d5f38794419de6db7044937caf178fc2955c0"
+    },
+    "bin/avutil-60.dll": {
+      "size_bytes": 2937856,
+      "sha256": "de817c6eb71ae79b3c02aef72b2d3ce7bd078e325035e09713c514444bf0d160"
+    },
+    "bin/ffmpeg.exe": {
+      "size_bytes": 542208,
+      "sha256": "f8df8d6173a49bf87e0879f695e6f9522e40af1185b82b3096a16656b84a29a6"
+    },
+    "bin/ffprobe.exe": {
+      "size_bytes": 227840,
+      "sha256": "c18452f173d1c157557cf65455e8d0a6060f53ead244de3a331af2906116aacc"
+    },
+    "bin/swresample-6.dll": {
+      "size_bytes": 723968,
+      "sha256": "bf2fe637f2e972781a9d213c05169df7156395afb7991970dd96c75f35b55e30"
+    },
+    "bin/swscale-9.dll": {
+      "size_bytes": 12570624,
+      "sha256": "c6dd6f63d9e60be056d3b44e2e49b94a2e9ffbf341e9b12762c8ed2ca4a1536c"
+    },
+    "licenses/LICENSE.txt": {
+      "size_bytes": 7651,
+      "sha256": "da7eabb7bafdf7d3ae5e9f223aa5bdc1eece45ac569dc21b3b037520b4464768"
+    }
+  },
   "ffmpeg_commit": "9b6c8969e05b4f0b29f0f85cd501be6b3e582e6b",
   "build_source_commit": "a99e8230eae00d1cee38f23076a7a1f55cd984e2",
   "license_policy": "LGPL build; --enable-gpl and --enable-nonfree are forbidden",

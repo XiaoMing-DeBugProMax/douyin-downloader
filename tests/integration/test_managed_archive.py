@@ -1183,6 +1183,93 @@ async def test_restart_recovers_a_file_promoted_just_before_process_crash(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("audio_outcome", ["ready", "no_audio"])
+async def test_restart_recovers_optional_audio_promotion(
+    tmp_path: Path,
+    audio_outcome: AudioExtractionOutcome,
+) -> None:
+    root = tmp_path / "library"
+    root.mkdir()
+    database = tmp_path / "archive.db"
+    interrupted = ManagedArchive(
+        database_path=database,
+        work_access=StaticWorkAccess(),
+        media_access=StaticMediaAccess(valid_mp4()),
+        audio_tool=RecordingAudioTool(audio_outcome),
+        file_promoter=CrashAfterPromotingFile(),
+    )
+
+    with pytest.raises(SimulatedProcessCrash):
+        await interrupted.archive_single(
+            SingleArchiveRequest(
+                "7429378937383308594",
+                root,
+                profile=ArchiveProfile(include_audio=True),
+            )
+        )
+
+    recovery_audio = RecordingAudioTool(audio_outcome)
+    restarted = ManagedArchive(
+        database_path=database,
+        work_access=UnexpectedWorkAccess(),
+        media_access=UnexpectedMediaAccess(),
+        audio_tool=recovery_audio,
+    )
+    recovered = restarted.get_work_archive("7429378937383308594")
+
+    assert recovered is not None
+    assert recovered.status == "archived"
+    assert recovered.audio_outcome == audio_outcome
+    assert recovery_audio.validations
+    assert recovery_audio.validations[-1][2] == audio_outcome
+    work_directory = root / recovered.relative_directory
+    audio_files = list(work_directory.glob("*.m4a"))
+    assert len(audio_files) == (1 if audio_outcome == "ready" else 0)
+    assert list(root.rglob("*.part")) == []
+
+
+@pytest.mark.asyncio
+async def test_restart_preserves_optional_audio_failure_result(tmp_path: Path) -> None:
+    root = tmp_path / "library"
+    root.mkdir()
+    database = tmp_path / "archive.db"
+    interrupted = ManagedArchive(
+        database_path=database,
+        work_access=StaticWorkAccess(),
+        media_access=StaticMediaAccess(valid_mp4()),
+        audio_tool=FailingAudioTool("extract_failed"),
+        file_promoter=CrashAfterPromotingFile(),
+    )
+
+    with pytest.raises(SimulatedProcessCrash):
+        await interrupted.archive_single(
+            SingleArchiveRequest(
+                "7429378937383308594",
+                root,
+                profile=ArchiveProfile(include_audio=True),
+            )
+        )
+
+    restarted = ManagedArchive(
+        database_path=database,
+        work_access=UnexpectedWorkAccess(),
+        media_access=UnexpectedMediaAccess(),
+        audio_tool=RecordingAudioTool("ready"),
+    )
+    recovered = restarted.get_work_archive("7429378937383308594")
+
+    assert recovered is not None
+    assert recovered.status == "needs_repair"
+    assert recovered.audio_outcome == "extract_failed"
+    with sqlite3.connect(database) as connection:
+        operation_result = connection.execute(
+            "SELECT result FROM archive_operations"
+        ).fetchone()
+    assert operation_result == ("partial_success",)
+    assert list(root.rglob("*.part")) == []
+
+
+@pytest.mark.asyncio
 async def test_status_audit_waits_for_active_promotion(tmp_path: Path) -> None:
     root = tmp_path / "library"
     root.mkdir()

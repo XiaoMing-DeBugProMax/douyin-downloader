@@ -60,11 +60,9 @@ def provision_from_archive(
     try:
         _extract_distribution(archive_path, staging)
         audit = _audit_distribution(staging, manifest, command_runner)
+        _validate_pinned_files(audit, manifest)
         audit_path = staging / "audit.json"
-        audit_path.write_text(
-            json.dumps(audit, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
+        _write_audit(audit_path, audit)
         output_directory.parent.mkdir(parents=True, exist_ok=True)
         staging.replace(output_directory)
     except Exception:
@@ -141,8 +139,9 @@ def _audit_distribution(
             "size_bytes": path.stat().st_size,
             "sha256": _sha256(path),
         }
-        for path in sorted((directory / "bin").iterdir())
-        if path.is_file()
+        for root in (directory / "bin", directory / "licenses")
+        for path in sorted(root.iterdir())
+        if path.is_file() and path.name != "audit.json"
     }
     return {
         "release_tag": _required_text(manifest, "release_tag"),
@@ -172,20 +171,30 @@ def _validate_existing(
     runner: CommandRunner,
 ) -> Path:
     audit_path = directory / "audit.json"
-    audit = load_manifest(audit_path)
-    if audit.get("release_tag") != manifest.get("release_tag"):
-        raise ProvisionError("existing FFmpeg release does not match the manifest")
-    files = audit.get("files")
-    if not isinstance(files, dict):
-        raise ProvisionError("existing FFmpeg audit is incomplete")
-    for relative, identity in files.items():
-        if not isinstance(relative, str) or not isinstance(identity, dict):
-            raise ProvisionError("existing FFmpeg audit is invalid")
-        path = directory / Path(relative)
-        if not path.is_file() or _sha256(path) != identity.get("sha256"):
-            raise ProvisionError("existing FFmpeg file hash mismatch")
-    _audit_distribution(directory, manifest, runner)
+    audit = _audit_distribution(directory, manifest, runner)
+    _validate_pinned_files(audit, manifest)
+    _write_audit(audit_path, audit)
     return audit_path
+
+
+def _validate_pinned_files(
+    audit: dict[str, Any],
+    manifest: dict[str, Any],
+) -> None:
+    pinned = manifest.get("files")
+    if not isinstance(pinned, dict) or not pinned:
+        raise ProvisionError("FFmpeg pinned manifest file list is missing")
+    if audit.get("files") != pinned:
+        raise ProvisionError("FFmpeg files do not match the pinned manifest")
+
+
+def _write_audit(path: Path, audit: dict[str, Any]) -> None:
+    temporary = path.with_name(f".{path.name}.part")
+    temporary.write_text(
+        json.dumps(audit, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
 
 
 def _run_identity_command(argv: tuple[str, ...]) -> CompletedProcess[str]:

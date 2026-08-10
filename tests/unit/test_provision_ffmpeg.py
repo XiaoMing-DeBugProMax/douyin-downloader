@@ -18,6 +18,13 @@ from scripts.provision_ffmpeg import (
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
+def _file_identity(content: bytes) -> dict[str, int | str]:
+    return {
+        "size_bytes": len(content),
+        "sha256": hashlib.sha256(content).hexdigest(),
+    }
+
+
 def test_distribution_manifest_pins_an_immutable_lgpl_build() -> None:
     manifest = load_manifest(PROJECT_ROOT / "third_party" / "ffmpeg" / "manifest.json")
 
@@ -54,6 +61,14 @@ def test_pinned_archive_is_safely_extracted_and_audited(tmp_path: Path) -> None:
         "archive_sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
         "version_marker": "n8.1.2-34-g9b6c8969e0",
         "release_tag": "fixture",
+        "files": {
+            "bin/avcodec.dll": _file_identity(b"shared-library"),
+            "bin/ffmpeg.exe": _file_identity(b"ffmpeg-binary"),
+            "bin/ffprobe.exe": _file_identity(b"ffprobe-binary"),
+            "licenses/LICENSE.txt": _file_identity(
+                b"GNU Lesser General Public License"
+            ),
+        },
     }
     calls: list[tuple[str, ...]] = []
 
@@ -89,4 +104,52 @@ def test_pinned_archive_is_safely_extracted_and_audited(tmp_path: Path) -> None:
     assert audit["files"]["bin/ffprobe.exe"]["sha256"] == hashlib.sha256(
         b"ffprobe-binary"
     ).hexdigest()
+    assert "licenses/LICENSE.txt" in audit["files"]
     assert len(calls) == 4
+
+
+def test_cached_distribution_rejects_files_outside_the_pinned_manifest(
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / "ffmpeg.zip"
+    entries = {
+        "ffmpeg-build/bin/ffmpeg.exe": b"ffmpeg-binary",
+        "ffmpeg-build/bin/ffprobe.exe": b"ffprobe-binary",
+        "ffmpeg-build/bin/avcodec.dll": b"shared-library",
+        "ffmpeg-build/LICENSE.txt": b"GNU Lesser General Public License",
+    }
+    with zipfile.ZipFile(archive, "w") as bundle:
+        for name, content in entries.items():
+            bundle.writestr(name, content)
+    manifest = {
+        "archive_sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+        "version_marker": "n8.1.2-34-g9b6c8969e0",
+        "release_tag": "fixture",
+        "files": {
+            "bin/avcodec.dll": _file_identity(b"shared-library"),
+            "bin/ffmpeg.exe": _file_identity(b"ffmpeg-binary"),
+            "bin/ffprobe.exe": _file_identity(b"ffprobe-binary"),
+            "licenses/LICENSE.txt": _file_identity(
+                b"GNU Lesser General Public License"
+            ),
+        },
+    }
+
+    def identify(argv: tuple[str, ...]) -> CompletedProcess[str]:
+        output = (
+            "ffmpeg version n8.1.2-34-g9b6c8969e0\n"
+            if argv[-1] == "-version"
+            else "configuration: --disable-network\n"
+        )
+        return CompletedProcess(argv, 0, output, "")
+
+    output = tmp_path / "ffmpeg"
+    audit_path = provision_from_archive(archive, output, manifest, runner=identify)
+    unexpected = output / "bin" / "injected.dll"
+    unexpected.write_bytes(b"not-from-the-pinned-archive")
+    audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    audit["files"]["bin/injected.dll"] = _file_identity(unexpected.read_bytes())
+    audit_path.write_text(json.dumps(audit), encoding="utf-8")
+
+    with pytest.raises(ProvisionError, match="pinned manifest"):
+        provision_from_archive(archive, output, manifest, runner=identify)

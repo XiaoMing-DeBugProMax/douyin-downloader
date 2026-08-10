@@ -402,7 +402,7 @@ class ManagedArchive:
                     promotion.relative_directory,
                     create=False,
                 ) as output_directory:
-                    self._artifact_pipeline.recover(
+                    result = self._artifact_pipeline.recover(
                         output_directory,
                         promotion.aweme_id,
                         promotion.artifacts,
@@ -410,6 +410,7 @@ class ManagedArchive:
                     self._store.finish_promotion(
                         promotion.ids,
                         promotion.aweme_id,
+                        result,
                     )
             except Exception:
                 self._store.discard_promotion(promotion)

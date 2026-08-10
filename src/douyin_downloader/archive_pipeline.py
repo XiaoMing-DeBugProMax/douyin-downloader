@@ -21,6 +21,10 @@ from douyin_downloader.audio_artifacts import AudioArtifactError, AudioArtifactT
 from douyin_downloader.domain import AppError, ResolvedWork
 from douyin_downloader.settings import ArchiveProfile
 
+_AUDIO_FAILURE_STATUSES = frozenset(
+    {"probe_failed", "extract_failed", "validation_failed"}
+)
+
 
 @dataclass(frozen=True, slots=True)
 class PreparedArchive:
@@ -236,8 +240,7 @@ class ArchiveArtifactPipeline:
                 result=(
                     "partial_success"
                     if any(
-                        artifact.status
-                        in {"probe_failed", "extract_failed", "validation_failed"}
+                        artifact.status in _AUDIO_FAILURE_STATUSES
                         for artifact in file_artifacts
                     )
                     else "success"
@@ -272,11 +275,7 @@ class ArchiveArtifactPipeline:
                         self._audio_tool.validate(video_path, None, "no_audio")
                         valid["audio"] = registration
                         continue
-                    if registration.status in {
-                        "probe_failed",
-                        "extract_failed",
-                        "validation_failed",
-                    }:
+                    if registration.status in _AUDIO_FAILURE_STATUSES:
                         continue
                 except (AudioArtifactError, AppError, OSError):
                     continue
@@ -355,15 +354,20 @@ class ArchiveArtifactPipeline:
         output_directory: Path,
         aweme_id: str,
         artifacts: tuple[ArtifactRecord, ...],
-    ) -> None:
+    ) -> str:
         kinds = {artifact.kind for artifact in artifacts}
         if not {"video", "cover", "metadata"}.issubset(kinds) or not kinds.issubset(
-            {"video", "cover", "description", "metadata"}
+            {"video", "cover", "audio", "description", "metadata"}
         ):
             raise archive_failed()
         part_paths: list[Path] = []
         try:
             for artifact in artifacts:
+                if artifact.kind == "audio" and artifact.status in {
+                    "no_audio",
+                    *_AUDIO_FAILURE_STATUSES,
+                }:
+                    continue
                 final_path = registered_path(
                     output_directory,
                     artifact.relative_path,
@@ -381,9 +385,32 @@ class ArchiveArtifactPipeline:
                     _validate_registered_artifact(part_path, artifact, aweme_id)
                     part_path.replace(final_path)
                 _validate_registered_artifact(final_path, artifact, aweme_id)
+
+            registrations = {artifact.kind: artifact for artifact in artifacts}
+            audio = registrations.get("audio")
+            if audio is not None and audio.status not in _AUDIO_FAILURE_STATUSES:
+                video = registrations["video"]
+                video_path = registered_path(output_directory, video.relative_path)
+                if audio.status == "no_audio":
+                    self._audio_tool.validate(video_path, None, "no_audio")
+                else:
+                    self._audio_tool.validate(
+                        video_path,
+                        registered_path(output_directory, audio.relative_path),
+                        "ready",
+                    )
         except Exception:
             _discard_paths(part_paths)
             raise
+        return (
+            "partial_success"
+            if any(
+                artifact.kind == "audio"
+                and artifact.status in _AUDIO_FAILURE_STATUSES
+                for artifact in artifacts
+            )
+            else "success"
+        )
 
 
 async def _write_remote(remote: RemoteArtifact, part_path: Path) -> None:
