@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import math
+import secrets
 import threading
 import time
 import weakref
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
+from enum import Enum
 from pathlib import Path
 from typing import Protocol
 from uuid import uuid4
@@ -19,6 +21,7 @@ from douyin_downloader.archive_adapters import (
     HttpMediaAccess,
     MediaAccess,
     RemoteArtifact,
+    RemoteResumeRequest,
     WindowsDirectoryChooser,
     WindowsFolderOpener,
 )
@@ -40,7 +43,12 @@ from douyin_downloader.audio_artifacts import (
     AudioArtifactTool,
     FfmpegAudioArtifactTool,
 )
-from douyin_downloader.domain import AppError, ResolvedWork
+from douyin_downloader.domain import (
+    AppError,
+    ResolvedWork,
+    TransientUpstreamError,
+    TransientUpstreamTimeout,
+)
 from douyin_downloader.resources import ffmpeg_executable_path, ffprobe_executable_path
 from douyin_downloader.settings import (
     ArchiveProfile,
@@ -60,6 +68,7 @@ __all__ = [
     "HttpMediaAccess",
     "ManagedArchive",
     "RemoteArtifact",
+    "RemoteResumeRequest",
     "SingleArchiveRequest",
     "TaskSnapshot",
     "WindowsDirectoryChooser",
@@ -250,12 +259,17 @@ class _TaskProgressRecorder:
         await self._persist()
         await self._controller.checkpoint()
 
-    async def remote_started(self, expected_size: int | None) -> None:
+    async def remote_started(
+        self,
+        expected_size: int | None,
+        existing_bytes: int = 0,
+    ) -> None:
         self._remaining_remote_artifacts -= 1
         if expected_size is None:
             self._all_sizes_known = False
         else:
             self._known_total += expected_size
+        self._completed_bytes += existing_bytes
         await self._persist()
         await self._controller.checkpoint()
 
@@ -304,6 +318,27 @@ class WorkAccess(Protocol):
     async def fetch_work(self, aweme_id: str) -> ResolvedWork: ...
 
 
+class RetryDelay(Protocol):
+    async def wait(self, attempt: int) -> None: ...
+
+
+class _JitteredRetryDelay:
+    async def wait(self, attempt: int) -> None:
+        base_seconds = min(0.25 * (2 ** (attempt - 1)), 4.0)
+        await asyncio.sleep(base_seconds * secrets.SystemRandom().uniform(0.75, 1.25))
+
+
+class _TaskRestartMode(Enum):
+    CONTINUE = "continue"
+    RETRY_FAILED = "retry_failed"
+
+
+@dataclass(frozen=True, slots=True)
+class _TaskRestart:
+    ids: TaskIds
+    mode: _TaskRestartMode
+
+
 class ManagedArchive:
     def __init__(
         self,
@@ -314,6 +349,7 @@ class ManagedArchive:
         audio_tool: AudioArtifactTool | None = None,
         folder_opener: FolderOpener | None = None,
         file_promoter: FilePromoter | None = None,
+        retry_delay: RetryDelay | None = None,
     ) -> None:
         self._store = ArchiveStore(database_path)
         self._store.interrupt_running_tasks()
@@ -328,6 +364,7 @@ class ManagedArchive:
         )
         self._folder_opener = folder_opener or WindowsFolderOpener()
         self._file_promoter = file_promoter or AtomicFilePromoter()
+        self._retry_delay = retry_delay or _JitteredRetryDelay()
         self._integrity_locks: weakref.WeakValueDictionary[
             str,
             threading.Lock,
@@ -364,6 +401,7 @@ class ManagedArchive:
         self,
         aweme_id: str,
         settings: OperationSettingsSnapshot,
+        restart: _TaskRestart | None = None,
     ) -> ArchiveOperationSnapshot:
         root = settings.archive_root
         existing = await run_in_thread_cancellation_safe(
@@ -411,70 +449,94 @@ class ManagedArchive:
             existing_relative_directory = existing.stored.relative_directory
             valid_artifacts = existing.valid_artifacts
 
-        ids = TaskIds(uuid4().hex, uuid4().hex, uuid4().hex)
+        ids = restart.ids if restart is not None else TaskIds(uuid4().hex, uuid4().hex, uuid4().hex)
         prepared: PreparedArchive | None = None
         promotion_started = False
         operation_result = "success"
         controller: _TaskController | None = None
+        relative_directory: Path | None = None
         try:
-            self._store.create_running(ids, aweme_id, settings)
+            if restart is None:
+                self._store.create_running(ids, aweme_id, settings)
+            elif restart.mode is _TaskRestartMode.RETRY_FAILED:
+                self._store.restart_failed(ids)
+            else:
+                self._store.restart_interrupted(ids)
             controller = _TaskController(self._store, ids)
             self._register_task_control(ids, controller)
-            progress = _TaskProgressRecorder(
-                self._store,
-                ids,
-                int("video" not in valid_artifacts)
-                + int("cover" not in valid_artifacts),
-                controller,
-            )
-            resolved = await self._work_access.fetch_work(aweme_id)
-            await controller.checkpoint()
-            if resolved.snapshot.aweme_id != aweme_id:
-                raise AppError(
-                    "UPSTREAM_BLOCKED",
-                    "解析服务暂时不可用，请稍后重试。",
-                    502,
-                )
-            relative_directory = (
-                existing_relative_directory
-                if existing_relative_directory is not None
-                else work_directory(resolved)
-            )
-            with pin_work_directory(
-                root,
-                relative_directory,
-                create=True,
-            ) as output_directory:
-                base_name = settings.artifact_base_name(resolved)
-                registered_artifacts: dict[str, ArtifactRecord] = (
-                    {artifact.kind: artifact for artifact in existing.stored.artifacts}
-                    if existing is not None
-                    else {}
-                )
-                prepared = await self._artifact_pipeline.prepare(
-                    output_directory,
-                    aweme_id,
-                    ids.operation,
-                    resolved,
-                    valid_artifacts,
-                    registered_artifacts,
-                    base_name,
-                    settings.profile,
-                    progress,
-                )
-                operation_result = prepared.result
-                await progress.set_phase("promoting")
-                self._store.prepare_promotion(
+            for attempt in range(settings.retry_limit + 1):
+                prepared = None
+                progress = _TaskProgressRecorder(
+                    self._store,
                     ids,
-                    aweme_id,
-                    root,
-                    relative_directory,
-                    prepared.artifacts,
+                    int("video" not in valid_artifacts)
+                    + int("cover" not in valid_artifacts),
+                    controller,
                 )
-                promotion_started = True
-                for part_path, final_path in prepared.promotions:
-                    self._file_promoter.promote(part_path, final_path)
-                self._store.finish_promotion(ids, aweme_id, operation_result)
+                try:
+                    await progress.set_phase("resolving")
+                    resolved = await self._work_access.fetch_work(aweme_id)
+                    await controller.checkpoint()
+                    if resolved.snapshot.aweme_id != aweme_id:
+                        raise AppError(
+                            "UPSTREAM_BLOCKED",
+                            "解析服务暂时不可用，请稍后重试。",
+                            502,
+                        )
+                    relative_directory = (
+                        existing_relative_directory
+                        if existing_relative_directory is not None
+                        else work_directory(resolved)
+                    )
+                    with pin_work_directory(
+                        root,
+                        relative_directory,
+                        create=True,
+                    ) as output_directory:
+                        base_name = settings.artifact_base_name(resolved)
+                        registered_artifacts: dict[str, ArtifactRecord] = (
+                            {
+                                artifact.kind: artifact
+                                for artifact in existing.stored.artifacts
+                            }
+                            if existing is not None
+                            else {}
+                        )
+                        prepared = await self._artifact_pipeline.prepare(
+                            output_directory,
+                            aweme_id,
+                            ids.operation,
+                            resolved,
+                            valid_artifacts,
+                            registered_artifacts,
+                            base_name,
+                            settings.profile,
+                            progress,
+                        )
+                        operation_result = prepared.result
+                        await progress.set_phase("promoting")
+                        self._store.prepare_promotion(
+                            ids,
+                            aweme_id,
+                            root,
+                            relative_directory,
+                            prepared.artifacts,
+                        )
+                        promotion_started = True
+                        for part_path, final_path in prepared.promotions:
+                            self._file_promoter.promote(part_path, final_path)
+                        self._store.finish_promotion(
+                            ids,
+                            aweme_id,
+                            operation_result,
+                        )
+                    break
+                except Exception as error:
+                    if promotion_started or not _is_transient_failure(error):
+                        raise
+                    if attempt == settings.retry_limit:
+                        raise _retry_exhausted(error) from error
+                    await self._retry_delay.wait(attempt + 1)
         except TaskCancellation as cancellation:
             if not promotion_started:
                 if prepared is not None and not cancellation.retain_parts:
@@ -494,6 +556,8 @@ class ManagedArchive:
                 controller.mark_stopped()
                 self._unregister_task_control(ids)
 
+        if relative_directory is None:
+            raise AssertionError("archive attempt must resolve a work directory")
         return _archive_snapshot(
             ids,
             aweme_id,
@@ -539,9 +603,45 @@ class ManagedArchive:
 
     async def resume_task(self, task_id: str) -> TaskCenterOperationSnapshot:
         controller = self._task_controls.get(task_id)
-        if controller is None:
-            raise AppError("TASK_CONTROL_UNAVAILABLE", "该任务当前不能继续。", 409)
-        await controller.resume()
+        if controller is not None:
+            await controller.resume()
+            return self._task_operation_for(task_id)
+        return await self._restart_persisted_task(task_id, _TaskRestartMode.CONTINUE)
+
+    async def _restart_persisted_task(
+        self,
+        task_id: str,
+        mode: _TaskRestartMode,
+    ) -> TaskCenterOperationSnapshot:
+        operation = self._store.load_task_operation(task_id)
+        if operation is None:
+            raise AppError("TASK_NOT_FOUND", "没有找到该任务记录。", 404)
+        unavailable_message = (
+            "该任务当前不能继续。"
+            if mode is _TaskRestartMode.CONTINUE
+            else "该任务当前不能重试。"
+        )
+        allowed = (
+            operation.task.lifecycle == "interrupted"
+            if mode is _TaskRestartMode.CONTINUE
+            else operation.task.lifecycle == "finished" and operation.task.result == "failed"
+        )
+        if not allowed:
+            raise AppError("TASK_CONTROL_UNAVAILABLE", unavailable_message, 409)
+        if len(operation.source_tasks) != 1 or len(operation.source_tasks[0].work_tasks) != 1:
+            raise AppError("TASK_CONTROL_UNAVAILABLE", unavailable_message, 409)
+        source = operation.source_tasks[0]
+        work = source.work_tasks[0]
+        ids = TaskIds(operation.task.task_id, source.task.task_id, work.task.task_id)
+        settings = self._store.load_operation_settings(operation.task.task_id)
+        if settings is None:
+            raise AppError("TASK_CONTROL_UNAVAILABLE", unavailable_message, 409)
+        async with _hold_thread_lock(self._integrity_lock(work.aweme_id)):
+            await self._archive_single_locked(
+                work.aweme_id,
+                settings,
+                restart=_TaskRestart(ids, mode),
+            )
         return self._task_operation_for(task_id)
 
     async def cancel_task(
@@ -558,6 +658,9 @@ class ManagedArchive:
             raise AppError("TASK_CONTROL_UNAVAILABLE", "该任务当前不能取消。", 409)
         await controller.cancel(retain_parts=retain_parts)
         return self._task_operation_for(task_id)
+
+    async def retry_task(self, task_id: str) -> TaskCenterOperationSnapshot:
+        return await self._restart_persisted_task(task_id, _TaskRestartMode.RETRY_FAILED)
 
     def clear_task_operation(self, operation_id: str) -> None:
         outcome = self._store.clear_task_operation(operation_id)
@@ -789,6 +892,11 @@ _TASK_ERRORS = {
         "解析服务暂时不可用。",
         "请稍后重试此归档操作。",
     ),
+    "UPSTREAM_TIMEOUT": TaskErrorSnapshot(
+        "UPSTREAM_TIMEOUT",
+        "连接远端服务超时。",
+        "请稍后重试此归档操作。",
+    ),
     "VIDEO_NOT_FOUND": TaskErrorSnapshot(
         "VIDEO_NOT_FOUND",
         "没有找到该作品。",
@@ -815,6 +923,43 @@ _TASK_ERRORS = {
         "请检查归档位置后重试。",
     ),
 }
+
+
+def _is_transient_failure(error: BaseException) -> bool:
+    return _failure_chain_contains(
+        error,
+        (TransientUpstreamError,),
+    )
+
+
+def _failure_chain_contains(
+    error: BaseException,
+    expected: tuple[type[BaseException], ...],
+) -> bool:
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        if isinstance(current, expected):
+            return True
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _retry_exhausted(error: Exception) -> AppError:
+    if _failure_chain_contains(error, (TransientUpstreamTimeout,)):
+        return AppError(
+            "UPSTREAM_TIMEOUT",
+            "连接远端服务超时，请稍后重试。",
+            504,
+        )
+    if isinstance(error, AppError):
+        return error
+    return AppError(
+        "UPSTREAM_BLOCKED",
+        "解析服务暂时不可用，请稍后重试。",
+        502,
+    )
 
 
 def _task_error_code(error: Exception) -> str:

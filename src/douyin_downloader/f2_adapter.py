@@ -18,6 +18,7 @@ from douyin_downloader.domain import (
     PublicMetrics,
     ResolvedWork,
     TransientUpstreamError,
+    TransientUpstreamTimeout,
     WorkSnapshot,
 )
 
@@ -237,6 +238,10 @@ def _raise_for_upstream_status(
     status = response.status_code
     if status == 404 and not_found_is_video:
         raise AppError("VIDEO_NOT_FOUND", _NOT_FOUND_MESSAGE, 404)
+    if status == 429:
+        raise AppError("UPSTREAM_BLOCKED", _BLOCKED_MESSAGE, 502) from (
+            TransientUpstreamError("HTTP 429")
+        )
     if 500 <= status <= 599:
         raise TransientUpstreamError(f"HTTP {status}")
     if status < 200 or status >= 300:
@@ -266,7 +271,7 @@ async def _load_f2_runtime_and_guest(aweme_id: str) -> _F2Runtime:
                 },
             )
         except httpx.TimeoutException as error:
-            raise TimeoutError from error
+            raise TransientUpstreamTimeout from error
         except httpx.NetworkError as error:
             raise TransientUpstreamError(type(error).__name__) from error
         _raise_for_upstream_status(ttwid_response, not_found_is_video=False)
@@ -312,7 +317,7 @@ class _PostDetailCrawler:
                 follow_redirects=False,
             )
         except httpx.TimeoutException as error:
-            raise TimeoutError from error
+            raise TransientUpstreamTimeout from error
         except httpx.NetworkError as error:
             raise TransientUpstreamError(type(error).__name__) from error
         _raise_for_upstream_status(response, not_found_is_video=True)

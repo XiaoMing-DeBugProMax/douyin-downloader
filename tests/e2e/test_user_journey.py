@@ -701,6 +701,101 @@ def test_task_controls_pause_resume_and_confirm_part_retention(
     expect(card.get_by_role("button", name="取消")).to_have_count(0)
 
 
+def test_interrupted_continue_and_failed_work_retry_require_user_action(
+    page: Page,
+    local_app_url: str,
+) -> None:
+    def task(task_id: str, lifecycle: str, result: str) -> dict[str, object]:
+        return {
+            "task_id": task_id,
+            "lifecycle": lifecycle,
+            "phase": "idle",
+            "result": result,
+            "progress": {
+                "completed_items": 0,
+                "total_items": 1,
+                "completed_bytes": 512,
+                "total_bytes": 1024,
+                "percentage": 50.0,
+                "speed_bytes_per_second": None,
+                "eta_seconds": None,
+            },
+            "error": None,
+        }
+
+    interrupted = {
+        "task": task("interrupted-operation", "interrupted", "none"),
+        "source_tasks": [
+            {
+                "task": task("interrupted-source", "interrupted", "none"),
+                "work_tasks": [
+                    {
+                        "aweme_id": "7429378937383308594",
+                        "task": task("interrupted-work", "interrupted", "none"),
+                    }
+                ],
+            }
+        ],
+    }
+    failed = {
+        "task": task("failed-operation", "finished", "failed"),
+        "source_tasks": [
+            {
+                "task": task("failed-source", "finished", "failed"),
+                "work_tasks": [
+                    {
+                        "aweme_id": "7429378937383308595",
+                        "task": task("failed-work", "finished", "failed"),
+                    }
+                ],
+            }
+        ],
+    }
+    operations = [interrupted, failed]
+    control_requests: list[str] = []
+
+    def set_running(operation: dict[str, object]) -> None:
+        operation["task"]["lifecycle"] = "running"
+        operation["task"]["phase"] = "resolving"
+        operation["task"]["result"] = "none"
+        source = operation["source_tasks"][0]
+        source["task"]["lifecycle"] = "running"
+        source["task"]["phase"] = "resolving"
+        source["task"]["result"] = "none"
+        work = source["work_tasks"][0]["task"]
+        work["lifecycle"] = "running"
+        work["phase"] = "resolving"
+        work["result"] = "none"
+
+    def handle_tasks(route: Route) -> None:
+        if route.request.method == "GET":
+            route.fulfill(status=200, json={"operations": operations})
+            return
+        control_requests.append(route.request.url)
+        operation = interrupted if route.request.url.endswith("/resume") else failed
+        set_running(operation)
+        route.fulfill(status=200, json=operation)
+
+    page.route("**/api/tasks**", handle_tasks)
+    page.goto(local_app_url)
+    page.get_by_role("tab", name="任务中心", exact=True).click()
+
+    assert control_requests == []
+    interrupted_card = page.locator(".task-operation").filter(
+        has_text="interrupted-operation"
+    )
+    interrupted_card.get_by_role("button", name="继续").click()
+    assert control_requests[-1].endswith("/api/tasks/interrupted-operation/resume")
+    expect(interrupted_card.locator(":scope > .task-state-fields")).to_contain_text(
+        "活动"
+    )
+
+    failed_card = page.locator(".task-operation").filter(has_text="failed-operation")
+    failed_card.locator(".task-work-details summary").click()
+    failed_card.locator(".task-work").get_by_role("button", name="重试").click()
+    assert control_requests[-1].endswith("/api/tasks/failed-work/retry")
+
+
 def test_light_theme_small_text_meets_wcag_aa(page: Page, local_app_url: str) -> None:
     page.goto(local_app_url)
     for selector, background, pseudo in (

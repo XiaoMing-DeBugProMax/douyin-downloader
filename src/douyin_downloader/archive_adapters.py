@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,10 +17,24 @@ class RemoteArtifact:
     content_type: str
     expected_size: int | None
     chunks: AsyncIterator[bytes]
+    resume_offset: int = 0
+    resume_validator: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RemoteResumeRequest:
+    offset: int
+    total_size: int
+    validator: str
 
 
 class MediaAccess(Protocol):
-    async def open_video(self, cdn_mirror_urls: tuple[str, ...]) -> RemoteArtifact: ...
+    async def open_video(
+        self,
+        cdn_mirror_urls: tuple[str, ...],
+        *,
+        resume: RemoteResumeRequest | None = None,
+    ) -> RemoteArtifact: ...
 
     async def open_cover(self, cdn_mirror_urls: tuple[str, ...]) -> RemoteArtifact: ...
 
@@ -28,8 +43,13 @@ class HttpMediaAccess:
     def __init__(self, client: httpx.AsyncClient) -> None:
         self._client = client
 
-    async def open_video(self, cdn_mirror_urls: tuple[str, ...]) -> RemoteArtifact:
-        return await self._open(cdn_mirror_urls, "video")
+    async def open_video(
+        self,
+        cdn_mirror_urls: tuple[str, ...],
+        *,
+        resume: RemoteResumeRequest | None = None,
+    ) -> RemoteArtifact:
+        return await self._open(cdn_mirror_urls, "video", resume=resume)
 
     async def open_cover(self, cdn_mirror_urls: tuple[str, ...]) -> RemoteArtifact:
         return await self._open(cdn_mirror_urls, "cover")
@@ -38,12 +58,41 @@ class HttpMediaAccess:
         self,
         cdn_mirror_urls: tuple[str, ...],
         kind: Literal["cover", "video"],
+        *,
+        resume: RemoteResumeRequest | None = None,
     ) -> RemoteArtifact:
-        upstream = await open_first_available(
-            self._client,
-            cdn_mirror_urls,
-            kind,
-        )
+        upstream = None
+        if kind == "video" and resume is not None:
+            try:
+                upstream = await open_first_available(
+                    self._client,
+                    cdn_mirror_urls,
+                    kind,
+                    request_headers={
+                        "Range": f"bytes={resume.offset}-",
+                        "If-Range": resume.validator,
+                    },
+                    allow_partial=True,
+                )
+            except Exception:
+                upstream = None
+            if upstream is not None and upstream.response.status_code == 206:
+                if _matches_resume_response(upstream.response, resume):
+                    return RemoteArtifact(
+                        content_type=upstream.content_type,
+                        expected_size=resume.total_size,
+                        chunks=upstream.iter_bytes(),
+                        resume_offset=resume.offset,
+                        resume_validator=resume.validator,
+                    )
+                await upstream.response.aclose()
+                upstream = None
+        if upstream is None or upstream.response.status_code != 200:
+            upstream = await open_first_available(
+                self._client,
+                cdn_mirror_urls,
+                kind,
+            )
         raw_length = upstream.response.headers.get("content-length")
         expected_size: int | None = None
         if raw_length is not None:
@@ -57,7 +106,42 @@ class HttpMediaAccess:
             content_type=upstream.content_type,
             expected_size=expected_size,
             chunks=upstream.iter_bytes(),
+            resume_validator=_response_validator(upstream.response),
         )
+
+
+def _response_validator(response: httpx.Response) -> str | None:
+    raw_etag = response.headers.get("etag")
+    etag = str(raw_etag) if raw_etag is not None else None
+    if etag and not etag.startswith("W/"):
+        return etag
+    raw_last_modified = response.headers.get("last-modified")
+    return str(raw_last_modified) if raw_last_modified is not None else None
+
+
+def _matches_resume_response(
+    response: httpx.Response,
+    resume: RemoteResumeRequest,
+) -> bool:
+    validator = _response_validator(response)
+    match = re.fullmatch(
+        r"bytes (\d+)-(\d+)/(\d+)",
+        response.headers.get("content-range", ""),
+    )
+    if validator != resume.validator or match is None:
+        return False
+    start, end, total = (int(value) for value in match.groups())
+    raw_length = response.headers.get("content-length")
+    try:
+        content_length = int(raw_length) if raw_length is not None else -1
+    except ValueError:
+        return False
+    return (
+        start == resume.offset
+        and total == resume.total_size
+        and end == total - 1
+        and content_length == total - start
+    )
 
 
 class FolderOpener(Protocol):

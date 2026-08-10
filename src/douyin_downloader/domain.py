@@ -115,3 +115,7 @@ class AppError(Exception):
 
 class TransientUpstreamError(Exception):
     pass
+
+
+class TransientUpstreamTimeout(TransientUpstreamError, TimeoutError):
+    pass

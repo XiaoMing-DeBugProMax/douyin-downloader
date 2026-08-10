@@ -352,18 +352,23 @@ function openCancelDialog(taskId) {
   taskCancelDialog.showModal();
 }
 
-function taskControlActions(task) {
+function taskControlActions(task, allowRetry = false) {
   const actions = createElement("div", "task-control-actions");
   if (task.lifecycle === "running") {
     const pause = createElement("button", "button button-secondary task-pause", "暂停");
     pause.type = "button";
     pause.addEventListener("click", () => controlTask(task.task_id, "pause", pause));
     actions.append(pause);
-  } else if (task.lifecycle === "paused") {
+  } else if (task.lifecycle === "paused" || task.lifecycle === "interrupted") {
     const resume = createElement("button", "button button-primary task-resume", "继续");
     resume.type = "button";
     resume.addEventListener("click", () => controlTask(task.task_id, "resume", resume));
     actions.append(resume);
+  } else if (allowRetry && task.lifecycle === "finished" && task.result === "failed") {
+    const retry = createElement("button", "button button-primary task-retry", "重试");
+    retry.type = "button";
+    retry.addEventListener("click", () => controlTask(task.task_id, "retry", retry));
+    actions.append(retry);
   }
   if (task.lifecycle === "running" || task.lifecycle === "paused") {
     const cancel = createElement("button", "button button-quiet task-cancel", "取消");
@@ -379,7 +384,7 @@ function renderWorkTask(work) {
   const heading = createElement("div", "task-work-heading");
   heading.append(
     createElement("h4", "", `作品 ${work.aweme_id}`),
-    taskControlActions(work.task),
+    taskControlActions(work.task, true),
   );
   node.append(
     heading,

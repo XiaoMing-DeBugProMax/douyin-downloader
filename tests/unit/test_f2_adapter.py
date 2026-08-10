@@ -8,7 +8,7 @@ from typing import Any
 import httpx
 import pytest
 
-from douyin_downloader.domain import AppError
+from douyin_downloader.domain import AppError, TransientUpstreamError
 from douyin_downloader.f2_adapter import (
     F2VideoParser,
     map_post_detail,
@@ -326,6 +326,8 @@ async def test_parse_service_retries_only_retryable_detail_failures(
 
     assert error.value.code == expected_code
     assert requests == expected_requests
+    if outcome == "rate_limited":
+        assert isinstance(error.value.__cause__, TransientUpstreamError)
 
 
 @pytest.mark.asyncio

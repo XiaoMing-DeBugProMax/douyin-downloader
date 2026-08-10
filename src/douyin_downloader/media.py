@@ -1,14 +1,19 @@
 import logging
 import re
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from typing import Literal
 from urllib.parse import urlsplit
 
 import httpx
 
-from douyin_downloader.domain import AppError, ParsedVideo
+from douyin_downloader.domain import (
+    AppError,
+    ParsedVideo,
+    TransientUpstreamError,
+    TransientUpstreamTimeout,
+)
 from douyin_downloader.logging_config import log_operation
 
 _LOGGER = logging.getLogger("douyin_downloader")
@@ -19,6 +24,19 @@ INVALID_WINDOWS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 def _download_error() -> AppError:
     return AppError("DOWNLOAD_FAILED", "下载失败，请重新解析后重试。", 502)
+
+
+def _log_download_failure(
+    operation: Literal["cover", "download"],
+    started_at: float,
+) -> None:
+    log_operation(
+        _LOGGER,
+        operation=operation,
+        error_code="DOWNLOAD_FAILED",
+        elapsed_ms=int((time.monotonic() - started_at) * 1000),
+        bytes_streamed=0,
+    )
 
 
 def _host_matches(host: str, suffixes: tuple[str, ...]) -> bool:
@@ -69,6 +87,12 @@ class UpstreamStream:
                 if chunk:
                     bytes_streamed += len(chunk)
                     yield chunk
+        except httpx.TimeoutException as error:
+            error_code = "STREAM_INTERRUPTED"
+            raise TransientUpstreamTimeout(type(error).__name__) from error
+        except httpx.TransportError as error:
+            error_code = "STREAM_INTERRUPTED"
+            raise TransientUpstreamError(type(error).__name__) from error
         except BaseException:
             error_code = "STREAM_INTERRUPTED"
             raise
@@ -89,45 +113,47 @@ async def open_upstream(
     client: httpx.AsyncClient,
     url: str,
     kind: Literal["cover", "video"],
+    *,
+    request_headers: Mapping[str, str] | None = None,
+    allow_partial: bool = False,
 ) -> UpstreamStream:
     started_at = time.monotonic()
     operation: Literal["cover", "download"] = "download" if kind == "video" else "cover"
     try:
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://www.douyin.com/",
+        }
+        if request_headers is not None:
+            headers.update(request_headers)
         request = client.build_request(
             "GET",
             validate_media_url(url, kind),
-            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.douyin.com/"},
+            headers=headers,
         )
         response = await client.send(request, stream=True, follow_redirects=False)
     except AppError:
-        log_operation(
-            _LOGGER,
-            operation=operation,
-            error_code="DOWNLOAD_FAILED",
-            elapsed_ms=int((time.monotonic() - started_at) * 1000),
-            bytes_streamed=0,
-        )
+        _log_download_failure(operation, started_at)
         raise
+    except httpx.TimeoutException as error:
+        _log_download_failure(operation, started_at)
+        raise _download_error() from TransientUpstreamTimeout(type(error).__name__)
     except httpx.HTTPError as error:
-        log_operation(
-            _LOGGER,
-            operation=operation,
-            error_code="DOWNLOAD_FAILED",
-            elapsed_ms=int((time.monotonic() - started_at) * 1000),
-            bytes_streamed=0,
-        )
-        raise _download_error() from error
+        _log_download_failure(operation, started_at)
+        raise _download_error() from TransientUpstreamError(type(error).__name__)
     expected_content_type = "video/mp4" if kind == "video" else "image/"
     content_type = response.headers.get("content-type", "").lower()
-    if not response.is_success or not content_type.startswith(expected_content_type):
+    accepted_status = response.status_code == 200 or (
+        allow_partial and response.status_code == 206
+    )
+    transient_status = response.status_code == 429 or response.status_code >= 500
+    if not accepted_status or not content_type.startswith(expected_content_type):
         await response.aclose()
-        log_operation(
-            _LOGGER,
-            operation=operation,
-            error_code="DOWNLOAD_FAILED",
-            elapsed_ms=int((time.monotonic() - started_at) * 1000),
-            bytes_streamed=0,
-        )
+        _log_download_failure(operation, started_at)
+        if transient_status:
+            raise _download_error() from TransientUpstreamError(
+                f"HTTP {response.status_code}"
+            )
         raise _download_error()
     return UpstreamStream(response, operation, started_at)
 
@@ -136,11 +162,20 @@ async def open_first_available(
     client: httpx.AsyncClient,
     urls: tuple[str, ...],
     kind: Literal["cover", "video"],
+    *,
+    request_headers: Mapping[str, str] | None = None,
+    allow_partial: bool = False,
 ) -> UpstreamStream:
     last_error: AppError | None = None
     for url in urls:
         try:
-            return await open_upstream(client, url, kind)
+            return await open_upstream(
+                client,
+                url,
+                kind,
+                request_headers=request_headers,
+                allow_partial=allow_partial,
+            )
         except AppError as error:
             last_error = error
     if last_error is not None:

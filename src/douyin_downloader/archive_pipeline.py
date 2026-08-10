@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Protocol
 
-from douyin_downloader.archive_adapters import MediaAccess, RemoteArtifact
+from douyin_downloader.archive_adapters import (
+    MediaAccess,
+    RemoteArtifact,
+    RemoteResumeRequest,
+)
 from douyin_downloader.archive_artifacts import (
     ArtifactKind,
     ArtifactRecord,
@@ -31,7 +37,11 @@ _AUDIO_FAILURE_STATUSES = frozenset(
 class ArchiveProgress(Protocol):
     async def set_phase(self, phase: str) -> None: ...
 
-    async def remote_started(self, expected_size: int | None) -> None: ...
+    async def remote_started(
+        self,
+        expected_size: int | None,
+        existing_bytes: int = 0,
+    ) -> None: ...
 
     async def advance_bytes(self, count: int) -> None: ...
 
@@ -82,17 +92,35 @@ class ArchiveArtifactPipeline:
                 )
                 video_final = registered_path(output_directory, video_relative)
                 video_part = output_directory / f"{aweme_id}.{operation_id}.mp4.part"
-                part_paths.append(video_part)
+                resume_path = video_part.with_name(f"{video_part.name}.resume.json")
+                part_paths.extend((video_part, resume_path))
                 playback = resolved.preferred_playback_source()
                 await _set_phase(progress, "downloading")
-                remote = await self._media_access.open_video(
-                    playback.cdn_mirror_urls
+                resume = _load_resume_request(video_part, resume_path)
+                remote = (
+                    await self._media_access.open_video(
+                        playback.cdn_mirror_urls,
+                        resume=resume,
+                    )
+                    if resume is not None
+                    else await self._media_access.open_video(
+                        playback.cdn_mirror_urls
+                    )
                 )
                 if progress is not None:
-                    await progress.remote_started(remote.expected_size)
+                    await progress.remote_started(
+                        remote.expected_size,
+                        remote.resume_offset,
+                    )
                 if remote.content_type.split(";", 1)[0].lower() != "video/mp4":
                     raise archive_failed()
-                await _write_remote(remote, video_part, progress)
+                _store_resume_provenance(resume_path, video_part, remote)
+                await _write_remote(
+                    remote,
+                    video_part,
+                    progress,
+                    resume_path=resume_path,
+                )
                 await _set_phase(progress, "verifying")
                 await run_in_thread_cancellation_safe(
                     _validate_video_duration,
@@ -108,6 +136,7 @@ class ArchiveArtifactPipeline:
                 )
                 video = _pending(video, video_part)
                 promotions.append((video_part, video_final))
+                resume_path.unlink(missing_ok=True)
                 video_input_path = video_part
             else:
                 video_input_path = registered_path(
@@ -440,18 +469,142 @@ async def _write_remote(
     remote: RemoteArtifact,
     part_path: Path,
     progress: ArchiveProgress | None = None,
+    *,
+    resume_path: Path | None = None,
 ) -> None:
-    written = 0
-    with part_path.open("wb") as output:
+    written = remote.resume_offset
+    if written and not await run_in_thread_cancellation_safe(
+        _path_has_size,
+        part_path,
+        written,
+    ):
+        raise archive_failed()
+    digest = hashlib.sha256()
+    if written:
+        with part_path.open("rb") as existing:
+            for block in iter(lambda: existing.read(1024 * 1024), b""):
+                digest.update(block)
+    with part_path.open("ab" if written else "wb") as output:
         async for chunk in remote.chunks:
             if chunk:
                 written += len(chunk)
                 output.write(chunk)
+                digest.update(chunk)
+                if resume_path is not None:
+                    output.flush()
+                    _write_resume_provenance(
+                        resume_path,
+                        remote,
+                        written,
+                        digest.hexdigest(),
+                    )
                 if progress is not None:
                     await progress.advance_bytes(len(chunk))
         output.flush()
     if remote.expected_size is not None and written != remote.expected_size:
         raise archive_failed()
+
+
+def _load_resume_request(
+    part_path: Path,
+    resume_path: Path,
+) -> RemoteResumeRequest | None:
+    if not part_path.is_file() or not resume_path.is_file():
+        return None
+    try:
+        if resume_path.stat().st_size > 4096:
+            return None
+        payload = json.loads(resume_path.read_text(encoding="utf-8"))
+        validator = payload["validator"]
+        total_size = payload["total_size"]
+        partial_size = payload["partial_size"]
+        partial_sha256 = payload["partial_sha256"]
+        offset = part_path.stat().st_size
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if (
+        payload.get("schema_version") != 1
+        or not isinstance(validator, str)
+        or not _resume_validator_is_safe(validator)
+        or not isinstance(total_size, int)
+        or isinstance(total_size, bool)
+        or partial_size != offset
+        or not isinstance(partial_sha256, str)
+        or partial_sha256 != _sha256_path(part_path)
+        or offset <= 0
+        or offset >= total_size
+    ):
+        return None
+    return RemoteResumeRequest(offset, total_size, validator)
+
+
+def _store_resume_provenance(
+    resume_path: Path,
+    part_path: Path,
+    remote: RemoteArtifact,
+) -> None:
+    validator = remote.resume_validator
+    total_size = remote.expected_size
+    if (
+        validator is None
+        or not _resume_validator_is_safe(validator)
+        or total_size is None
+        or total_size <= remote.resume_offset
+    ):
+        resume_path.unlink(missing_ok=True)
+        return
+    partial_size = remote.resume_offset
+    partial_sha256 = _sha256_path(part_path) if partial_size else hashlib.sha256().hexdigest()
+    _write_resume_provenance(
+        resume_path,
+        remote,
+        partial_size,
+        partial_sha256,
+    )
+
+
+def _write_resume_provenance(
+    resume_path: Path,
+    remote: RemoteArtifact,
+    partial_size: int,
+    partial_sha256: str,
+) -> None:
+    resume_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "validator": remote.resume_validator,
+                "total_size": remote.expected_size,
+                "partial_size": partial_size,
+                "partial_sha256": partial_sha256,
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
+
+
+def _sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _path_has_size(path: Path, expected_size: int) -> bool:
+    return path.is_file() and path.stat().st_size == expected_size
+
+
+def _resume_validator_is_safe(validator: str) -> bool:
+    return (
+        0 < len(validator) <= 512
+        and validator.isascii()
+        and all(character.isprintable() for character in validator)
+        and "://" not in validator
+        and "?" not in validator
+    )
 
 
 async def _set_phase(progress: ArchiveProgress | None, phase: str) -> None:

@@ -55,6 +55,7 @@ class RecordingManagedArchive:
         self.cleared_operations: list[str] = []
         self.paused_tasks: list[str] = []
         self.resumed_tasks: list[str] = []
+        self.retried_tasks: list[str] = []
         self.cancelled_tasks: list[tuple[str, bool]] = []
 
     async def archive_single(
@@ -97,6 +98,10 @@ class RecordingManagedArchive:
 
     async def resume_task(self, task_id: str) -> TaskCenterOperationSnapshot:
         self.resumed_tasks.append(task_id)
+        return self.task_operations[0]
+
+    async def retry_task(self, task_id: str) -> TaskCenterOperationSnapshot:
+        self.retried_tasks.append(task_id)
         return self.task_operations[0]
 
     async def cancel_task(
@@ -411,6 +416,7 @@ async def test_task_control_routes_require_origin_and_explicit_cancel_choice(
             headers = {"origin": "http://testserver"}
             pause = await client.post("/api/tasks/work-1/pause", headers=headers)
             resume = await client.post("/api/tasks/work-1/resume", headers=headers)
+            retry = await client.post("/api/tasks/work-1/retry", headers=headers)
             cancel = await client.post(
                 "/api/tasks/work-1/cancel",
                 headers=headers,
@@ -429,11 +435,13 @@ async def test_task_control_routes_require_origin_and_explicit_cancel_choice(
     assert pause.status_code == 200
     assert pause.json()["task"]["task_id"] == "operation-1"
     assert resume.status_code == 200
+    assert retry.status_code == 200
     assert cancel.status_code == 200
     assert missing_choice.status_code == 400
     assert cross_origin.status_code == 403
     assert managed_archive.paused_tasks == ["work-1"]
     assert managed_archive.resumed_tasks == ["work-1"]
+    assert managed_archive.retried_tasks == ["work-1"]
     assert managed_archive.cancelled_tasks == [("work-1", True)]
     assert "douyinvod.com" not in cancel.text
     assert str(tmp_path) not in cancel.text

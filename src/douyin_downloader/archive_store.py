@@ -218,6 +218,32 @@ class ArchiveStore:
         operations = self._stored_task_operations(operation_rows, source_rows, work_rows)
         return operations[0] if operations else None
 
+    def load_operation_settings(
+        self,
+        operation_id: str,
+    ) -> OperationSettingsSnapshot | None:
+        if not self._database_path.is_file():
+            return None
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT root_path, naming_template, profile_audio,
+                       profile_description, download_concurrency, retry_limit
+                FROM archive_operations
+                WHERE operation_id=? AND history_visible=1
+                """,
+                (operation_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return OperationSettingsSnapshot(
+            archive_root=Path(str(row[0])),
+            naming_template=NamingTemplate(str(row[1])),
+            profile=ArchiveProfile(bool(row[2]), bool(row[3])),
+            download_concurrency=int(row[4]),
+            retry_limit=int(row[5]),
+        )
+
     @staticmethod
     def _stored_task_operations(
         operation_rows: list[tuple[object, ...]],
@@ -342,15 +368,15 @@ class ArchiveStore:
                 UPDATE archive_operations
                 SET lifecycle='interrupted', phase='idle',
                     speed_bytes_per_second=NULL, eta_seconds=NULL
-                WHERE lifecycle='running';
+                WHERE lifecycle IN ('running', 'paused');
                 UPDATE source_tasks
                 SET lifecycle='interrupted', phase='idle',
                     speed_bytes_per_second=NULL, eta_seconds=NULL
-                WHERE lifecycle='running';
+                WHERE lifecycle IN ('running', 'paused');
                 UPDATE work_tasks
                 SET lifecycle='interrupted', phase='idle',
                     speed_bytes_per_second=NULL, eta_seconds=NULL
-                WHERE lifecycle='running';
+                WHERE lifecycle IN ('running', 'paused');
                 """
             )
 
@@ -405,6 +431,63 @@ class ArchiveStore:
                 "UPDATE work_tasks SET lifecycle=? WHERE work_task_id=?",
                 (lifecycle, ids.work),
             )
+
+    def restart_interrupted(self, ids: TaskIds) -> None:
+        self._restart_tasks(ids, expected_lifecycle="interrupted")
+
+    def restart_failed(self, ids: TaskIds) -> None:
+        self._restart_tasks(
+            ids,
+            expected_lifecycle="finished",
+            expected_result="failed",
+        )
+
+    def _restart_tasks(
+        self,
+        ids: TaskIds,
+        *,
+        expected_lifecycle: str,
+        expected_result: str | None = None,
+    ) -> None:
+        with self._connection() as connection:
+            values = ("running", "resolving", "none", None, 0)
+            statements = (
+                (
+                    "UPDATE archive_operations SET lifecycle=?, phase=?, result=?, "
+                    "error_code=?, completed_bytes=?, total_bytes=NULL, "
+                    "speed_bytes_per_second=NULL, eta_seconds=NULL "
+                    "WHERE operation_id=? AND lifecycle=? "
+                    "AND (? IS NULL OR result=?)",
+                    ids.operation,
+                ),
+                (
+                    "UPDATE source_tasks SET lifecycle=?, phase=?, result=?, "
+                    "error_code=?, completed_bytes=?, total_bytes=NULL, "
+                    "speed_bytes_per_second=NULL, eta_seconds=NULL "
+                    "WHERE source_task_id=? AND lifecycle=? "
+                    "AND (? IS NULL OR result=?)",
+                    ids.source,
+                ),
+                (
+                    "UPDATE work_tasks SET lifecycle=?, phase=?, result=?, "
+                    "error_code=?, completed_bytes=?, total_bytes=NULL, "
+                    "speed_bytes_per_second=NULL, eta_seconds=NULL "
+                    "WHERE work_task_id=? AND lifecycle=? "
+                    "AND (? IS NULL OR result=?)",
+                    ids.work,
+                ),
+            )
+            for statement, task_id in statements:
+                connection.execute(
+                    statement,
+                    (
+                        *values,
+                        task_id,
+                        expected_lifecycle,
+                        expected_result,
+                        expected_result,
+                    ),
+                )
 
     def cancel(self, ids: TaskIds) -> None:
         with self._connection() as connection:

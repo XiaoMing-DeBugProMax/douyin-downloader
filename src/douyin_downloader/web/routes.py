@@ -47,6 +47,8 @@ class ManagedArchiveModule(Protocol):
 
     async def resume_task(self, task_id: str) -> TaskCenterOperationSnapshot: ...
 
+    async def retry_task(self, task_id: str) -> TaskCenterOperationSnapshot: ...
+
     async def cancel_task(
         self,
         task_id: str,
@@ -506,6 +508,16 @@ def build_router() -> APIRouter:
     async def resume_task(task_id: str, request: Request) -> TaskOperationResponse:
         _validate_task_id(task_id)
         operation = await _managed_archive(request).resume_task(task_id)
+        return TaskOperationResponse.model_validate(operation)
+
+    @router.post(
+        "/api/tasks/{task_id}/retry",
+        response_model=TaskOperationResponse,
+        dependencies=[Depends(require_local_session), Depends(require_same_origin)],
+    )
+    async def retry_task(task_id: str, request: Request) -> TaskOperationResponse:
+        _validate_task_id(task_id)
+        operation = await _managed_archive(request).retry_task(task_id)
         return TaskOperationResponse.model_validate(operation)
 
     @router.post(
