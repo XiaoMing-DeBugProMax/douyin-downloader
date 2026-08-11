@@ -25,7 +25,7 @@ from douyin_downloader.archive_adapters import (
     WindowsDirectoryChooser,
     WindowsFolderOpener,
 )
-from douyin_downloader.archive_artifacts import ArtifactRecord
+from douyin_downloader.archive_artifacts import ArtifactRecord, validate_metadata
 from douyin_downloader.archive_paths import pin_work_directory, work_directory
 from douyin_downloader.archive_pipeline import (
     ArchiveArtifactPipeline,
@@ -59,6 +59,8 @@ from douyin_downloader.task_control import TaskCancellation
 
 __all__ = [
     "ArchiveItemSnapshot",
+    "ArchiveArtifactSnapshot",
+    "WorkArchiveSnapshot",
     "ArchiveOperationSnapshot",
     "TaskCenterOperationSnapshot",
     "TaskCenterSourceSnapshot",
@@ -162,6 +164,28 @@ class ArchiveItemSnapshot:
     relative_directory: Path
     audio_outcome: str = "not_requested"
     description_outcome: str = "not_requested"
+
+
+@dataclass(frozen=True, slots=True)
+class ArchiveArtifactSnapshot:
+    kind: str
+    relative_path: Path
+    size_bytes: int
+    mime_type: str
+    sha256: str
+    integrity: str
+
+
+@dataclass(frozen=True, slots=True)
+class WorkArchiveSnapshot:
+    aweme_id: str
+    author: str | None
+    published_at: int | None
+    profile: ArchiveProfile
+    root: Path
+    relative_directory: Path
+    status: str
+    artifacts: tuple[ArchiveArtifactSnapshot, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -402,6 +426,8 @@ class ManagedArchive:
         aweme_id: str,
         settings: OperationSettingsSnapshot,
         restart: _TaskRestart | None = None,
+        *,
+        force: bool = False,
     ) -> ArchiveOperationSnapshot:
         root = settings.archive_root
         existing = await run_in_thread_cancellation_safe(
@@ -422,11 +448,15 @@ class ManagedArchive:
                 ),
             )
             if (
-                existing.status == "archived"
+                not force
+                and existing.status == "archived"
                 and effective_profile == existing.stored.settings.profile
             ):
                 return _archive_snapshot(
-                    existing.stored.ids,
+                    self._store.load_archive_task_ids(
+                        existing.stored.operation_id,
+                        aweme_id,
+                    ),
                     aweme_id,
                     existing.stored.relative_directory,
                     "archived",
@@ -448,6 +478,8 @@ class ManagedArchive:
             )
             existing_relative_directory = existing.stored.relative_directory
             valid_artifacts = existing.valid_artifacts
+            if force:
+                valid_artifacts = {}
 
         ids = restart.ids if restart is not None else TaskIds(uuid4().hex, uuid4().hex, uuid4().hex)
         prepared: PreparedArchive | None = None
@@ -521,6 +553,9 @@ class ManagedArchive:
                             root,
                             relative_directory,
                             prepared.artifacts,
+                            resolved.snapshot.author.nickname,
+                            resolved.snapshot.published_at,
+                            settings,
                         )
                         promotion_started = True
                         for part_path, final_path in prepared.promotions:
@@ -587,6 +622,44 @@ class ManagedArchive:
                 "description",
             ),
         )
+
+    def inspect_registered_archive(self, aweme_id: str) -> WorkArchiveSnapshot | None:
+        _validate_aweme_id(aweme_id)
+        existing = self._audit_archive(aweme_id)
+        return _work_archive_snapshot(existing) if existing is not None else None
+
+    def registered_archive_ids(self) -> tuple[str, ...]:
+        return self._store.list_archive_ids()
+
+    async def rearchive_registered(
+        self,
+        aweme_id: str,
+        *,
+        profile: ArchiveProfile,
+        force: bool = False,
+    ) -> ArchiveOperationSnapshot:
+        async with self._hold_existing_archive(aweme_id) as existing:
+            settings = replace(
+                existing.stored.settings,
+                profile=profile,
+            )
+            return await self._archive_single_locked(
+                aweme_id,
+                settings,
+                force=force,
+            )
+
+    @asynccontextmanager
+    async def _hold_existing_archive(
+        self,
+        aweme_id: str,
+    ) -> AsyncIterator[_AuditedArchive]:
+        _validate_aweme_id(aweme_id)
+        async with _hold_thread_lock(self._integrity_lock(aweme_id)):
+            existing = self._audit_archive_unlocked(aweme_id)
+            if existing is None:
+                raise AppError("ARCHIVE_NOT_FOUND", "没有找到该作品的本地档案。", 404)
+            yield existing
 
     def list_task_operations(self) -> tuple[TaskCenterOperationSnapshot, ...]:
         return tuple(
@@ -739,6 +812,21 @@ class ManagedArchive:
                     stored.aweme_id,
                     stored.artifacts,
                 )
+                if stored.author is None and "metadata" in valid_artifacts:
+                    metadata = validate_metadata(
+                        output_directory / valid_artifacts["metadata"].relative_path,
+                        stored.aweme_id,
+                    )
+                    self._store.update_library_metadata(
+                        stored.aweme_id,
+                        author=metadata.work.author.nickname,
+                        published_at=metadata.work.published_at,
+                    )
+                    stored = replace(
+                        stored,
+                        author=metadata.work.author.nickname,
+                        published_at=metadata.work.published_at,
+                    )
         except AppError:
             expected_directory = stored.root / stored.relative_directory
             if stored.root.is_dir() and not expected_directory.exists():
@@ -815,6 +903,41 @@ def _archive_snapshot(
         ),
         settings=settings,
     )
+
+
+def _work_archive_snapshot(existing: _AuditedArchive) -> WorkArchiveSnapshot:
+    integrity_by_kind = {
+        artifact.kind: "valid" for artifact in existing.valid_artifacts.values()
+    }
+    if existing.status == "location_unavailable":
+        integrity_by_kind = {
+            artifact.kind: "unknown" for artifact in existing.stored.artifacts
+        }
+    return WorkArchiveSnapshot(
+        aweme_id=existing.stored.aweme_id,
+        author=existing.stored.author,
+        published_at=existing.stored.published_at,
+        profile=existing.stored.settings.profile,
+        root=existing.stored.root,
+        relative_directory=existing.stored.relative_directory,
+        status=existing.status,
+        artifacts=tuple(
+            ArchiveArtifactSnapshot(
+                kind=artifact.kind,
+                relative_path=artifact.relative_path,
+                size_bytes=artifact.size_bytes,
+                mime_type=artifact.mime_type,
+                sha256=artifact.sha256,
+                integrity=integrity_by_kind.get(artifact.kind, "invalid"),
+            )
+            for artifact in existing.stored.artifacts
+        ),
+    )
+
+
+def _validate_aweme_id(aweme_id: str) -> None:
+    if not aweme_id.isdigit():
+        raise AppError("INVALID_INPUT", "作品标识无效。", 400)
 
 
 def _task_center_snapshot(

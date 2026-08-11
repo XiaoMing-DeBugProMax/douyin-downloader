@@ -33,6 +33,7 @@ from douyin_downloader.domain import (
     ResolvedWork,
     WorkSnapshot,
 )
+from douyin_downloader.library import LocalArchiveLibrary
 from douyin_downloader.settings import ArchiveProfile, OperationSettingsSnapshot
 
 
@@ -1155,6 +1156,111 @@ async def test_missing_work_directory_is_repairable_when_root_is_available(
     assert (work_directory / "7429378937383308594.mp4").is_file()
     assert (work_directory / "7429378937383308594.cover.png").is_file()
     assert (work_directory / "7429378937383308594.metadata.json").is_file()
+
+
+@pytest.mark.asyncio
+async def test_library_survives_cleared_task_history_and_lists_one_work(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "library"
+    root.mkdir()
+    media = StaticMediaAccess(valid_mp4())
+    archive = ManagedArchive(
+        database_path=tmp_path / "archive.db",
+        work_access=StaticWorkAccess(),
+        media_access=media,
+    )
+    first = await archive.archive_single(
+        SingleArchiveRequest("7429378937383308594", root)
+    )
+    duplicate = await archive.archive_single(
+        SingleArchiveRequest("7429378937383308594", root)
+    )
+    archive.clear_task_operation(first.operation.task_id)
+    with sqlite3.connect(tmp_path / "archive.db") as connection:
+        connection.execute("DELETE FROM work_tasks")
+        connection.execute("DELETE FROM source_tasks")
+        connection.execute("DELETE FROM archive_operations")
+
+    items = LocalArchiveLibrary(archive).list_works()
+
+    assert duplicate.operation.task_id == first.operation.task_id
+    assert len(items) == 1
+    item = items[0]
+    assert item.aweme_id == "7429378937383308594"
+    assert item.author == "测试作者"
+    assert item.published_at == 1_720_000_000
+    assert item.root == root
+    assert item.profile == ArchiveProfile()
+    assert item.status == "archived"
+    assert {artifact.kind for artifact in item.artifacts} == {
+        "video",
+        "cover",
+        "metadata",
+    }
+    assert all(artifact.integrity == "valid" for artifact in item.artifacts)
+    assert all(artifact.size_bytes >= 0 for artifact in item.artifacts)
+    assert all(len(artifact.sha256) == 64 for artifact in item.artifacts)
+    assert archive.list_task_operations() == ()
+
+
+@pytest.mark.asyncio
+async def test_force_rearchive_requires_confirmation_and_downloads_core_artifacts_again(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "library"
+    root.mkdir()
+    media = StaticMediaAccess(valid_mp4())
+    archive = ManagedArchive(
+        database_path=tmp_path / "archive.db",
+        work_access=StaticWorkAccess(),
+        media_access=media,
+    )
+    await archive.archive_single(SingleArchiveRequest("7429378937383308594", root))
+
+    with pytest.raises(AppError) as error:
+        await LocalArchiveLibrary(archive).force_rearchive(
+            "7429378937383308594",
+            confirm_overwrite=False,
+        )
+
+    assert error.value.code == "ARCHIVE_OVERWRITE_CONFIRMATION_REQUIRED"
+    await LocalArchiveLibrary(archive).force_rearchive(
+        "7429378937383308594",
+        confirm_overwrite=True,
+    )
+    assert len(media.requests) == 2
+    assert len(media.cover_requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_library_backfills_display_metadata_for_an_existing_archive(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "library"
+    root.mkdir()
+    database = tmp_path / "archive.db"
+    archive = ManagedArchive(
+        database_path=database,
+        work_access=StaticWorkAccess(),
+        media_access=StaticMediaAccess(valid_mp4()),
+    )
+    await archive.archive_single(SingleArchiveRequest("7429378937383308594", root))
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE archive_items SET author_nickname=NULL, published_at=NULL"
+        )
+
+    restarted = ManagedArchive(
+        database_path=database,
+        work_access=UnexpectedWorkAccess(),
+        media_access=UnexpectedMediaAccess(),
+    )
+    item = LocalArchiveLibrary(restarted).get_work("7429378937383308594")
+
+    assert item is not None
+    assert item.author == "测试作者"
+    assert item.published_at == 1_720_000_000
 
 
 @pytest.mark.asyncio

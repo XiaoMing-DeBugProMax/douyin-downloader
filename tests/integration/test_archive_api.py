@@ -6,6 +6,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from douyin_downloader.archive import (
+    ArchiveArtifactSnapshot,
     ArchiveItemSnapshot,
     ArchiveOperationSnapshot,
     SingleArchiveRequest,
@@ -15,11 +16,12 @@ from douyin_downloader.archive import (
     TaskErrorSnapshot,
     TaskProgressSnapshot,
     TaskSnapshot,
+    WorkArchiveSnapshot,
 )
 from douyin_downloader.domain import ParsedVideo, ResolvedShare
 from douyin_downloader.parse_service import ParseService
 from douyin_downloader.session import SessionManager
-from douyin_downloader.settings import SettingsModule
+from douyin_downloader.settings import ArchiveProfile, SettingsModule
 from douyin_downloader.store import ParseStore
 from douyin_downloader.web.app import create_app
 from douyin_downloader.web.routes import AppServices
@@ -57,6 +59,10 @@ class RecordingManagedArchive:
         self.resumed_tasks: list[str] = []
         self.retried_tasks: list[str] = []
         self.cancelled_tasks: list[tuple[str, bool]] = []
+        self.library_items: tuple[WorkArchiveSnapshot, ...] = ()
+        self.supplements: list[tuple[str, bool, bool]] = []
+        self.repairs: list[str] = []
+        self.forced: list[tuple[str, bool]] = []
 
     async def archive_single(
         self,
@@ -85,6 +91,46 @@ class RecordingManagedArchive:
     def open_work_folder(self, aweme_id: str) -> None:
         self.open_thread_ids.append(threading.get_ident())
         self.opened.append(aweme_id)
+
+    def get_work(self, aweme_id: str) -> WorkArchiveSnapshot | None:
+        return next((item for item in self.library_items if item.aweme_id == aweme_id), None)
+
+    def list_works(self) -> tuple[WorkArchiveSnapshot, ...]:
+        return self.library_items
+
+    async def supplement(
+        self,
+        aweme_id: str,
+        *,
+        include_audio: bool,
+        include_description: bool,
+    ) -> ArchiveOperationSnapshot:
+        self.supplements.append((aweme_id, include_audio, include_description))
+        return self._action_result(aweme_id)
+
+    async def repair(self, aweme_id: str) -> ArchiveOperationSnapshot:
+        self.repairs.append(aweme_id)
+        return self._action_result(aweme_id)
+
+    async def force_rearchive(
+        self,
+        aweme_id: str,
+        *,
+        confirm_overwrite: bool,
+    ) -> ArchiveOperationSnapshot:
+        self.forced.append((aweme_id, confirm_overwrite))
+        return self._action_result(aweme_id)
+
+    def _action_result(self, aweme_id: str) -> ArchiveOperationSnapshot:
+        task = TaskSnapshot("library-action", "finished", "idle", "success")
+        item = ArchiveItemSnapshot(aweme_id, "archived", Path("author/year/work"))
+        return ArchiveOperationSnapshot(
+            task,
+            task,
+            task,
+            item,
+            SingleArchiveRequest(aweme_id, Path("C:/library")).settings_snapshot(),
+        )
 
     def list_task_operations(self) -> tuple[TaskCenterOperationSnapshot, ...]:
         return self.task_operations
@@ -227,6 +273,106 @@ async def test_location_unavailable_archive_cannot_open_folder(tmp_path: Path) -
         "description_outcome": "not_requested",
         "can_open_folder": False,
     }
+
+
+@pytest.mark.asyncio
+async def test_library_routes_list_detail_and_dispatch_explicit_actions(
+    tmp_path: Path,
+) -> None:
+    managed_archive = RecordingManagedArchive()
+    item = WorkArchiveSnapshot(
+        aweme_id=VIDEO.aweme_id,
+        author="测试作者",
+        published_at=1_720_000_000,
+        profile=ArchiveProfile(),
+        root=tmp_path / "library",
+        relative_directory=Path("author/2024/work-7429378937383308594"),
+        status="archived",
+        artifacts=(
+            ArchiveArtifactSnapshot(
+                "video",
+                Path("7429378937383308594.mp4"),
+                1024,
+                "video/mp4",
+                "a" * 64,
+                "valid",
+            ),
+        ),
+    )
+    managed_archive.library_items = (item,)
+    sessions = SessionManager()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(404))
+    ) as media_client:
+        app = create_app(
+            services=AppServices(
+                parse_service=ParseService(UnusedResolver(), UnusedParser(), ParseStore()),
+                media_client=media_client,
+                managed_archive=managed_archive,
+                archive_library=managed_archive,
+            ),
+            session_manager=sessions,
+            testing=True,
+        )
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://testserver",
+        ) as client:
+            client.cookies.set("douyin_local_session", sessions.cookie_token)
+            headers = {"origin": "http://testserver"}
+            listing = await client.get("/api/library")
+            detail = await client.get(f"/api/library/{VIDEO.aweme_id}")
+            supplement = await client.post(
+                f"/api/library/{VIDEO.aweme_id}/supplement",
+                headers=headers,
+                json={"include_audio": True, "include_description": False},
+            )
+            repair = await client.post(
+                f"/api/library/{VIDEO.aweme_id}/repair",
+                headers=headers,
+            )
+            force = await client.post(
+                f"/api/library/{VIDEO.aweme_id}/force",
+                headers=headers,
+                json={"confirm_overwrite": True},
+            )
+            missing_confirmation = await client.post(
+                f"/api/library/{VIDEO.aweme_id}/force",
+                headers=headers,
+                json={},
+            )
+            cross_origin = await client.post(
+                f"/api/library/{VIDEO.aweme_id}/repair",
+                headers={"origin": "https://example.com"},
+            )
+
+    assert listing.status_code == 200
+    assert listing.json()["items"] == [detail.json()]
+    assert detail.json() == {
+        "aweme_id": VIDEO.aweme_id,
+        "author": "测试作者",
+        "published_at": 1_720_000_000,
+        "profile": {"include_audio": False, "include_description": False},
+        "root": str(tmp_path / "library"),
+        "relative_directory": "author\\2024\\work-7429378937383308594",
+        "status": "archived",
+        "artifacts": [
+            {
+                "kind": "video",
+                "relative_path": "7429378937383308594.mp4",
+                "size_bytes": 1024,
+                "mime_type": "video/mp4",
+                "sha256": "a" * 64,
+                "integrity": "valid",
+            }
+        ],
+    }
+    assert supplement.status_code == repair.status_code == force.status_code == 200
+    assert missing_confirmation.status_code == 400
+    assert cross_origin.status_code == 403
+    assert managed_archive.supplements == [(VIDEO.aweme_id, True, False)]
+    assert managed_archive.repairs == [VIDEO.aweme_id]
+    assert managed_archive.forced == [(VIDEO.aweme_id, True)]
 
 
 @pytest.mark.asyncio

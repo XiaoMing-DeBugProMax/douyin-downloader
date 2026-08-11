@@ -82,6 +82,40 @@ _TASK_CENTER_MIGRATIONS = (
     ),
 )
 
+_LIBRARY_MIGRATIONS = (
+    (
+        "author_nickname",
+        "ALTER TABLE archive_items ADD COLUMN author_nickname TEXT",
+    ),
+    (
+        "published_at",
+        "ALTER TABLE archive_items ADD COLUMN published_at INTEGER",
+    ),
+    (
+        "naming_template",
+        "ALTER TABLE archive_items ADD COLUMN naming_template "
+        "TEXT NOT NULL DEFAULT '{aweme_id}'",
+    ),
+    (
+        "profile_audio",
+        "ALTER TABLE archive_items ADD COLUMN profile_audio INTEGER NOT NULL DEFAULT 0",
+    ),
+    (
+        "profile_description",
+        "ALTER TABLE archive_items ADD COLUMN profile_description "
+        "INTEGER NOT NULL DEFAULT 0",
+    ),
+    (
+        "download_concurrency",
+        "ALTER TABLE archive_items ADD COLUMN download_concurrency "
+        "INTEGER NOT NULL DEFAULT 3",
+    ),
+    (
+        "retry_limit",
+        "ALTER TABLE archive_items ADD COLUMN retry_limit INTEGER NOT NULL DEFAULT 3",
+    ),
+)
+
 
 def ensure_archive_schema(database_path: Path) -> None:
     """Back up an existing database, then apply archive migrations atomically."""
@@ -120,17 +154,31 @@ def ensure_archive_schema(database_path: Path) -> None:
                 for row in connection.execute(f"PRAGMA table_info({table})")
             }
         )
+        archive_item_columns = (
+            {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(archive_items)")
+            }
+            if "archive_items" in tables
+            else set()
+        )
+        missing_library_migrations = tuple(
+            statement
+            for column, statement in _LIBRARY_MIGRATIONS
+            if "archive_items" in tables and column not in archive_item_columns
+        )
         needs_settings_table = "current_settings" not in tables
         is_existing_database = bool(tables)
         if is_existing_database and (
             needs_settings_table
             or missing_operation_migrations
             or missing_task_migrations
+            or missing_library_migrations
         ):
             backup_label = (
                 "settings-snapshot"
                 if needs_settings_table or missing_operation_migrations
-                else "task-center"
+                else "local-library" if missing_library_migrations else "task-center"
             )
             _backup_before_migration(database_path, connection, backup_label)
 
@@ -139,6 +187,39 @@ def ensure_archive_schema(database_path: Path) -> None:
                 connection.execute(statement)
             for statement in missing_task_migrations:
                 connection.execute(statement)
+            for statement in missing_library_migrations:
+                connection.execute(statement)
+            if missing_library_migrations and "archive_operations" in tables:
+                connection.execute(
+                    """
+                    UPDATE archive_items
+                    SET naming_template = COALESCE(
+                            (SELECT naming_template FROM archive_operations
+                             WHERE operation_id = archive_items.operation_id),
+                            naming_template
+                        ),
+                        profile_audio = COALESCE(
+                            (SELECT profile_audio FROM archive_operations
+                             WHERE operation_id = archive_items.operation_id),
+                            profile_audio
+                        ),
+                        profile_description = COALESCE(
+                            (SELECT profile_description FROM archive_operations
+                             WHERE operation_id = archive_items.operation_id),
+                            profile_description
+                        ),
+                        download_concurrency = COALESCE(
+                            (SELECT download_concurrency FROM archive_operations
+                             WHERE operation_id = archive_items.operation_id),
+                            download_concurrency
+                        ),
+                        retry_limit = COALESCE(
+                            (SELECT retry_limit FROM archive_operations
+                             WHERE operation_id = archive_items.operation_id),
+                            retry_limit
+                        )
+                    """
+                )
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS current_settings (

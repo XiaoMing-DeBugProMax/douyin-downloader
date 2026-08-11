@@ -17,6 +17,7 @@ from douyin_downloader.archive import (
 )
 from douyin_downloader.domain import AppError
 from douyin_downloader.f2_adapter import F2VideoParser, F2WorkAccess
+from douyin_downloader.library import LocalArchiveLibrary
 from douyin_downloader.parse_service import ParseService
 from douyin_downloader.resources import static_directory, static_resource_path
 from douyin_downloader.runtime import RuntimeStore
@@ -42,14 +43,17 @@ async def _application_lifespan(app: FastAPI) -> AsyncIterator[None]:
         database_path = RuntimeStore().app_dir / "archive.db"
         settings = SettingsModule(database_path)
         settings.current()
-        managed_archive: ManagedArchive | None = ManagedArchive(
+        managed = ManagedArchive(
             database_path=database_path,
             work_access=work_access,
             media_access=HttpMediaAccess(client),
         )
+        managed_archive: ManagedArchive | None = managed
+        archive_library = LocalArchiveLibrary(managed)
     except (OSError, RuntimeError, sqlite3.Error):
         settings = None
         managed_archive = None
+        archive_library = None
     app.state.services = AppServices(
         parse_service=ParseService(
             ShareResolver(client),
@@ -58,6 +62,7 @@ async def _application_lifespan(app: FastAPI) -> AsyncIterator[None]:
         ),
         media_client=client,
         managed_archive=managed_archive,
+        archive_library=archive_library,
         settings=settings,
         directory_chooser=WindowsDirectoryChooser(),
     )

@@ -15,6 +15,7 @@ from douyin_downloader.archive import (
     ArchiveOperationSnapshot,
     SingleArchiveRequest,
     TaskCenterOperationSnapshot,
+    WorkArchiveSnapshot,
 )
 from douyin_downloader.domain import AppError
 from douyin_downloader.media import UpstreamStream, open_first_available, safe_video_filename
@@ -57,6 +58,29 @@ class ManagedArchiveModule(Protocol):
     ) -> TaskCenterOperationSnapshot: ...
 
 
+class ArchiveLibraryModule(Protocol):
+    def get_work(self, aweme_id: str) -> WorkArchiveSnapshot | None: ...
+
+    def list_works(self) -> tuple[WorkArchiveSnapshot, ...]: ...
+
+    async def supplement(
+        self,
+        aweme_id: str,
+        *,
+        include_audio: bool,
+        include_description: bool,
+    ) -> ArchiveOperationSnapshot: ...
+
+    async def repair(self, aweme_id: str) -> ArchiveOperationSnapshot: ...
+
+    async def force_rearchive(
+        self,
+        aweme_id: str,
+        *,
+        confirm_overwrite: bool,
+    ) -> ArchiveOperationSnapshot: ...
+
+
 class DirectoryChooser(Protocol):
     def choose_directory(self) -> Path | None: ...
 
@@ -76,6 +100,7 @@ class AppServices:
     parse_service: ParseService
     media_client: httpx.AsyncClient
     managed_archive: ManagedArchiveModule | None = None
+    archive_library: ArchiveLibraryModule | None = None
     settings: SettingsModuleInterface | None = None
     directory_chooser: DirectoryChooser | None = None
 
@@ -111,6 +136,13 @@ class ArchiveResponse(BaseModel):
     can_open_folder: bool
 
 
+class ArchiveProfileModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    include_audio: bool
+    include_description: bool
+
+
 class ArchiveWorkResponse(BaseModel):
     aweme_id: str
     status: str
@@ -119,11 +151,45 @@ class ArchiveWorkResponse(BaseModel):
     can_open_folder: bool
 
 
-class ArchiveProfileModel(BaseModel):
+class LibraryArtifactResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    kind: str
+    relative_path: str
+    size_bytes: int
+    mime_type: str
+    sha256: str
+    integrity: str
+
+
+class LibraryWorkResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    aweme_id: str
+    author: str | None
+    published_at: int | None
+    profile: ArchiveProfileModel
+    root: str
+    relative_directory: str
+    status: str
+    artifacts: list[LibraryArtifactResponse]
+
+
+class LibraryWorksResponse(BaseModel):
+    items: list[LibraryWorkResponse]
+
+
+class SupplementArchiveRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    include_audio: bool
-    include_description: bool
+    include_audio: bool = False
+    include_description: bool = False
+
+
+class ForceRearchiveRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    confirm_overwrite: bool
 
 
 class SettingsUpdateRequest(BaseModel):
@@ -226,6 +292,13 @@ def _managed_archive(request: Request) -> ManagedArchiveModule:
     return archive
 
 
+def _archive_library(request: Request) -> ArchiveLibraryModule:
+    library = _services(request).archive_library
+    if library is None:
+        raise AppError("ARCHIVE_UNAVAILABLE", "本地档案库暂时不可用。", 503)
+    return library
+
+
 def _settings_module(request: Request) -> SettingsModuleInterface:
     settings = _services(request).settings
     if settings is None:
@@ -243,6 +316,43 @@ def _settings_response(settings: CurrentSettings) -> SettingsResponse:
         ),
         download_concurrency=settings.download_concurrency,
         retry_limit=settings.retry_limit,
+    )
+
+
+def _archive_response(result: ArchiveOperationSnapshot) -> ArchiveResponse:
+    return ArchiveResponse(
+        operation_id=result.operation.task_id,
+        aweme_id=result.archive_item.aweme_id,
+        status=result.archive_item.status,
+        audio_outcome=result.archive_item.audio_outcome,
+        description_outcome=result.archive_item.description_outcome,
+        can_open_folder=True,
+    )
+
+
+def _library_work_response(item: WorkArchiveSnapshot) -> LibraryWorkResponse:
+    return LibraryWorkResponse(
+        aweme_id=item.aweme_id,
+        author=item.author,
+        published_at=item.published_at,
+        profile=ArchiveProfileModel(
+            include_audio=item.profile.include_audio,
+            include_description=item.profile.include_description,
+        ),
+        root=str(item.root),
+        relative_directory=str(item.relative_directory),
+        status=item.status,
+        artifacts=[
+            LibraryArtifactResponse(
+                kind=artifact.kind,
+                relative_path=str(artifact.relative_path),
+                size_bytes=artifact.size_bytes,
+                mime_type=artifact.mime_type,
+                sha256=artifact.sha256,
+                integrity=artifact.integrity,
+            )
+            for artifact in item.artifacts
+        ],
     )
 
 
@@ -351,14 +461,76 @@ def build_router() -> APIRouter:
         result = await archive.archive_single(
             SingleArchiveRequest.from_settings(video.aweme_id, settings)
         )
-        return ArchiveResponse(
-            operation_id=result.operation.task_id,
-            aweme_id=result.archive_item.aweme_id,
-            status=result.archive_item.status,
-            audio_outcome=result.archive_item.audio_outcome,
-            description_outcome=result.archive_item.description_outcome,
-            can_open_folder=True,
+        return _archive_response(result)
+
+    @router.get(
+        "/api/library",
+        response_model=LibraryWorksResponse,
+        dependencies=[Depends(require_local_session)],
+    )
+    async def list_library(request: Request) -> LibraryWorksResponse:
+        items = await asyncio.to_thread(_archive_library(request).list_works)
+        return LibraryWorksResponse(
+            items=[_library_work_response(item) for item in items]
         )
+
+    @router.get(
+        "/api/library/{aweme_id}",
+        response_model=LibraryWorkResponse,
+        dependencies=[Depends(require_local_session)],
+    )
+    async def library_detail(aweme_id: str, request: Request) -> LibraryWorkResponse:
+        if not aweme_id.isdigit():
+            raise AppError("INVALID_INPUT", "作品标识无效。", 400)
+        item = await asyncio.to_thread(
+            _archive_library(request).get_work,
+            aweme_id,
+        )
+        if item is None:
+            raise AppError("ARCHIVE_NOT_FOUND", "没有找到该作品的本地档案。", 404)
+        return _library_work_response(item)
+
+    @router.post(
+        "/api/library/{aweme_id}/supplement",
+        response_model=ArchiveResponse,
+        dependencies=[Depends(require_local_session), Depends(require_same_origin)],
+    )
+    async def supplement_library_work(
+        aweme_id: str,
+        payload: SupplementArchiveRequest,
+        request: Request,
+    ) -> ArchiveResponse:
+        result = await _archive_library(request).supplement(
+            aweme_id,
+            include_audio=payload.include_audio,
+            include_description=payload.include_description,
+        )
+        return _archive_response(result)
+
+    @router.post(
+        "/api/library/{aweme_id}/repair",
+        response_model=ArchiveResponse,
+        dependencies=[Depends(require_local_session), Depends(require_same_origin)],
+    )
+    async def repair_library_work(aweme_id: str, request: Request) -> ArchiveResponse:
+        result = await _archive_library(request).repair(aweme_id)
+        return _archive_response(result)
+
+    @router.post(
+        "/api/library/{aweme_id}/force",
+        response_model=ArchiveResponse,
+        dependencies=[Depends(require_local_session), Depends(require_same_origin)],
+    )
+    async def force_library_work(
+        aweme_id: str,
+        payload: ForceRearchiveRequest,
+        request: Request,
+    ) -> ArchiveResponse:
+        result = await _archive_library(request).force_rearchive(
+            aweme_id,
+            confirm_overwrite=payload.confirm_overwrite,
+        )
+        return _archive_response(result)
 
     @router.get(
         "/api/settings",

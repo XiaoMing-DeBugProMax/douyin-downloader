@@ -128,6 +128,12 @@
               <button id="archive-open" class="button button-quiet" type="button" hidden>
                 打开所在文件夹
               </button>
+              <button id="archive-library" class="button button-quiet" type="button" hidden>
+                在档案库查看
+              </button>
+              <button id="archive-task" class="button button-quiet" type="button" hidden>
+                查看当前任务
+              </button>
             </div>
           </div>
         </div>
@@ -159,10 +165,44 @@
         <div id="tasks-list" class="tasks-list" aria-label="归档任务历史"></div>
       </section>
 
-      <section id="library-workspace" class="workspace-panel placeholder-workspace" role="tabpanel" aria-labelledby="tab-library" hidden>
-        <p class="eyebrow">LOCAL ARCHIVE</p>
-        <h1>本地档案库</h1>
-        <p>已归档作品的检索与管理将在本周期后续功能中开放。</p>
+      <section id="library-workspace" class="workspace-panel library-workspace" role="tabpanel" aria-labelledby="tab-library" hidden>
+        <div class="workspace-heading library-heading">
+          <div>
+            <p class="eyebrow">LOCAL ARCHIVE</p>
+            <h1>本地档案库</h1>
+            <p>每个作品只保留一条当前档案记录，可补充、修复或明确强制重新归档。</p>
+          </div>
+          <button id="library-refresh" class="button button-secondary" type="button">刷新</button>
+        </div>
+        <div class="library-feedback">
+          <p id="library-status" role="status" aria-live="polite"></p>
+          <p id="library-error" role="alert"></p>
+        </div>
+        <p id="library-empty" class="tasks-empty" hidden>还没有本地档案。</p>
+        <div class="library-layout">
+          <div id="library-list" class="library-list" aria-label="本地档案作品"></div>
+          <article id="library-detail" class="library-detail" aria-labelledby="library-detail-title" hidden>
+            <div class="library-detail-heading">
+              <div>
+                <p class="eyebrow">ARCHIVE DETAIL</p>
+                <h2 id="library-detail-title"></h2>
+                <p id="library-detail-status"></p>
+              </div>
+              <button id="library-open" class="button button-secondary" type="button">打开文件夹</button>
+            </div>
+            <dl id="library-metadata" class="library-metadata"></dl>
+            <div class="library-supplement">
+              <label><input id="library-audio" type="checkbox"> 补充音频</label>
+              <label><input id="library-description" type="checkbox"> 补充文案</label>
+              <button id="library-supplement" class="button button-secondary" type="button">补充成果</button>
+            </div>
+            <div id="library-artifacts" class="library-artifacts"></div>
+            <div class="library-actions">
+              <button id="library-repair" class="button button-secondary" type="button">修复异常成果</button>
+              <button id="library-force" class="button button-quiet" type="button">强制重新归档</button>
+            </div>
+          </article>
+        </div>
       </section>
 
       <section id="settings-workspace" class="workspace-panel settings-workspace" role="tabpanel" aria-labelledby="tab-settings" hidden>

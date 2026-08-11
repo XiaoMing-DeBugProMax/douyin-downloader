@@ -20,6 +20,8 @@ const downloadCustom = document.querySelector("#download-custom");
 const archiveStatus = document.querySelector("#archive-status");
 const archiveStart = document.querySelector("#archive-start");
 const archiveOpen = document.querySelector("#archive-open");
+const archiveLibrary = document.querySelector("#archive-library");
+const archiveTask = document.querySelector("#archive-task");
 const parseAnother = document.querySelector("#parse-another");
 const themeButton = document.querySelector("#theme-button");
 const themeMenu = document.querySelector("#theme-menu");
@@ -46,6 +48,23 @@ const tasksList = document.querySelector("#tasks-list");
 const taskCancelDialog = document.querySelector("#task-cancel-dialog");
 const taskCancelRetain = document.querySelector("#task-cancel-retain");
 const taskCancelDelete = document.querySelector("#task-cancel-delete");
+const libraryWorkspace = document.querySelector("#library-workspace");
+const libraryRefresh = document.querySelector("#library-refresh");
+const libraryStatus = document.querySelector("#library-status");
+const libraryError = document.querySelector("#library-error");
+const libraryEmpty = document.querySelector("#library-empty");
+const libraryList = document.querySelector("#library-list");
+const libraryDetail = document.querySelector("#library-detail");
+const libraryDetailTitle = document.querySelector("#library-detail-title");
+const libraryDetailStatus = document.querySelector("#library-detail-status");
+const libraryMetadata = document.querySelector("#library-metadata");
+const libraryArtifacts = document.querySelector("#library-artifacts");
+const libraryOpen = document.querySelector("#library-open");
+const libraryAudio = document.querySelector("#library-audio");
+const libraryDescription = document.querySelector("#library-description");
+const librarySupplement = document.querySelector("#library-supplement");
+const libraryRepair = document.querySelector("#library-repair");
+const libraryForce = document.querySelector("#library-force");
 
 let currentParse = null;
 let isParsing = false;
@@ -56,6 +75,11 @@ let settingsLoaded = false;
 let tasksLoading = false;
 let tasksRefreshTimer = null;
 let pendingCancelTaskId = null;
+let currentArchiveOperationId = null;
+let pendingTaskFocus = null;
+let libraryLoading = false;
+let selectedLibraryWork = null;
+let pendingLibraryFocus = null;
 
 function storedTheme() {
   try {
@@ -183,6 +207,7 @@ function activateWorkspace(name) {
     panel.hidden = panel.id !== `${name}-workspace`;
   }
   if (name === "settings") loadSettings();
+  if (name === "library") loadLibrary(pendingLibraryFocus);
   if (name === "tasks") {
     loadTasks();
   } else if (tasksRefreshTimer !== null) {
@@ -438,6 +463,8 @@ async function clearTaskOperation(operationId, button) {
 
 function renderTaskOperation(operation) {
   const card = createElement("article", "task-operation");
+  card.dataset.operationId = operation.task.task_id;
+  card.tabIndex = -1;
   const heading = createElement("div", "task-operation-heading");
   const title = createElement("div");
   title.append(
@@ -495,6 +522,14 @@ async function loadTasks(force = false) {
       return;
     }
     const operations = renderTasks(await response.json());
+    if (pendingTaskFocus) {
+      const target = tasksList.querySelector(
+        `[data-operation-id="${CSS.escape(pendingTaskFocus)}"]`,
+      );
+      target?.focus();
+      target?.scrollIntoView({ block: "center" });
+      pendingTaskFocus = null;
+    }
     tasksStatus.textContent = operations.length ? `共 ${operations.length} 个归档操作。` : "";
     scheduleTaskRefresh(operations);
   } catch (_) {
@@ -506,6 +541,173 @@ async function loadTasks(force = false) {
 }
 
 tasksRefresh.addEventListener("click", () => loadTasks(true));
+
+function libraryStatusText(statusValue) {
+  return {
+    archived: "完整",
+    needs_repair: "需要修复",
+    location_unavailable: "位置不可用",
+  }[statusValue] || statusValue;
+}
+
+function formatLibraryDate(timestamp) {
+  if (!timestamp) return "未知";
+  return new Date(timestamp * 1000).toLocaleString("zh-CN");
+}
+
+function formatBytes(size) {
+  if (!Number.isFinite(size)) return "未知";
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+  return `${(size / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function metadataRow(label, value) {
+  const row = document.createElement("div");
+  row.append(createElement("dt", "", label), createElement("dd", "", value));
+  return row;
+}
+
+function renderLibraryDetail(item) {
+  selectedLibraryWork = item;
+  libraryDetail.hidden = false;
+  libraryDetailTitle.textContent = item.author || `作品 ${item.aweme_id}`;
+  libraryDetailStatus.textContent = `${libraryStatusText(item.status)} · ${item.aweme_id}`;
+  libraryOpen.disabled = item.status === "location_unavailable";
+  libraryRepair.hidden = item.status !== "needs_repair";
+  libraryAudio.checked = false;
+  libraryAudio.disabled = item.profile.include_audio;
+  libraryDescription.checked = false;
+  libraryDescription.disabled = item.profile.include_description;
+  libraryMetadata.replaceChildren(
+    metadataRow("发布时间", formatLibraryDate(item.published_at)),
+    metadataRow(
+      "归档方案",
+      ["视频、封面、元数据", item.profile.include_audio && "音频", item.profile.include_description && "文案"]
+        .filter(Boolean)
+        .join(" · "),
+    ),
+    metadataRow("根目录", item.root),
+    metadataRow("相对目录", item.relative_directory),
+  );
+  libraryArtifacts.replaceChildren();
+  for (const artifact of item.artifacts) {
+    const row = createElement("div", "library-artifact");
+    row.append(
+      createElement("strong", "", artifact.kind),
+      createElement("span", "", artifact.relative_path),
+      createElement("span", "", formatBytes(artifact.size_bytes)),
+      createElement("code", "", artifact.sha256),
+      createElement("span", `integrity integrity-${artifact.integrity}`, artifact.integrity),
+    );
+    libraryArtifacts.append(row);
+  }
+}
+
+function renderLibrary(items, focusAwemeId) {
+  libraryList.replaceChildren();
+  libraryEmpty.hidden = items.length !== 0;
+  if (items.length === 0) {
+    selectedLibraryWork = null;
+    libraryDetail.hidden = true;
+    return;
+  }
+  const selected = items.find((item) => item.aweme_id === focusAwemeId)
+    || items.find((item) => item.aweme_id === selectedLibraryWork?.aweme_id)
+    || items[0];
+  for (const item of items) {
+    const button = createElement("button", "library-item");
+    button.type = "button";
+    button.dataset.awemeId = item.aweme_id;
+    button.setAttribute("aria-pressed", String(item.aweme_id === selected.aweme_id));
+    button.append(
+      createElement("strong", "", item.author || `作品 ${item.aweme_id}`),
+      createElement("span", "", item.aweme_id),
+      createElement("span", `library-state state-${item.status}`, libraryStatusText(item.status)),
+    );
+    button.addEventListener("click", () => {
+      renderLibraryDetail(item);
+      for (const candidate of libraryList.querySelectorAll(".library-item")) {
+        candidate.setAttribute("aria-pressed", String(candidate === button));
+      }
+    });
+    libraryList.append(button);
+  }
+  renderLibraryDetail(selected);
+  libraryList.querySelector(`[data-aweme-id="${CSS.escape(selected.aweme_id)}"]`)?.focus();
+}
+
+async function loadLibrary(focusAwemeId = null) {
+  if (libraryLoading) return;
+  libraryLoading = true;
+  pendingLibraryFocus = null;
+  libraryStatus.textContent = "正在读取本地档案…";
+  libraryError.textContent = "";
+  try {
+    const response = await fetch("/api/library");
+    if (!response.ok) {
+      libraryError.textContent = await responseErrorMessage(response);
+      libraryStatus.textContent = "";
+      return;
+    }
+    const payload = await response.json();
+    const items = Array.isArray(payload?.items) ? payload.items : [];
+    renderLibrary(items, focusAwemeId);
+    libraryStatus.textContent = items.length ? `共 ${items.length} 个作品` : "";
+  } catch (_) {
+    libraryError.textContent = UNKNOWN_ERROR;
+    libraryStatus.textContent = "";
+  } finally {
+    libraryLoading = false;
+  }
+}
+
+async function runLibraryAction(path, body = null) {
+  if (!selectedLibraryWork) return;
+  libraryError.textContent = "";
+  const options = { method: "POST" };
+  if (body !== null) {
+    options.headers = { "Content-Type": "application/json" };
+    options.body = JSON.stringify(body);
+  }
+  try {
+    const response = await fetch(path, options);
+    if (!response.ok) {
+      libraryError.textContent = await responseErrorMessage(response);
+      return;
+    }
+    await loadLibrary(selectedLibraryWork.aweme_id);
+  } catch (_) {
+    libraryError.textContent = UNKNOWN_ERROR;
+  }
+}
+
+libraryRefresh.addEventListener("click", () => loadLibrary(selectedLibraryWork?.aweme_id));
+libraryOpen.addEventListener("click", () => {
+  if (selectedLibraryWork) {
+    runLibraryAction(`/api/archive/work/${encodeURIComponent(selectedLibraryWork.aweme_id)}/open`);
+  }
+});
+librarySupplement.addEventListener("click", () => {
+  if (!selectedLibraryWork || (!libraryAudio.checked && !libraryDescription.checked)) return;
+  runLibraryAction(
+    `/api/library/${encodeURIComponent(selectedLibraryWork.aweme_id)}/supplement`,
+    { include_audio: libraryAudio.checked, include_description: libraryDescription.checked },
+  );
+});
+libraryRepair.addEventListener("click", () => {
+  if (selectedLibraryWork) {
+    runLibraryAction(`/api/library/${encodeURIComponent(selectedLibraryWork.aweme_id)}/repair`);
+  }
+});
+libraryForce.addEventListener("click", () => {
+  if (!selectedLibraryWork) return;
+  if (!window.confirm("这会重新下载并覆盖该作品当前方案中的成果。确定继续吗？")) return;
+  runLibraryAction(
+    `/api/library/${encodeURIComponent(selectedLibraryWork.aweme_id)}/force`,
+    { confirm_overwrite: true },
+  );
+});
 
 async function confirmTaskCancellation(retainParts, button) {
   const taskId = pendingCancelTaskId;
@@ -702,6 +904,8 @@ function setArchiveState(
   archiveStart.disabled = unavailable || locationUnavailable;
   archiveStart.textContent = needsRepair ? "修复本地归档" : "加入本地归档";
   archiveOpen.hidden = !(archived || needsRepair);
+  archiveLibrary.hidden = !(archived || needsRepair || locationUnavailable);
+  archiveTask.hidden = !currentArchiveOperationId;
 }
 
 async function refreshArchiveStatus(awemeId) {
@@ -748,6 +952,7 @@ form.addEventListener("submit", async (event) => {
 
   setParsingState(true);
   currentParse = null;
+  currentArchiveOperationId = null;
   result.hidden = true;
   showNotice("正在解析，请稍候…");
 
@@ -832,6 +1037,7 @@ archiveStart.addEventListener("click", async () => {
       return;
     }
     const payload = await response.json();
+    currentArchiveOperationId = payload.operation_id;
     setArchiveState(
       payload.status,
       payload.audio_outcome,
@@ -862,8 +1068,21 @@ archiveOpen.addEventListener("click", async () => {
   }
 });
 
+archiveLibrary.addEventListener("click", () => {
+  if (!currentParse) return;
+  pendingLibraryFocus = currentParse.awemeId;
+  activateWorkspace("library");
+});
+
+archiveTask.addEventListener("click", () => {
+  if (!currentArchiveOperationId) return;
+  pendingTaskFocus = currentArchiveOperationId;
+  activateWorkspace("tasks");
+});
+
 parseAnother.addEventListener("click", () => {
   currentParse = null;
+  currentArchiveOperationId = null;
   form.reset();
   result.hidden = true;
   cover.removeAttribute("src");

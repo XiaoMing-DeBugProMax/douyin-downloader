@@ -25,13 +25,15 @@ class TaskIds:
 
 @dataclass(frozen=True, slots=True)
 class StoredArchive:
-    ids: TaskIds
+    operation_id: str
     aweme_id: str
     root: Path
     relative_directory: Path
     status: str
     artifacts: tuple[ArtifactRecord, ...]
     settings: OperationSettingsSnapshot
+    author: str | None
+    published_at: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,42 +86,79 @@ class ArchiveStore:
         with self._connection() as connection:
             row = connection.execute(
                 """
-                SELECT o.operation_id, s.source_task_id, w.work_task_id,
-                       i.root_path, i.relative_directory, i.status,
-                       o.naming_template, o.profile_audio,
-                       o.profile_description, o.download_concurrency,
-                       o.retry_limit
-                FROM archive_items AS i
-                JOIN archive_operations AS o ON o.operation_id = i.operation_id
-                JOIN source_tasks AS s ON s.operation_id = o.operation_id
-                JOIN work_tasks AS w ON w.source_task_id = s.source_task_id
-                WHERE i.aweme_id = ?
+                 SELECT i.operation_id, i.root_path, i.relative_directory, i.status,
+                       i.naming_template, i.profile_audio,
+                       i.profile_description, i.download_concurrency,
+                       i.retry_limit, i.author_nickname, i.published_at
+                 FROM archive_items AS i
+                 WHERE i.aweme_id = ?
                 """,
                 (aweme_id,),
             ).fetchone()
         if row is None:
             return None
         return StoredArchive(
-            ids=TaskIds(str(row[0]), str(row[1]), str(row[2])),
+            operation_id=str(row[0]),
             aweme_id=aweme_id,
-            root=Path(str(row[3])),
-            relative_directory=Path(str(row[4])),
-            status=str(row[5]),
+            root=Path(str(row[1])),
+            relative_directory=Path(str(row[2])),
+            status=str(row[3]),
             artifacts=self._load_artifacts(aweme_id),
             settings=OperationSettingsSnapshot(
-                archive_root=Path(str(row[3])),
-                naming_template=NamingTemplate(str(row[6])),
-                profile=ArchiveProfile(bool(row[7]), bool(row[8])),
-                download_concurrency=int(row[9]),
-                retry_limit=int(row[10]),
+                archive_root=Path(str(row[1])),
+                naming_template=NamingTemplate(str(row[4])),
+                profile=ArchiveProfile(bool(row[5]), bool(row[6])),
+                download_concurrency=int(row[7]),
+                retry_limit=int(row[8]),
             ),
+            author=str(row[9]) if row[9] is not None else None,
+            published_at=int(row[10]) if row[10] is not None else None,
         )
+
+    def load_archive_task_ids(self, operation_id: str, aweme_id: str) -> TaskIds:
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT o.operation_id, s.source_task_id, w.work_task_id
+                FROM archive_operations AS o
+                JOIN source_tasks AS s ON s.operation_id = o.operation_id
+                JOIN work_tasks AS w ON w.source_task_id = s.source_task_id
+                WHERE o.operation_id = ? AND w.aweme_id = ?
+                """,
+                (operation_id, aweme_id),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("archive operation task records are unavailable")
+        return TaskIds(str(row[0]), str(row[1]), str(row[2]))
+
+    def list_archive_ids(self) -> tuple[str, ...]:
+        if not self._database_path.is_file():
+            return ()
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT aweme_id FROM archive_items ORDER BY aweme_id DESC"
+            ).fetchall()
+        return tuple(str(row[0]) for row in rows)
 
     def set_archive_status(self, aweme_id: str, status: str) -> None:
         with self._connection() as connection:
             connection.execute(
                 "UPDATE archive_items SET status=? WHERE aweme_id=?",
                 (status, aweme_id),
+            )
+
+    def update_library_metadata(
+        self,
+        aweme_id: str,
+        *,
+        author: str,
+        published_at: int | None,
+    ) -> None:
+        with self._connection() as connection:
+            connection.execute(
+                "UPDATE archive_items SET author_nickname=?, published_at=? "
+                "WHERE aweme_id=?",
+                (author, published_at, aweme_id),
             )
 
     def list_task_operations(self) -> tuple[StoredTaskOperation, ...]:
@@ -518,18 +557,44 @@ class ArchiveStore:
         root: Path,
         relative_directory: Path,
         artifacts: tuple[ArtifactRecord, ...],
+        author: str,
+        published_at: int | None,
+        settings: OperationSettingsSnapshot,
     ) -> None:
         with self._connection() as connection:
             connection.execute(
                 """
-                INSERT INTO archive_items VALUES (?, ?, ?, ?, 'promoting')
+                INSERT INTO archive_items
+                    (aweme_id, operation_id, root_path, relative_directory, status,
+                     author_nickname, published_at, naming_template, profile_audio,
+                     profile_description, download_concurrency, retry_limit)
+                VALUES (?, ?, ?, ?, 'promoting', ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(aweme_id) DO UPDATE SET
                     operation_id=excluded.operation_id,
                     root_path=excluded.root_path,
                     relative_directory=excluded.relative_directory,
-                    status='promoting'
+                    status='promoting',
+                    author_nickname=excluded.author_nickname,
+                    published_at=excluded.published_at,
+                    naming_template=excluded.naming_template,
+                    profile_audio=excluded.profile_audio,
+                    profile_description=excluded.profile_description,
+                    download_concurrency=excluded.download_concurrency,
+                    retry_limit=excluded.retry_limit
                 """,
-                (aweme_id, ids.operation, str(root), str(relative_directory)),
+                (
+                    aweme_id,
+                    ids.operation,
+                    str(root),
+                    str(relative_directory),
+                    author,
+                    published_at,
+                    str(settings.naming_template),
+                    int(settings.profile.include_audio),
+                    int(settings.profile.include_description),
+                    settings.download_concurrency,
+                    settings.retry_limit,
+                ),
             )
             connection.execute(
                 "DELETE FROM archive_artifacts WHERE aweme_id=?",
@@ -690,7 +755,14 @@ class ArchiveStore:
                 operation_id TEXT NOT NULL REFERENCES archive_operations(operation_id),
                 root_path TEXT NOT NULL,
                 relative_directory TEXT NOT NULL,
-                status TEXT NOT NULL
+                status TEXT NOT NULL,
+                author_nickname TEXT,
+                published_at INTEGER,
+                naming_template TEXT NOT NULL DEFAULT '{aweme_id}',
+                profile_audio INTEGER NOT NULL DEFAULT 0,
+                profile_description INTEGER NOT NULL DEFAULT 0,
+                download_concurrency INTEGER NOT NULL DEFAULT 3,
+                retry_limit INTEGER NOT NULL DEFAULT 3
             );
             CREATE TABLE IF NOT EXISTS archive_artifacts (
                 aweme_id TEXT NOT NULL REFERENCES archive_items(aweme_id)

@@ -179,6 +179,171 @@ def test_managed_archive_strip_updates_and_opens_folder(
     assert len(opened) == 1
 
 
+def test_quick_archive_result_locates_current_task(
+    page: Page,
+    local_app_url: str,
+) -> None:
+    page.route(
+        "**/api/archive/work/**",
+        lambda route: route.fulfill(
+            status=200,
+            json={
+                "aweme_id": "7429378937383308594",
+                "status": "not_archived",
+                "audio_outcome": "not_requested",
+                "description_outcome": "not_requested",
+                "can_open_folder": False,
+            },
+        ),
+    )
+    page.route(
+        "**/api/archive/single",
+        lambda route: route.fulfill(
+            status=200,
+            json={
+                "operation_id": "operation-1",
+                "aweme_id": "7429378937383308594",
+                "status": "archived",
+                "audio_outcome": "not_requested",
+                "description_outcome": "not_requested",
+                "can_open_folder": True,
+            },
+        ),
+    )
+    task = {
+        "task_id": "operation-1",
+        "lifecycle": "finished",
+        "phase": "idle",
+        "result": "success",
+        "progress": {
+            "completed_items": 1,
+            "total_items": 1,
+            "completed_bytes": 1024,
+            "total_bytes": 1024,
+            "percentage": 100.0,
+            "speed_bytes_per_second": None,
+            "eta_seconds": None,
+        },
+        "error": None,
+    }
+    page.route(
+        "**/api/tasks",
+        lambda route: route.fulfill(
+            status=200,
+            json={
+                "operations": [
+                    {
+                        "task": task,
+                        "source_tasks": [
+                            {
+                                "task": {**task, "task_id": "source-1"},
+                                "work_tasks": [
+                                    {
+                                        "task": {**task, "task_id": "work-1"},
+                                        "aweme_id": "7429378937383308594",
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ]
+            },
+        ),
+    )
+    parse_video(page, local_app_url)
+    page.locator("#archive-start").click()
+    expect(page.locator("#archive-task")).to_be_visible()
+
+    page.locator("#archive-task").click()
+
+    expect(page.locator("#tasks-workspace")).to_be_visible()
+    expect(page.locator('[data-operation-id="operation-1"]')).to_be_focused()
+
+
+def test_quick_result_locates_library_work_and_confirms_force_rearchive(
+    page: Page,
+    local_app_url: str,
+) -> None:
+    actions: list[tuple[str, object]] = []
+    item = {
+        "aweme_id": "7429378937383308594",
+        "author": "测试作者",
+        "published_at": 1_720_000_000,
+        "profile": {"include_audio": False, "include_description": False},
+        "root": "D:\\Archive",
+        "relative_directory": "author\\2024\\work-7429378937383308594",
+        "status": "needs_repair",
+        "artifacts": [
+            {
+                "kind": "video",
+                "relative_path": "7429378937383308594.mp4",
+                "size_bytes": 1024,
+                "mime_type": "video/mp4",
+                "sha256": "a" * 64,
+                "integrity": "invalid",
+            }
+        ],
+    }
+
+    page.route(
+        "**/api/archive/work/**",
+        lambda route: route.fulfill(
+            status=200,
+            json={
+                "aweme_id": item["aweme_id"],
+                "status": "archived",
+                "audio_outcome": "not_requested",
+                "description_outcome": "not_requested",
+                "can_open_folder": True,
+            },
+        ),
+    )
+
+    def handle_library(route: Route) -> None:
+        request = route.request
+        if request.method == "GET":
+            route.fulfill(status=200, json={"items": [item]})
+            return
+        actions.append((request.url.rsplit("/", 1)[-1], request.post_data_json))
+        route.fulfill(
+            status=200,
+            json={
+                "operation_id": "library-action",
+                "aweme_id": item["aweme_id"],
+                "status": "archived",
+                "audio_outcome": "ready",
+                "description_outcome": "not_requested",
+                "can_open_folder": True,
+            },
+        )
+
+    page.route("**/api/library**", handle_library)
+    parse_video(page, local_app_url)
+    expect(page.locator("#archive-library")).to_be_visible()
+
+    page.locator("#archive-library").click()
+
+    expect(page.locator("#library-workspace")).to_be_visible()
+    expect(page.locator(".library-item")).to_have_count(1)
+    expect(page.locator(".library-item")).to_have_attribute("aria-pressed", "true")
+    expect(page.locator("#library-detail-title")).to_have_text("测试作者")
+    expect(page.locator("#library-artifacts")).to_contain_text("invalid")
+    page.locator("#library-audio").check()
+    with page.expect_request(lambda request: request.url.endswith("/supplement")):
+        page.locator("#library-supplement").click()
+    assert len(actions) == 1
+    assert actions[0] == (
+        "supplement",
+        {"include_audio": True, "include_description": False},
+    )
+
+    page.once("dialog", lambda dialog: dialog.accept())
+    with page.expect_request(lambda request: request.url.endswith("/force")):
+        page.locator("#library-force").click()
+    assert len(actions) == 2
+    assert actions[1] == ("force", {"confirm_overwrite": True})
+
+
 def test_split_description_only_extracts_trailing_tags(
     page: Page,
     local_app_url: str,
