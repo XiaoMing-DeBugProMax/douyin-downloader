@@ -8,7 +8,11 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 
-from douyin_downloader.archive_artifacts import ArchiveMetadata, validate_metadata
+from douyin_downloader.archive_artifacts import (
+    ArchiveMetadata,
+    ArtifactMetadata,
+    validate_metadata,
+)
 from douyin_downloader.archive_paths import is_reparse_point, pin_work_directory
 from douyin_downloader.archive_store import ArchiveStore
 from douyin_downloader.database_safety import (
@@ -352,46 +356,61 @@ def _validated_rebuild_item(
                 return None
             document = validate_metadata(pinned_metadata, aweme_id)
             metadata_payload = pinned_metadata.read_bytes()
-        artifacts: list[tuple[str, str, int, str, str]] = []
-        for artifact in document.artifacts:
-            relative_artifact = Path(artifact.path)
-            artifact_parent = relative_directory / relative_artifact.parent
-            with pin_work_directory(
-                root,
-                artifact_parent,
-                create=False,
-            ) as artifact_directory:
-                path = artifact_directory / relative_artifact.name
-                if (
-                    is_reparse_point(path)
-                    or not path.is_file()
-                    or file_contains_sensitive_marker(path)
-                ):
-                    return None
-                payload = path.read_bytes()
-            if (
-                len(payload) != artifact.size_bytes
-                or hashlib.sha256(payload).hexdigest() != artifact.sha256
-            ):
-                return None
+            artifacts: list[tuple[str, str, int, str, str]] = []
+            for artifact in document.artifacts:
+                relative_artifact = Path(artifact.path)
+                if relative_artifact.parent == Path():
+                    item = _validated_artifact(directory, relative_artifact, artifact)
+                    if item is None:
+                        return None
+                    artifacts.append(item)
+                    continue
+                with pin_work_directory(
+                    directory,
+                    relative_artifact.parent,
+                    create=False,
+                    require_delete_access=False,
+                ) as artifact_directory:
+                    item = _validated_artifact(
+                        artifact_directory,
+                        relative_artifact,
+                        artifact,
+                    )
+                    if item is None:
+                        return None
+                    artifacts.append(item)
             artifacts.append(
                 (
-                    artifact.kind,
-                    artifact.path,
-                    artifact.size_bytes,
-                    artifact.mime_type,
-                    artifact.sha256,
+                    "metadata",
+                    metadata_path.name,
+                    len(metadata_payload),
+                    "application/json",
+                    hashlib.sha256(metadata_payload).hexdigest(),
                 )
             )
-        artifacts.append(
-            (
-                "metadata",
-                metadata_path.name,
-                len(metadata_payload),
-                "application/json",
-                hashlib.sha256(metadata_payload).hexdigest(),
-            )
-        )
-        return document, relative_directory, tuple(artifacts)
+            return document, relative_directory, tuple(artifacts)
     except (OSError, AppError, ValueError):
         return None
+
+
+def _validated_artifact(
+    directory: Path,
+    relative_artifact: Path,
+    artifact: ArtifactMetadata,
+) -> tuple[str, str, int, str, str] | None:
+    path = directory / relative_artifact.name
+    if (
+        is_reparse_point(path)
+        or not path.is_file()
+        or file_contains_sensitive_marker(path)
+    ):
+        return None
+    payload = path.read_bytes()
+    kind = artifact.kind
+    artifact_path = artifact.path
+    size_bytes = artifact.size_bytes
+    mime_type = artifact.mime_type
+    sha256 = artifact.sha256
+    if len(payload) != size_bytes or hashlib.sha256(payload).hexdigest() != sha256:
+        return None
+    return kind, artifact_path, size_bytes, mime_type, sha256

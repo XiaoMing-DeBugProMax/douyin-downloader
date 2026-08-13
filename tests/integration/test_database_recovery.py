@@ -408,6 +408,7 @@ def test_rebuild_never_allows_delete_sharing_for_pinned_read_directories(
         *,
         create: bool,
         share_delete: bool = False,
+        require_delete_access: bool = True,
     ) -> archive_paths.PinnedWorkDirectory:
         calls.append(share_delete)
         return original(
@@ -415,6 +416,7 @@ def test_rebuild_never_allows_delete_sharing_for_pinned_read_directories(
             relative,
             create=create,
             share_delete=share_delete,
+            require_delete_access=require_delete_access,
         )
 
     monkeypatch.setattr(

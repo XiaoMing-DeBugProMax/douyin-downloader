@@ -60,6 +60,7 @@ def pin_work_directory(
     *,
     create: bool,
     share_delete: bool = False,
+    require_delete_access: bool = True,
 ) -> PinnedWorkDirectory:
     if relative_directory.is_absolute() or ".." in relative_directory.parts:
         raise archive_path_invalid()
@@ -67,7 +68,9 @@ def pin_work_directory(
     try:
         resolved_root = root.resolve(strict=True)
         root_handle, pinned_root = _open_directory_handle(
-            resolved_root, share_delete=share_delete
+            resolved_root,
+            share_delete=share_delete,
+            require_delete_access=require_delete_access,
         )
         handles.append(root_handle)
         if pinned_root != resolved_root:
@@ -81,7 +84,9 @@ def pin_work_directory(
             if is_reparse_point(candidate) or not candidate.is_dir():
                 raise archive_path_invalid()
             handle, pinned_path = _open_directory_handle(
-                candidate, share_delete=share_delete
+                candidate,
+                share_delete=share_delete,
+                require_delete_access=require_delete_access,
             )
             handles.append(handle)
             if (
@@ -113,7 +118,12 @@ def archive_path_invalid() -> AppError:
     return AppError("ARCHIVE_PATH_INVALID", "归档路径无效。", 409)
 
 
-def _open_directory_handle(path: Path, *, share_delete: bool = False) -> tuple[int, Path]:
+def _open_directory_handle(
+    path: Path,
+    *,
+    share_delete: bool = False,
+    require_delete_access: bool = True,
+) -> tuple[int, Path]:
     if os.name != "nt":
         flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
         flags |= getattr(os, "O_NOFOLLOW", 0)
@@ -154,7 +164,7 @@ def _open_directory_handle(path: Path, *, share_delete: bool = False) -> tuple[i
         share_mode |= _FILE_SHARE_DELETE
     raw_handle = create_file(
         str(path),
-        _FILE_READ_ATTRIBUTES | _DELETE_ACCESS,
+        _FILE_READ_ATTRIBUTES | (_DELETE_ACCESS if require_delete_access else 0),
         share_mode,
         None,
         _OPEN_EXISTING,
