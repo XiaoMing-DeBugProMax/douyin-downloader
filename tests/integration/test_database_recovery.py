@@ -346,6 +346,10 @@ def test_rebuild_skips_corrupt_metadata_archives_and_never_publishes_empty_db(
         "s_v_web_id=ABCDEFGHIJKLMNOPQRSTUVWXYZ123456",
         "launch_token=ABCDEFGHIJKLMNOPQRSTUVWXYZ123456",
         "https://v95-web.douyinvod.com/video.mp4?signature=secret",
+        "https://v95-web.bytevcloud.com/video.mp4?unknown=secret",
+        "https://v95-web.bytecdn.cn/video.mp4?unknown=secret",
+        "https://p3.byteimg.com/cover.png?unknown=secret",
+        "https://p3.byteimg.cn/cover.png?unknown=secret",
     ),
 )
 def test_rebuild_rejects_sensitive_metadata_values(
@@ -385,6 +389,44 @@ def test_rebuild_rejects_an_intermediate_reparse_artifact_directory(
 
     assert raised.value.code == "DATABASE_REBUILD_EMPTY"
     assert not database.exists()
+
+
+def test_rebuild_never_allows_delete_sharing_for_pinned_read_directories(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "archive.db"
+    root = tmp_path / "library"
+    root.mkdir()
+    write_rebuildable_archive(root, nested_video=True)
+    calls: list[bool] = []
+    original = archive_paths.pin_work_directory
+
+    def recording_pin(
+        pin_root: Path,
+        relative: Path,
+        *,
+        create: bool,
+        share_delete: bool = False,
+    ) -> archive_paths.PinnedWorkDirectory:
+        calls.append(share_delete)
+        return original(
+            pin_root,
+            relative,
+            create=create,
+            share_delete=share_delete,
+        )
+
+    monkeypatch.setattr(
+        "douyin_downloader.database_recovery.pin_work_directory",
+        recording_pin,
+    )
+
+    result = DatabaseRecovery(database).rebuild_from_metadata(root)
+
+    assert result.rebuilt_archives == 1
+    assert calls
+    assert not any(calls)
 
 
 def test_sensitive_session_values_never_enter_backup_list(tmp_path: Path) -> None:

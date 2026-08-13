@@ -341,12 +341,7 @@ def _validated_rebuild_item(
 ) -> tuple[ArchiveMetadata, Path, tuple[tuple[str, str, int, str, str], ...]] | None:
     try:
         relative_directory = metadata_path.parent.relative_to(root)
-        with pin_work_directory(
-            root,
-            relative_directory,
-            create=False,
-            share_delete=True,
-        ) as directory:
+        with pin_work_directory(root, relative_directory, create=False) as directory:
             pinned_metadata = directory / metadata_path.name
             if is_reparse_point(pinned_metadata) or file_contains_sensitive_marker(
                 pinned_metadata
@@ -356,47 +351,47 @@ def _validated_rebuild_item(
             if not aweme_id.isdigit():
                 return None
             document = validate_metadata(pinned_metadata, aweme_id)
-            artifacts: list[tuple[str, str, int, str, str]] = []
-            for artifact in document.artifacts:
-                relative_artifact = Path(artifact.path)
-                with pin_work_directory(
-                    directory,
-                    relative_artifact.parent,
-                    create=False,
-                    share_delete=True,
-                ) as artifact_directory:
-                    path = artifact_directory / relative_artifact.name
-                    if (
-                        is_reparse_point(path)
-                        or not path.is_file()
-                        or file_contains_sensitive_marker(path)
-                    ):
-                        return None
-                    payload = path.read_bytes()
+            metadata_payload = pinned_metadata.read_bytes()
+        artifacts: list[tuple[str, str, int, str, str]] = []
+        for artifact in document.artifacts:
+            relative_artifact = Path(artifact.path)
+            artifact_parent = relative_directory / relative_artifact.parent
+            with pin_work_directory(
+                root,
+                artifact_parent,
+                create=False,
+            ) as artifact_directory:
+                path = artifact_directory / relative_artifact.name
                 if (
-                    len(payload) != artifact.size_bytes
-                    or hashlib.sha256(payload).hexdigest() != artifact.sha256
+                    is_reparse_point(path)
+                    or not path.is_file()
+                    or file_contains_sensitive_marker(path)
                 ):
                     return None
-                artifacts.append(
-                    (
-                        artifact.kind,
-                        artifact.path,
-                        artifact.size_bytes,
-                        artifact.mime_type,
-                        artifact.sha256,
-                    )
-                )
-            metadata_payload = pinned_metadata.read_bytes()
+                payload = path.read_bytes()
+            if (
+                len(payload) != artifact.size_bytes
+                or hashlib.sha256(payload).hexdigest() != artifact.sha256
+            ):
+                return None
             artifacts.append(
                 (
-                    "metadata",
-                    pinned_metadata.name,
-                    len(metadata_payload),
-                    "application/json",
-                    hashlib.sha256(metadata_payload).hexdigest(),
+                    artifact.kind,
+                    artifact.path,
+                    artifact.size_bytes,
+                    artifact.mime_type,
+                    artifact.sha256,
                 )
             )
-            return document, relative_directory, tuple(artifacts)
+        artifacts.append(
+            (
+                "metadata",
+                metadata_path.name,
+                len(metadata_payload),
+                "application/json",
+                hashlib.sha256(metadata_payload).hexdigest(),
+            )
+        )
+        return document, relative_directory, tuple(artifacts)
     except (OSError, AppError, ValueError):
         return None
