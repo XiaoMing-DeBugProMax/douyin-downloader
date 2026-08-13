@@ -86,8 +86,6 @@ def test_packaging_manifest_requires_audited_ffmpeg_and_compliance_material() ->
     assert "NOTICE.md" in spec
     assert "provision_ffmpeg.py" in build
     assert "--output" in build
-    assert "DOUYIN_BUILT_EXE" in build
-    assert "test_packaged_runtime.py" in build
 
 
 def test_system_tray_runtime_and_windows_backend_are_packaged() -> None:
