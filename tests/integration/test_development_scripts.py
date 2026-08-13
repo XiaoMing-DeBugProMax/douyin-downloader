@@ -64,6 +64,43 @@ def test_verify_focused_runs_only_the_requested_pytest_node() -> None:
     assert "VERIFY_RESULT=ok" in result.stdout
 
 
+def test_verify_focused_propagates_the_pytest_failure_exit_code() -> None:
+    project_root = Path(__file__).parents[2]
+    script = project_root / "scripts" / "verify.ps1"
+    missing_node = "tests/unit/test_app_baseline.py::test_node_does_not_exist"
+
+    result = _run_powershell(script, "-Focused", missing_node, cwd=project_root)
+
+    assert result.returncode == 4, result.stdout + result.stderr
+    assert f"VERIFY_FOCUSED={missing_node}" in result.stdout
+    assert "VERIFY_RESULT=ok" not in result.stdout
+
+
+def test_python_failure_classifier_recognizes_localized_access_denial() -> None:
+    project_root = Path(__file__).parents[2]
+    helper = project_root / "scripts" / "python-environment.ps1"
+    command = (
+        f". '{helper}'; "
+        "$message = [string]([char]0x62D2) + [char]0x7EDD + "
+        "[char]0x8BBF + [char]0x95EE; "
+        "Get-PythonFailureCode -Message $message "
+        "-FallbackCode 'PYTHON_UNAVAILABLE'"
+    )
+
+    result = subprocess.run(  # noqa: S603
+        [str(POWERSHELL), "-NoProfile", "-Command", command],
+        cwd=project_root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == "PYTHON_EXECUTION_DENIED"
+
+
 def test_bootstrap_check_reuses_the_read_only_preflight() -> None:
     project_root = Path(__file__).parents[2]
     script = project_root / "scripts" / "bootstrap-dev.ps1"
@@ -96,6 +133,10 @@ def test_verify_uses_the_common_repository_venv_from_a_linked_worktree(
             project_root / "scripts" / "verify.ps1",
             worktree / "scripts" / "verify.ps1",
         )
+        shutil.copy2(
+            project_root / "scripts" / "python-environment.ps1",
+            worktree / "scripts" / "python-environment.ps1",
+        )
         result = _run_powershell(
             worktree / "scripts" / "verify.ps1",
             "-Preflight",
@@ -126,6 +167,10 @@ def test_verify_classifies_a_broken_launcher_as_an_incomplete_venv(tmp_path: Pat
     scripts = repository / "scripts"
     scripts.mkdir(parents=True)
     shutil.copy2(project_root / "scripts" / "verify.ps1", scripts / "verify.ps1")
+    shutil.copy2(
+        project_root / "scripts" / "python-environment.ps1",
+        scripts / "python-environment.ps1",
+    )
     (repository / "src").mkdir()
     subprocess.run(  # noqa: S603
         [str(GIT), "init", "--quiet"],
@@ -162,6 +207,10 @@ def test_bootstrap_repair_rebuilds_an_existing_broken_venv(tmp_path: Path) -> No
         (dependency_package / "__init__.py").write_text("", encoding="utf-8")
     tests.mkdir()
     shutil.copy2(project_root / "scripts" / "verify.ps1", scripts / "verify.ps1")
+    shutil.copy2(
+        project_root / "scripts" / "python-environment.ps1",
+        scripts / "python-environment.ps1",
+    )
     shutil.copy2(
         project_root / "scripts" / "bootstrap-dev.ps1",
         scripts / "bootstrap-dev.ps1",
@@ -230,6 +279,10 @@ def test_bootstrap_refuses_to_clear_a_broken_venv_without_repair(tmp_path: Path)
     repository = tmp_path / "repository"
     scripts = repository / "scripts"
     scripts.mkdir(parents=True)
+    shutil.copy2(
+        project_root / "scripts" / "python-environment.ps1",
+        scripts / "python-environment.ps1",
+    )
     shutil.copy2(
         project_root / "scripts" / "bootstrap-dev.ps1",
         scripts / "bootstrap-dev.ps1",

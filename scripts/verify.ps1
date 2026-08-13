@@ -12,6 +12,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+. (Join-Path $PSScriptRoot 'python-environment.ps1')
+
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $sourceRoot = (Resolve-Path (Join-Path $projectRoot 'src')).Path
 
@@ -73,25 +75,17 @@ try {
 }
 catch {
     $message = $_.Exception.Message
-    if ($message -match 'Access is denied|Unable to create process') {
+    $code = Get-PythonFailureCode -Message $message -FallbackCode 'PYTHON_UNAVAILABLE'
+    if ($code -eq 'PYTHON_EXECUTION_DENIED') {
         Stop-Verification `
-            -Code 'PYTHON_EXECUTION_DENIED' `
+            -Code $code `
             -Message "Python exists but cannot run in the current execution boundary: $python"
     }
-    if ($message -match 'No Python at|cannot find') {
-        Stop-Verification -Code 'VENV_INCOMPLETE' -Message $message
-    }
-    Stop-Verification -Code 'PYTHON_UNAVAILABLE' -Message $message
+    Stop-Verification -Code $code -Message $message
 }
 
 if ($LASTEXITCODE -ne 0) {
-    $code = 'PYTHON_UNAVAILABLE'
-    if ($version -match 'Access is denied|Unable to create process') {
-        $code = 'PYTHON_EXECUTION_DENIED'
-    }
-    if ($version -match 'No Python at|cannot find') {
-        $code = 'VENV_INCOMPLETE'
-    }
+    $code = Get-PythonFailureCode -Message $version -FallbackCode 'PYTHON_UNAVAILABLE'
     Stop-Verification `
         -Code $code `
         -Message "Python exited with code ${LASTEXITCODE}: $version" `

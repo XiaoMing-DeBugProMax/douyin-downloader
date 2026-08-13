@@ -9,6 +9,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+. (Join-Path $PSScriptRoot 'python-environment.ps1')
+
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $verifyScript = Join-Path $PSScriptRoot 'verify.ps1'
 $powerShell = Join-Path $PSHOME 'powershell.exe'
@@ -86,16 +88,18 @@ try {
 }
 catch {
     $message = $_.Exception.Message
-    if ($message -match 'Access is denied') {
+    $code = Get-PythonFailureCode -Message $message -FallbackCode 'PYTHON_UNAVAILABLE'
+    if ($code -eq 'PYTHON_EXECUTION_DENIED') {
         Stop-Bootstrap `
-            -Code 'PYTHON_EXECUTION_DENIED' `
+            -Code $code `
             -Message "Python exists but cannot run in the current execution boundary: $basePython"
     }
-    Stop-Bootstrap -Code 'PYTHON_UNAVAILABLE' -Message $message
+    Stop-Bootstrap -Code $code -Message $message
 }
 if ($LASTEXITCODE -ne 0) {
+    $code = Get-PythonFailureCode -Message $baseVersion -FallbackCode 'PYTHON_UNAVAILABLE'
     Stop-Bootstrap `
-        -Code 'PYTHON_UNAVAILABLE' `
+        -Code $code `
         -Message "Python exited with code ${LASTEXITCODE}: $baseVersion" `
         -ExitCode $LASTEXITCODE
 }
