@@ -12,12 +12,11 @@ import douyin_downloader.launcher as launcher_module
 from douyin_downloader.launcher import (
     ControlWindow,
     ServerStartError,
-    TrayActions,
-    WindowsTray,
     main,
 )
 from douyin_downloader.runtime import RuntimeStore
 from douyin_downloader.session import SessionManager
+from douyin_downloader.system_tray import TrayActions, WindowsTray
 
 
 class FakeRoot:

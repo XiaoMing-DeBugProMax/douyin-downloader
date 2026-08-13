@@ -459,57 +459,34 @@ class ArchiveStore:
                 speed_bytes_per_second,
                 eta_seconds,
             )
-            connection.execute(
-                "UPDATE archive_operations SET phase=?, completed_bytes=?, "
-                "total_bytes=?, speed_bytes_per_second=?, eta_seconds=? "
-                "WHERE operation_id=?",
-                (*values, ids.operation),
-            )
-            connection.execute(
-                "UPDATE source_tasks SET phase=?, completed_bytes=?, total_bytes=?, "
-                "speed_bytes_per_second=?, eta_seconds=? "
-                "WHERE source_task_id=?",
-                (*values, ids.source),
-            )
-            connection.execute(
-                "UPDATE work_tasks SET phase=?, completed_bytes=?, total_bytes=?, "
-                "speed_bytes_per_second=?, eta_seconds=? "
-                "WHERE work_task_id=?",
-                (*values, ids.work),
+            _update_task_hierarchy(
+                connection,
+                ids,
+                set_clause=(
+                    "phase=?, completed_bytes=?, total_bytes=?, "
+                    "speed_bytes_per_second=?, eta_seconds=?"
+                ),
+                values=values,
             )
 
     def set_task_lifecycle(self, ids: TaskIds, lifecycle: str) -> None:
         with self._connection() as connection:
-            connection.execute(
-                "UPDATE archive_operations SET lifecycle=? WHERE operation_id=?",
-                (lifecycle, ids.operation),
-            )
-            connection.execute(
-                "UPDATE source_tasks SET lifecycle=? WHERE source_task_id=?",
-                (lifecycle, ids.source),
-            )
-            connection.execute(
-                "UPDATE work_tasks SET lifecycle=? WHERE work_task_id=?",
-                (lifecycle, ids.work),
+            _update_task_hierarchy(
+                connection,
+                ids,
+                set_clause="lifecycle=?",
+                values=(lifecycle,),
             )
 
     def interrupt(self, ids: TaskIds) -> None:
         with self._connection() as connection:
-            values = ("interrupted", "idle", None, None)
-            connection.execute(
-                "UPDATE archive_operations SET lifecycle=?, phase=?, "
-                "speed_bytes_per_second=?, eta_seconds=? WHERE operation_id=?",
-                (*values, ids.operation),
-            )
-            connection.execute(
-                "UPDATE source_tasks SET lifecycle=?, phase=?, "
-                "speed_bytes_per_second=?, eta_seconds=? WHERE source_task_id=?",
-                (*values, ids.source),
-            )
-            connection.execute(
-                "UPDATE work_tasks SET lifecycle=?, phase=?, "
-                "speed_bytes_per_second=?, eta_seconds=? WHERE work_task_id=?",
-                (*values, ids.work),
+            _update_task_hierarchy(
+                connection,
+                ids,
+                set_clause=(
+                    "lifecycle=?, phase=?, speed_bytes_per_second=?, eta_seconds=?"
+                ),
+                values=("interrupted", "idle", None, None),
             )
 
     def restart_interrupted(self, ids: TaskIds) -> None:
@@ -868,6 +845,25 @@ def _stored_task(row: tuple[object, ...]) -> StoredTask:
         speed_bytes_per_second=float(str(row[7])) if row[7] is not None else None,
         eta_seconds=int(str(row[8])) if row[8] is not None else None,
     )
+
+
+def _update_task_hierarchy(
+    connection: sqlite3.Connection,
+    ids: TaskIds,
+    *,
+    set_clause: str,
+    values: tuple[object, ...],
+) -> None:
+    targets = (
+        ("archive_operations", "operation_id", ids.operation),
+        ("source_tasks", "source_task_id", ids.source),
+        ("work_tasks", "work_task_id", ids.work),
+    )
+    for table, id_column, task_id in targets:
+        connection.execute(
+            f"UPDATE {table} SET {set_clause} WHERE {id_column}=?",  # noqa: S608
+            (*values, task_id),
+        )
 
 
 def _set_task_results(
