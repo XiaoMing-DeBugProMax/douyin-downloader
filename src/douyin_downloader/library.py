@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Protocol
 
 from douyin_downloader.archive import (
     ArchiveOperationSnapshot,
     WorkArchiveSnapshot,
 )
+from douyin_downloader.archive_adapters import RecycleBin, WindowsRecycleBin
 from douyin_downloader.domain import AppError
 from douyin_downloader.settings import ArchiveProfile
 
@@ -26,12 +28,23 @@ class ManagedArchiveGateway(Protocol):
         force: bool = False,
     ) -> ArchiveOperationSnapshot: ...
 
+    def relocate_registered_archive(
+        self, aweme_id: str, archive_root: Path
+    ) -> WorkArchiveSnapshot: ...
+
+    def delete_registered_archive(self, aweme_id: str, recycle_bin: RecycleBin) -> None: ...
+
 
 class LocalArchiveLibrary:
     """Work-centred library boundary over managed archive commands."""
 
-    def __init__(self, managed_archive: ManagedArchiveGateway) -> None:
+    def __init__(
+        self,
+        managed_archive: ManagedArchiveGateway,
+        recycle_bin: RecycleBin | None = None,
+    ) -> None:
         self._managed_archive = managed_archive
+        self._recycle_bin = recycle_bin or WindowsRecycleBin()
 
     def list_works(self) -> tuple[WorkArchiveSnapshot, ...]:
         items: list[WorkArchiveSnapshot] = []
@@ -89,6 +102,20 @@ class LocalArchiveLibrary:
             profile=item.profile,
             force=True,
         )
+
+    def relocate(self, aweme_id: str, archive_root: Path) -> WorkArchiveSnapshot:
+        self._required_work(aweme_id)
+        return self._managed_archive.relocate_registered_archive(aweme_id, archive_root)
+
+    def delete(self, aweme_id: str, *, confirm_recycle: bool) -> None:
+        if not confirm_recycle:
+            raise AppError(
+                "ARCHIVE_DELETE_CONFIRMATION_REQUIRED",
+                "删除本地档案前必须明确确认移入回收站。",
+                409,
+            )
+        self._required_work(aweme_id)
+        self._managed_archive.delete_registered_archive(aweme_id, self._recycle_bin)
 
     def _required_work(self, aweme_id: str) -> WorkArchiveSnapshot:
         item = self.get_work(aweme_id)

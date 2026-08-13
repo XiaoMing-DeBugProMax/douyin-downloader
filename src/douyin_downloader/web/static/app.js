@@ -63,8 +63,10 @@ const libraryOpen = document.querySelector("#library-open");
 const libraryAudio = document.querySelector("#library-audio");
 const libraryDescription = document.querySelector("#library-description");
 const librarySupplement = document.querySelector("#library-supplement");
+const libraryRelocate = document.querySelector("#library-relocate");
 const libraryRepair = document.querySelector("#library-repair");
 const libraryForce = document.querySelector("#library-force");
+const libraryDelete = document.querySelector("#library-delete");
 
 let currentParse = null;
 let isParsing = false;
@@ -682,7 +684,35 @@ async function runLibraryAction(path, body = null) {
   }
 }
 
+async function runLibraryDelete() {
+  if (!selectedLibraryWork) return;
+  libraryError.textContent = "";
+  try {
+    const response = await fetch(
+      `/api/library/${encodeURIComponent(selectedLibraryWork.aweme_id)}`,
+      {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ confirm_recycle: true }),
+      },
+    );
+    if (!response.ok) {
+      libraryError.textContent = await responseErrorMessage(response);
+      return;
+    }
+    selectedLibraryWork = null;
+    await loadLibrary();
+  } catch (_) {
+    libraryError.textContent = UNKNOWN_ERROR;
+  }
+}
+
 libraryRefresh.addEventListener("click", () => loadLibrary(selectedLibraryWork?.aweme_id));
+libraryRelocate.addEventListener("click", () => {
+  if (selectedLibraryWork) {
+    runLibraryAction(`/api/library/${encodeURIComponent(selectedLibraryWork.aweme_id)}/relocate`);
+  }
+});
 libraryOpen.addEventListener("click", () => {
   if (selectedLibraryWork) {
     runLibraryAction(`/api/archive/work/${encodeURIComponent(selectedLibraryWork.aweme_id)}/open`);
@@ -707,6 +737,11 @@ libraryForce.addEventListener("click", () => {
     `/api/library/${encodeURIComponent(selectedLibraryWork.aweme_id)}/force`,
     { confirm_overwrite: true },
   );
+});
+libraryDelete.addEventListener("click", () => {
+  if (!selectedLibraryWork) return;
+  if (!window.confirm("将把该作品的整个档案目录移入 Windows 回收站。确定继续吗？")) return;
+  runLibraryDelete();
 });
 
 async function confirmTaskCancellation(retainParts, button) {

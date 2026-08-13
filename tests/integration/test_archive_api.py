@@ -18,7 +18,7 @@ from douyin_downloader.archive import (
     TaskSnapshot,
     WorkArchiveSnapshot,
 )
-from douyin_downloader.domain import ParsedVideo, ResolvedShare
+from douyin_downloader.domain import AppError, ParsedVideo, ResolvedShare
 from douyin_downloader.parse_service import ParseService
 from douyin_downloader.session import SessionManager
 from douyin_downloader.settings import ArchiveProfile, SettingsModule
@@ -63,6 +63,8 @@ class RecordingManagedArchive:
         self.supplements: list[tuple[str, bool, bool]] = []
         self.repairs: list[str] = []
         self.forced: list[tuple[str, bool]] = []
+        self.relocations: list[tuple[str, Path]] = []
+        self.deletions: list[tuple[str, bool]] = []
 
     async def archive_single(
         self,
@@ -120,6 +122,30 @@ class RecordingManagedArchive:
     ) -> ArchiveOperationSnapshot:
         self.forced.append((aweme_id, confirm_overwrite))
         return self._action_result(aweme_id)
+
+    def relocate(self, aweme_id: str, archive_root: Path) -> WorkArchiveSnapshot:
+        self.relocations.append((aweme_id, archive_root))
+        item = self.get_work(aweme_id)
+        assert item is not None
+        return WorkArchiveSnapshot(
+            aweme_id=item.aweme_id,
+            author=item.author,
+            published_at=item.published_at,
+            profile=item.profile,
+            root=archive_root,
+            relative_directory=item.relative_directory,
+            status="archived",
+            artifacts=item.artifacts,
+        )
+
+    def delete(self, aweme_id: str, *, confirm_recycle: bool) -> None:
+        if not confirm_recycle:
+            raise AppError(
+                "ARCHIVE_DELETE_CONFIRMATION_REQUIRED",
+                "confirmation required",
+                409,
+            )
+        self.deletions.append((aweme_id, confirm_recycle))
 
     def _action_result(self, aweme_id: str) -> ArchiveOperationSnapshot:
         task = TaskSnapshot("library-action", "finished", "idle", "success")
@@ -310,6 +336,7 @@ async def test_library_routes_list_detail_and_dispatch_explicit_actions(
                 media_client=media_client,
                 managed_archive=managed_archive,
                 archive_library=managed_archive,
+                directory_chooser=StaticDirectoryChooser(tmp_path / "relocated"),
             ),
             session_manager=sessions,
             testing=True,
@@ -345,6 +372,23 @@ async def test_library_routes_list_detail_and_dispatch_explicit_actions(
                 f"/api/library/{VIDEO.aweme_id}/repair",
                 headers={"origin": "https://example.com"},
             )
+            (tmp_path / "relocated").mkdir()
+            relocate = await client.post(
+                f"/api/library/{VIDEO.aweme_id}/relocate",
+                headers=headers,
+            )
+            delete_without_confirmation = await client.request(
+                "DELETE",
+                f"/api/library/{VIDEO.aweme_id}",
+                headers=headers,
+                json={"confirm_recycle": False},
+            )
+            deleted = await client.request(
+                "DELETE",
+                f"/api/library/{VIDEO.aweme_id}",
+                headers=headers,
+                json={"confirm_recycle": True},
+            )
 
     assert listing.status_code == 200
     assert listing.json()["items"] == [detail.json()]
@@ -370,9 +414,15 @@ async def test_library_routes_list_detail_and_dispatch_explicit_actions(
     assert supplement.status_code == repair.status_code == force.status_code == 200
     assert missing_confirmation.status_code == 400
     assert cross_origin.status_code == 403
+    assert relocate.status_code == 200
+    assert relocate.json()["root"] == str(tmp_path / "relocated")
+    assert delete_without_confirmation.status_code == 409
+    assert deleted.status_code == 204
     assert managed_archive.supplements == [(VIDEO.aweme_id, True, False)]
     assert managed_archive.repairs == [VIDEO.aweme_id]
     assert managed_archive.forced == [(VIDEO.aweme_id, True)]
+    assert managed_archive.relocations == [(VIDEO.aweme_id, tmp_path / "relocated")]
+    assert managed_archive.deletions == [(VIDEO.aweme_id, True)]
 
 
 @pytest.mark.asyncio

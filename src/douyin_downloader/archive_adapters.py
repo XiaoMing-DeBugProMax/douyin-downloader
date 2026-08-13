@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import os
 import re
 from collections.abc import AsyncIterator
@@ -162,6 +163,38 @@ class FilePromoter(Protocol):
 class AtomicFilePromoter:
     def promote(self, part_path: Path, final_path: Path) -> None:
         part_path.replace(final_path)
+
+
+class RecycleBin(Protocol):
+    def move_to_recycle_bin(self, path: Path) -> None: ...
+
+
+class WindowsRecycleBin:
+    """Move one validated directory to the Windows Recycle Bin."""
+
+    def move_to_recycle_bin(self, path: Path) -> None:
+        if os.name != "nt":
+            raise OSError("recycling archive folders requires Windows")
+
+        class _SHFileOpStruct(ctypes.Structure):
+            _fields_ = [
+                ("hwnd", ctypes.c_void_p),
+                ("wFunc", ctypes.c_uint),
+                ("pFrom", ctypes.c_wchar_p),
+                ("pTo", ctypes.c_wchar_p),
+                ("fFlags", ctypes.c_ushort),
+                ("fAnyOperationsAborted", ctypes.c_int),
+                ("hNameMappings", ctypes.c_void_p),
+                ("lpszProgressTitle", ctypes.c_wchar_p),
+            ]
+
+        operation = _SHFileOpStruct()
+        operation.wFunc = 3  # FO_DELETE
+        operation.pFrom = f"{path}\0\0"
+        operation.fFlags = 0x0040 | 0x0010 | 0x0004 | 0x0400
+        result = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(operation))
+        if result != 0 or operation.fAnyOperationsAborted:
+            raise OSError(f"Windows Recycle Bin operation failed: {result}")
 
 
 class WindowsDirectoryChooser:

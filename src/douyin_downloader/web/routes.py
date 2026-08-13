@@ -80,6 +80,10 @@ class ArchiveLibraryModule(Protocol):
         confirm_overwrite: bool,
     ) -> ArchiveOperationSnapshot: ...
 
+    def relocate(self, aweme_id: str, archive_root: Path) -> WorkArchiveSnapshot: ...
+
+    def delete(self, aweme_id: str, *, confirm_recycle: bool) -> None: ...
+
 
 class DirectoryChooser(Protocol):
     def choose_directory(self) -> Path | None: ...
@@ -190,6 +194,12 @@ class ForceRearchiveRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     confirm_overwrite: bool
+
+
+class DeleteArchiveRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    confirm_recycle: bool
 
 
 class SettingsUpdateRequest(BaseModel):
@@ -531,6 +541,53 @@ def build_router() -> APIRouter:
             confirm_overwrite=payload.confirm_overwrite,
         )
         return _archive_response(result)
+
+    @router.post(
+        "/api/library/{aweme_id}/relocate",
+        response_model=LibraryWorkResponse,
+        dependencies=[Depends(require_local_session), Depends(require_same_origin)],
+    )
+    async def relocate_library_work(
+        aweme_id: str,
+        request: Request,
+    ) -> LibraryWorkResponse:
+        if not aweme_id.isdigit():
+            raise AppError("INVALID_INPUT", "作品标识无效。", 400)
+        services: AppServices = request.app.state.services
+        if services.directory_chooser is None:
+            raise AppError("ARCHIVE_UNAVAILABLE", "本地档案暂时不可用。", 503)
+        archive_root = await asyncio.to_thread(
+            services.directory_chooser.choose_directory
+        )
+        if archive_root is None:
+            raise AppError(
+                "ARCHIVE_SELECTION_CANCELLED",
+                "已取消选择档案目录。",
+                409,
+            )
+        item = await asyncio.to_thread(
+            _archive_library(request).relocate,
+            aweme_id,
+            archive_root,
+        )
+        return _library_work_response(item)
+
+    @router.delete(
+        "/api/library/{aweme_id}",
+        status_code=204,
+        dependencies=[Depends(require_local_session), Depends(require_same_origin)],
+    )
+    async def delete_library_work(
+        aweme_id: str,
+        payload: DeleteArchiveRequest,
+        request: Request,
+    ) -> Response:
+        await asyncio.to_thread(
+            _archive_library(request).delete,
+            aweme_id,
+            confirm_recycle=payload.confirm_recycle,
+        )
+        return Response(status_code=204)
 
     @router.get(
         "/api/settings",

@@ -343,6 +343,18 @@ def test_quick_result_locates_library_work_and_confirms_force_rearchive(
     assert len(actions) == 2
     assert actions[1] == ("force", {"confirm_overwrite": True})
 
+    with page.expect_request(lambda request: request.url.endswith("/relocate")):
+        page.locator("#library-relocate").click()
+    assert actions[2] == ("relocate", None)
+
+    page.once("dialog", lambda dialog: dialog.accept())
+    with page.expect_request(
+        lambda request: request.method == "DELETE"
+        and request.url.endswith(f"/api/library/{item['aweme_id']}")
+    ):
+        page.locator("#library-delete").click()
+    assert actions[3] == (item["aweme_id"], {"confirm_recycle": True})
+
 
 def test_split_description_only_extracts_trailing_tags(
     page: Page,

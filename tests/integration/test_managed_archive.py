@@ -3,6 +3,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import sqlite3
 import struct
 import threading
@@ -172,6 +173,19 @@ class StaticMediaAccess:
             expected_size=len(self.cover_payload),
             chunks=chunks(),
         )
+
+
+class RecordingRecycleBin:
+    def __init__(self, destination: Path, *, fail: bool = False) -> None:
+        self.destination = destination
+        self.fail = fail
+        self.paths: list[Path] = []
+
+    def move_to_recycle_bin(self, path: Path) -> None:
+        self.paths.append(path)
+        if self.fail:
+            raise OSError("recycle failed")
+        path.rename(self.destination)
 
 
 class EmptyDescriptionWorkAccess(StaticWorkAccess):
@@ -906,6 +920,103 @@ async def test_corrupt_video_is_repaired_without_redownloading_healthy_cover(
 
 
 @pytest.mark.asyncio
+async def test_library_relocates_only_to_a_complete_matching_archive(
+    tmp_path: Path,
+) -> None:
+    original_root = tmp_path / "original"
+    original_root.mkdir()
+    database = tmp_path / "archive.db"
+    managed = ManagedArchive(
+        database_path=database,
+        work_access=StaticWorkAccess(),
+        media_access=StaticMediaAccess(valid_mp4()),
+    )
+    completed = await managed.archive_single(
+        SingleArchiveRequest("7429378937383308594", original_root)
+    )
+    relative_directory = completed.archive_item.relative_directory
+    new_root = tmp_path / "replacement"
+    new_root.mkdir()
+    shutil.copytree(
+        original_root / relative_directory,
+        new_root / relative_directory,
+    )
+    shutil.rmtree(original_root)
+    library = LocalArchiveLibrary(managed)
+
+    relocated = library.relocate("7429378937383308594", new_root)
+
+    assert relocated.root == new_root.resolve(strict=True)
+    assert relocated.status == "archived"
+    assert library.get_work("7429378937383308594") == relocated
+
+
+@pytest.mark.asyncio
+async def test_library_rejects_corrupt_relocation_without_changing_record(
+    tmp_path: Path,
+) -> None:
+    original_root = tmp_path / "original"
+    original_root.mkdir()
+    managed = ManagedArchive(
+        database_path=tmp_path / "archive.db",
+        work_access=StaticWorkAccess(),
+        media_access=StaticMediaAccess(valid_mp4()),
+    )
+    completed = await managed.archive_single(
+        SingleArchiveRequest("7429378937383308594", original_root)
+    )
+    relative_directory = completed.archive_item.relative_directory
+    wrong_root = tmp_path / "wrong"
+    wrong_root.mkdir()
+    shutil.copytree(original_root / relative_directory, wrong_root / relative_directory)
+    (wrong_root / relative_directory / "7429378937383308594.mp4").write_bytes(b"bad")
+    library = LocalArchiveLibrary(managed)
+
+    with pytest.raises(AppError) as raised:
+        library.relocate("7429378937383308594", wrong_root)
+
+    assert raised.value.code == "ARCHIVE_RELOCATION_INVALID"
+    assert library.get_work("7429378937383308594").root == original_root.resolve()
+
+
+@pytest.mark.asyncio
+async def test_library_deletes_record_only_after_recycle_succeeds(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "library"
+    root.mkdir()
+    database = tmp_path / "archive.db"
+    managed = ManagedArchive(
+        database_path=database,
+        work_access=StaticWorkAccess(),
+        media_access=StaticMediaAccess(valid_mp4()),
+    )
+    completed = await managed.archive_single(
+        SingleArchiveRequest("7429378937383308594", root)
+    )
+    work_directory = root / completed.archive_item.relative_directory
+    failed_recycler = RecordingRecycleBin(tmp_path / "unused", fail=True)
+    library = LocalArchiveLibrary(managed, failed_recycler)
+
+    with pytest.raises(AppError) as raised:
+        library.delete("7429378937383308594", confirm_recycle=True)
+
+    assert raised.value.code == "ARCHIVE_RECYCLE_FAILED"
+    assert work_directory.is_dir()
+    assert library.get_work("7429378937383308594") is not None
+
+    recycled_directory = tmp_path / "recycled-work"
+    recycler = RecordingRecycleBin(recycled_directory)
+    LocalArchiveLibrary(managed, recycler).delete(
+        "7429378937383308594", confirm_recycle=True
+    )
+
+    assert recycler.paths == [work_directory.resolve(strict=False)]
+    assert recycled_directory.is_dir()
+    assert managed.inspect_registered_archive("7429378937383308594") is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("cover_payload", [b"not-an-image", truncated_jpeg()])
 async def test_undecodable_cover_never_creates_a_complete_archive(
     tmp_path: Path,
@@ -1125,6 +1236,12 @@ async def test_unavailable_archive_root_is_not_misreported_as_needs_repair(
     with pytest.raises(AppError) as error:
         archive.open_work_folder("7429378937383308594")
     assert error.value.code == "ARCHIVE_LOCATION_UNAVAILABLE"
+
+    disconnected.rename(root)
+    reconnected = archive.get_work_archive("7429378937383308594")
+
+    assert reconnected is not None
+    assert reconnected.status == "archived"
 
 
 @pytest.mark.asyncio

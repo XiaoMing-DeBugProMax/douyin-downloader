@@ -147,6 +147,24 @@ class ArchiveStore:
                 (status, aweme_id),
             )
 
+    def update_archive_root(self, aweme_id: str, root: Path) -> None:
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE archive_items SET root_path=? WHERE aweme_id=?",
+                (str(root), aweme_id),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("archive record is unavailable")
+
+    def delete_archive(self, aweme_id: str) -> None:
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "DELETE FROM archive_items WHERE aweme_id=?",
+                (aweme_id,),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("archive record is unavailable")
+
     def update_library_metadata(
         self,
         aweme_id: str,
