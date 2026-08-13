@@ -29,6 +29,7 @@ from douyin_downloader.url_resolver import ShareResolver
 from douyin_downloader.web.routes import AppServices, build_router
 
 STATIC_DIR = static_directory()
+_WORKSPACE_NAMES = frozenset({"quick", "batch", "tasks", "library", "settings"})
 
 
 @asynccontextmanager
@@ -161,11 +162,17 @@ def create_app(
     async def home(
         request: Request,
         launch_token: str | None = Query(default=None),
+        workspace: str | None = Query(default=None),
     ) -> FileResponse | RedirectResponse:
         if launch_token is not None:
             if not sessions.consume_launch_token(launch_token):
                 raise HTTPException(status_code=403, detail="INVALID_LAUNCH_TOKEN")
-            response = RedirectResponse("/", status_code=303)
+            location = (
+                f"/?workspace={workspace}"
+                if workspace in _WORKSPACE_NAMES
+                else "/"
+            )
+            response = RedirectResponse(location, status_code=303)
             response.set_cookie(
                 COOKIE_NAME,
                 sessions.cookie_token,

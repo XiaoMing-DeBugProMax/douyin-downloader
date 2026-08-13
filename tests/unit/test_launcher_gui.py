@@ -1,13 +1,21 @@
 from __future__ import annotations
 
 import runpy
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
 import douyin_downloader.launcher as launcher_module
-from douyin_downloader.launcher import ControlWindow, ServerStartError, main
+from douyin_downloader.launcher import (
+    ControlWindow,
+    ServerStartError,
+    TrayActions,
+    WindowsTray,
+    main,
+)
 from douyin_downloader.runtime import RuntimeStore
 from douyin_downloader.session import SessionManager
 
@@ -20,6 +28,10 @@ class FakeRoot:
         self.protocols: dict[str, object] = {}
         self.mainloop_calls = 0
         self.destroy_calls = 0
+        self.withdraw_calls = 0
+        self.deiconify_calls = 0
+        self.lift_calls = 0
+        self.after_callbacks: list[object] = []
 
     def title(self, value: str) -> None:
         self.window_title = value
@@ -38,6 +50,23 @@ class FakeRoot:
 
     def destroy(self) -> None:
         self.destroy_calls += 1
+
+    def withdraw(self) -> None:
+        self.withdraw_calls += 1
+
+    def deiconify(self) -> None:
+        self.deiconify_calls += 1
+
+    def lift(self) -> None:
+        self.lift_calls += 1
+
+    def after(self, _: int, callback: object) -> None:
+        self.after_callbacks.append(callback)
+
+    def run_after_callback(self) -> None:
+        callback = self.after_callbacks.pop(0)
+        assert callable(callback)
+        callback()
 
 
 class FakeWidget:
@@ -61,6 +90,38 @@ class FakeRunningServer:
         self.base_url = "http://127.0.0.1:45678"
         self.sessions = SessionManager()
         self.stop_calls = 0
+        self.active_tasks = False
+        self.pause_all_calls = 0
+        self.interrupt_all_calls = 0
+        self.fail_active_query = False
+
+    def stop(self) -> None:
+        self.stop_calls += 1
+
+    def has_active_tasks(self) -> bool:
+        if self.fail_active_query:
+            raise OSError("server unavailable")
+        return self.active_tasks
+
+    def pause_all(self) -> None:
+        self.pause_all_calls += 1
+
+    def interrupt_all(self) -> None:
+        self.interrupt_all_calls += 1
+
+
+class FakeTray:
+    def __init__(self) -> None:
+        self.actions: object | None = None
+        self.start_calls = 0
+        self.stop_calls = 0
+        self.fail_start = False
+
+    def start(self, actions: object) -> None:
+        if self.fail_start:
+            raise OSError("tray unavailable")
+        self.actions = actions
+        self.start_calls += 1
 
     def stop(self) -> None:
         self.stop_calls += 1
@@ -134,6 +195,268 @@ def test_control_window_renders_confirmed_copy_and_wires_actions(
 
     window.run()
     assert root.mainloop_calls == 1
+
+
+def test_idle_window_close_stops_without_prompting_or_starting_tray(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_fake_tk(monkeypatch)
+    root = FakeRoot()
+    running = FakeRunningServer()
+    tray = FakeTray()
+    prompts: list[bool] = []
+    window = ControlWindow(
+        running,  # type: ignore[arg-type]
+        root=root,  # type: ignore[arg-type]
+        close_prompt=lambda _: prompts.append(True) or "cancel",
+        tray=tray,  # type: ignore[arg-type]
+    )
+
+    window.request_close()
+
+    assert prompts == []
+    assert tray.start_calls == 0
+    assert running.interrupt_all_calls == 0
+    assert running.stop_calls == 1
+    assert root.destroy_calls == 1
+
+
+def test_stop_still_releases_window_when_active_query_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_fake_tk(monkeypatch)
+    root = FakeRoot()
+    running = FakeRunningServer()
+    running.fail_active_query = True
+    window = ControlWindow(
+        running,  # type: ignore[arg-type]
+        root=root,  # type: ignore[arg-type]
+        tray=FakeTray(),  # type: ignore[arg-type]
+    )
+
+    window.stop_and_exit()
+
+    assert running.stop_calls == 1
+    assert root.destroy_calls == 1
+
+
+def test_active_window_close_can_be_cancelled_without_changing_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_fake_tk(monkeypatch)
+    root = FakeRoot()
+    running = FakeRunningServer()
+    running.active_tasks = True
+    tray = FakeTray()
+    window = ControlWindow(
+        running,  # type: ignore[arg-type]
+        root=root,  # type: ignore[arg-type]
+        close_prompt=lambda _: "cancel",
+        tray=tray,  # type: ignore[arg-type]
+    )
+
+    window.request_close()
+
+    assert tray.start_calls == 0
+    assert running.pause_all_calls == 0
+    assert running.interrupt_all_calls == 0
+    assert running.stop_calls == 0
+    assert root.withdraw_calls == 0
+    assert root.destroy_calls == 0
+
+
+def test_active_window_can_continue_in_tray_and_reopen_same_control_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_fake_tk(monkeypatch)
+    root = FakeRoot()
+    running = FakeRunningServer()
+    running.active_tasks = True
+    tray = FakeTray()
+    window = ControlWindow(
+        running,  # type: ignore[arg-type]
+        root=root,  # type: ignore[arg-type]
+        close_prompt=lambda _: "tray",
+        tray=tray,  # type: ignore[arg-type]
+    )
+
+    window.request_close()
+
+    assert root.withdraw_calls == 1
+    assert tray.start_calls == 1
+    assert running.stop_calls == 0
+    assert tray.actions is not None
+    scheduled_callbacks = len(root.after_callbacks)
+    tray.actions.reopen()  # type: ignore[union-attr]
+    assert len(root.after_callbacks) == scheduled_callbacks
+    assert tray.stop_calls == 0
+    assert root.deiconify_calls == 0
+    root.run_after_callback()
+    assert tray.stop_calls == 1
+    assert root.deiconify_calls == 1
+    assert root.lift_calls == 1
+
+
+def test_tray_start_failure_restores_control_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_fake_tk(monkeypatch)
+    root = FakeRoot()
+    running = FakeRunningServer()
+    running.active_tasks = True
+    tray = FakeTray()
+    tray.fail_start = True
+    window = ControlWindow(
+        running,  # type: ignore[arg-type]
+        root=root,  # type: ignore[arg-type]
+        close_prompt=lambda _: "tray",
+        tray=tray,  # type: ignore[arg-type]
+    )
+
+    window.request_close()
+
+    assert root.withdraw_calls == 1
+    assert root.deiconify_calls == 1
+    assert root.lift_calls == 1
+    assert running.stop_calls == 0
+    assert root.destroy_calls == 0
+
+
+def test_tray_menu_opens_task_center_and_pauses_all_active_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_fake_tk(monkeypatch)
+    root = FakeRoot()
+    running = FakeRunningServer()
+    running.active_tasks = True
+    tray = FakeTray()
+    opened_urls: list[str] = []
+    window = ControlWindow(
+        running,  # type: ignore[arg-type]
+        browser_open=opened_urls.append,
+        root=root,  # type: ignore[arg-type]
+        close_prompt=lambda _: "tray",
+        tray=tray,  # type: ignore[arg-type]
+    )
+    window.request_close()
+    assert tray.actions is not None
+    scheduled_callbacks = len(root.after_callbacks)
+
+    tray.actions.open_tasks()  # type: ignore[union-attr]
+    tray.actions.pause_all()  # type: ignore[union-attr]
+    assert len(root.after_callbacks) == scheduled_callbacks
+    assert opened_urls == []
+    assert running.pause_all_calls == 0
+    root.run_after_callback()
+
+    query = parse_qs(urlsplit(opened_urls[0]).query)
+    assert query["workspace"] == ["tasks"]
+    assert running.pause_all_calls == 1
+    assert running.stop_calls == 0
+
+
+def test_explicit_stop_interrupts_work_and_releases_tray_and_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_fake_tk(monkeypatch)
+    root = FakeRoot()
+    running = FakeRunningServer()
+    running.active_tasks = True
+    tray = FakeTray()
+    window = ControlWindow(
+        running,  # type: ignore[arg-type]
+        root=root,  # type: ignore[arg-type]
+        close_prompt=lambda _: "tray",
+        tray=tray,  # type: ignore[arg-type]
+    )
+    window.request_close()
+    assert tray.actions is not None
+    scheduled_callbacks = len(root.after_callbacks)
+
+    tray.actions.stop()  # type: ignore[union-attr]
+    assert len(root.after_callbacks) == scheduled_callbacks
+    assert running.stop_calls == 0
+    root.run_after_callback()
+
+    assert running.interrupt_all_calls == 1
+    assert running.stop_calls == 1
+    assert tray.stop_calls == 1
+    assert root.destroy_calls == 1
+
+
+def test_windows_tray_wires_required_menu_and_stops_idempotently(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    items: list[SimpleNamespace] = []
+    icons: list[SimpleNamespace] = []
+
+    def menu_item(text: str, action: object, **kwargs: object) -> SimpleNamespace:
+        item = SimpleNamespace(text=text, action=action, kwargs=kwargs)
+        items.append(item)
+        return item
+
+    def icon(*args: object) -> SimpleNamespace:
+        created = SimpleNamespace(
+            args=args,
+            run_detached_calls=0,
+            stop_calls=0,
+            visible=True,
+        )
+        created.run_detached = lambda: setattr(
+            created, "run_detached_calls", created.run_detached_calls + 1
+        )
+        created.stop = lambda: setattr(created, "stop_calls", created.stop_calls + 1)
+        icons.append(created)
+        return created
+
+    fake_pystray = SimpleNamespace(
+        Icon=icon,
+        Menu=lambda *entries: entries,
+        MenuItem=menu_item,
+    )
+    monkeypatch.setitem(sys.modules, "pystray", fake_pystray)
+    image = object()
+
+    class FakeImageSource:
+        def __enter__(self) -> FakeImageSource:
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            return None
+
+        def copy(self) -> object:
+            return image
+
+    monkeypatch.setattr("PIL.Image.open", lambda _: FakeImageSource())
+    events: list[str] = []
+    tray = WindowsTray(tmp_path / "app.ico")
+    actions = TrayActions(
+        reopen=lambda: events.append("reopen"),
+        open_tasks=lambda: events.append("tasks"),
+        pause_all=lambda: events.append("pause"),
+        stop=lambda: events.append("stop"),
+    )
+
+    tray.start(actions)
+    tray.start(actions)
+
+    assert len(icons) == 1
+    assert icons[0].run_detached_calls == 1
+    assert [item.text for item in items] == [
+        "重新打开",
+        "打开任务中心",
+        "暂停全部",
+        "停止应用",
+    ]
+    assert items[0].kwargs == {"default": True}
+    for item in items:
+        item.action(None, item)
+    assert events == ["reopen", "tasks", "pause", "stop"]
+
+    tray.stop()
+    tray.stop()
+    assert icons[0].stop_calls == 1
 
 
 def test_main_runs_new_instance_in_order_and_always_stops(

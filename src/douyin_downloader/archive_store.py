@@ -493,6 +493,25 @@ class ArchiveStore:
                 (lifecycle, ids.work),
             )
 
+    def interrupt(self, ids: TaskIds) -> None:
+        with self._connection() as connection:
+            values = ("interrupted", "idle", None, None)
+            connection.execute(
+                "UPDATE archive_operations SET lifecycle=?, phase=?, "
+                "speed_bytes_per_second=?, eta_seconds=? WHERE operation_id=?",
+                (*values, ids.operation),
+            )
+            connection.execute(
+                "UPDATE source_tasks SET lifecycle=?, phase=?, "
+                "speed_bytes_per_second=?, eta_seconds=? WHERE source_task_id=?",
+                (*values, ids.source),
+            )
+            connection.execute(
+                "UPDATE work_tasks SET lifecycle=?, phase=?, "
+                "speed_bytes_per_second=?, eta_seconds=? WHERE work_task_id=?",
+                (*values, ids.work),
+            )
+
     def restart_interrupted(self, ids: TaskIds) -> None:
         self._restart_tasks(ids, expected_lifecycle="interrupted")
 

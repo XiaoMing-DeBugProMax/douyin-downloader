@@ -87,6 +87,15 @@ def test_packaging_manifest_requires_audited_ffmpeg_and_compliance_material() ->
     assert "--output" in build
 
 
+def test_system_tray_runtime_and_windows_backend_are_packaged() -> None:
+    project_root = Path(__file__).parents[2]
+    project = (project_root / "pyproject.toml").read_text(encoding="utf-8")
+    manifest = (project_root / "douyin_downloader.spec").read_text(encoding="utf-8")
+
+    assert '"pystray==0.19.5"' in project
+    assert '"pystray._win32"' in manifest
+
+
 def test_current_package_contains_only_required_media_tools_when_available() -> None:
     project_root = Path(__file__).parents[2]
     artifacts = tuple((project_root / "dist").glob("*.exe"))

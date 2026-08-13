@@ -45,3 +45,5 @@ def test_parse_page_uses_safe_text_rendering_and_required_controls() -> None:
     assert '"待修复"' in script
     assert '"修复本地归档"' in script
     assert "new Blob" not in script
+    assert 'new URLSearchParams(window.location.search).get("workspace")' in script
+    assert 'activateWorkspace(initialWorkspace)' in script

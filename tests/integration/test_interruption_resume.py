@@ -273,6 +273,112 @@ async def test_restart_marks_paused_work_interrupted_without_remote_access(
 
 
 @pytest.mark.asyncio
+async def test_active_archive_can_be_discovered_and_paused_as_a_group(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "library"
+    root.mkdir()
+    media = PausableMediaAccess()
+    archive = ManagedArchive(
+        database_path=tmp_path / "archive.db",
+        work_access=StaticWorkAccess(),
+        media_access=media,
+    )
+    running = asyncio.create_task(
+        archive.archive_single(
+            SingleArchiveRequest("7429378937383308594", root)
+        )
+    )
+    await media.video_ready.wait()
+
+    assert archive.has_active_tasks() is True
+    pausing = asyncio.create_task(archive.pause_all())
+    media.release_first_chunk.set()
+    await pausing
+
+    operation = archive.list_task_operations()[0]
+    assert operation.task.lifecycle == "paused"
+    assert operation.source_tasks[0].task.lifecycle == "paused"
+    assert operation.source_tasks[0].work_tasks[0].task.lifecycle == "paused"
+    assert archive.has_active_tasks() is True
+
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+
+
+@pytest.mark.asyncio
+async def test_stop_and_exit_interrupts_active_archive_and_retains_parts(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "library"
+    root.mkdir()
+    media = PausableMediaAccess()
+    archive = ManagedArchive(
+        database_path=tmp_path / "archive.db",
+        work_access=StaticWorkAccess(),
+        media_access=media,
+    )
+    running = asyncio.create_task(
+        archive.archive_single(
+            SingleArchiveRequest("7429378937383308594", root)
+        )
+    )
+    await media.video_ready.wait()
+
+    interrupting = asyncio.create_task(archive.interrupt_all())
+    media.release_first_chunk.set()
+    await interrupting
+    with pytest.raises(AppError) as stopped:
+        await running
+
+    assert stopped.value.code == "TASK_INTERRUPTED"
+    operation = archive.list_task_operations()[0]
+    assert operation.task.lifecycle == "interrupted"
+    assert operation.task.phase == "idle"
+    assert operation.task.result == "none"
+    assert operation.source_tasks[0].task.lifecycle == "interrupted"
+    assert operation.source_tasks[0].work_tasks[0].task.lifecycle == "interrupted"
+    assert archive.has_active_tasks() is False
+    assert list(root.rglob("*.part"))
+
+
+@pytest.mark.asyncio
+async def test_stop_persists_interruption_before_active_chunk_reaches_checkpoint(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "library"
+    root.mkdir()
+    media = PausableMediaAccess()
+    archive = ManagedArchive(
+        database_path=tmp_path / "archive.db",
+        work_access=StaticWorkAccess(),
+        media_access=media,
+    )
+    running = asyncio.create_task(
+        archive.archive_single(
+            SingleArchiveRequest("7429378937383308594", root)
+        )
+    )
+    await media.video_ready.wait()
+
+    interrupting = asyncio.create_task(archive.interrupt_all())
+    await asyncio.sleep(0)
+
+    operation = archive.list_task_operations()[0]
+    assert operation.task.lifecycle == "interrupted"
+    assert operation.source_tasks[0].task.lifecycle == "interrupted"
+    assert operation.source_tasks[0].work_tasks[0].task.lifecycle == "interrupted"
+    assert interrupting.done() is False
+
+    media.release_first_chunk.set()
+    await interrupting
+    with pytest.raises(AppError) as stopped:
+        await running
+    assert stopped.value.code == "TASK_INTERRUPTED"
+
+
+@pytest.mark.asyncio
 async def test_process_crash_after_durable_chunk_requires_explicit_continue(
     tmp_path: Path,
 ) -> None:

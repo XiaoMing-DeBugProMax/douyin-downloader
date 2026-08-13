@@ -52,6 +52,7 @@ STATIC_DATA = [
 ]
 HIDDEN_IMPORTS = [
     "f2.utils.abogus",
+    "pystray._win32",
     "uvicorn.lifespan.on",
     "uvicorn.logging",
     "uvicorn.loops.asyncio",

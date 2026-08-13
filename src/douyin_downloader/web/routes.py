@@ -58,6 +58,16 @@ class ManagedArchiveModule(Protocol):
         retain_parts: bool,
     ) -> TaskCenterOperationSnapshot: ...
 
+    def has_active_tasks(self) -> bool: ...
+
+    async def pause_all(self) -> None: ...
+
+    def request_pause_all(self) -> object: ...
+
+    async def interrupt_all(self) -> None: ...
+
+    def request_interrupt_all(self) -> object: ...
+
 
 class ArchiveLibraryModule(Protocol):
     def get_work(self, aweme_id: str) -> WorkArchiveSnapshot | None: ...
@@ -437,13 +447,39 @@ def streaming_cover_response(upstream: UpstreamStream) -> StreamingResponse:
 def build_router() -> APIRouter:
     router = APIRouter()
 
-    @router.post("/api/internal/launch-token")
-    async def issue_launch_token(request: Request) -> dict[str, str]:
+    def require_management(request: Request) -> None:
         supplied = request.headers.get("x-management-token")
         sessions: SessionManager = request.app.state.session_manager
         if supplied is None or not secrets.compare_digest(supplied, sessions.management_token):
             raise HTTPException(status_code=403)
+
+    @router.post("/api/internal/launch-token")
+    async def issue_launch_token(request: Request) -> dict[str, str]:
+        require_management(request)
+        sessions: SessionManager = request.app.state.session_manager
         return {"launch_token": sessions.issue_launch_token()}
+
+    @router.get("/api/internal/tasks/active")
+    async def internal_active_tasks(request: Request) -> dict[str, bool]:
+        require_management(request)
+        archive = _services(request).managed_archive
+        return {"active": archive is not None and archive.has_active_tasks()}
+
+    @router.post("/api/internal/tasks/pause-all", status_code=204)
+    async def internal_pause_all(request: Request) -> Response:
+        require_management(request)
+        archive = _services(request).managed_archive
+        if archive is not None:
+            archive.request_pause_all()
+        return Response(status_code=204)
+
+    @router.post("/api/internal/tasks/interrupt-all", status_code=204)
+    async def internal_interrupt_all(request: Request) -> Response:
+        require_management(request)
+        archive = _services(request).managed_archive
+        if archive is not None:
+            archive.request_interrupt_all()
+        return Response(status_code=204)
 
     @router.post(
         "/api/parse",

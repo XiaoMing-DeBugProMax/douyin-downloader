@@ -59,7 +59,7 @@ from douyin_downloader.settings import (
     NamingTemplate,
     OperationSettingsSnapshot,
 )
-from douyin_downloader.task_control import TaskCancellation
+from douyin_downloader.task_control import TaskCancellation, TaskInterruption
 
 __all__ = [
     "ArchiveItemSnapshot",
@@ -218,13 +218,17 @@ class _TaskController:
         self._paused = asyncio.Event()
         self._resumed = asyncio.Event()
         self._cancel_requested: bool | None = None
+        self._interrupt_requested = False
         self._stopped = asyncio.Event()
 
     async def pause(self) -> None:
+        self.request_pause()
+        await self._paused.wait()
+
+    def request_pause(self) -> None:
         if not self._pause_requested:
             self._pause_requested = True
             self._continue.clear()
-        await self._paused.wait()
 
     async def resume(self) -> None:
         if not self._pause_requested:
@@ -240,10 +244,20 @@ class _TaskController:
         self._continue.set()
         await self._stopped.wait()
 
+    def request_interrupt(self) -> None:
+        self._interrupt_requested = True
+        self._continue.set()
+        self._store.interrupt(self._ids)
+
+    async def wait_stopped(self) -> None:
+        await self._stopped.wait()
+
     def mark_stopped(self) -> None:
         self._stopped.set()
 
     async def checkpoint(self) -> None:
+        if self._interrupt_requested:
+            raise TaskInterruption
         if self._cancel_requested is not None:
             raise TaskCancellation(retain_parts=self._cancel_requested)
         if not self._pause_requested:
@@ -252,6 +266,8 @@ class _TaskController:
         self._paused.set()
         await self._continue.wait()
         self._paused.clear()
+        if self._interrupt_requested:
+            raise TaskInterruption
         if self._cancel_requested is not None:
             raise TaskCancellation(retain_parts=self._cancel_requested)
         await asyncio.to_thread(self._store.set_task_lifecycle, self._ids, "running")
@@ -570,6 +586,14 @@ class ManagedArchive:
                     if attempt == settings.retry_limit:
                         raise _retry_exhausted(error) from error
                     await self._retry_delay.wait(attempt + 1)
+        except TaskInterruption as interruption:
+            if not promotion_started:
+                self._store.interrupt(ids)
+            raise AppError(
+                "TASK_INTERRUPTED",
+                "归档任务已中断，可稍后手动继续。",
+                409,
+            ) from interruption
         except TaskCancellation as cancellation:
             if not promotion_started:
                 if prepared is not None and not cancellation.retain_parts:
@@ -748,6 +772,29 @@ class ManagedArchive:
         return tuple(
             _task_center_snapshot(operation) for operation in self._store.list_task_operations()
         )
+
+    def has_active_tasks(self) -> bool:
+        return bool(self._task_controls)
+
+    async def pause_all(self) -> None:
+        controllers = self.request_pause_all()
+        await asyncio.gather(*(controller.pause() for controller in controllers))
+
+    def request_pause_all(self) -> tuple[_TaskController, ...]:
+        controllers = tuple(set(self._task_controls.values()))
+        for controller in controllers:
+            controller.request_pause()
+        return controllers
+
+    async def interrupt_all(self) -> None:
+        controllers = self.request_interrupt_all()
+        await asyncio.gather(*(controller.wait_stopped() for controller in controllers))
+
+    def request_interrupt_all(self) -> tuple[_TaskController, ...]:
+        controllers = tuple(set(self._task_controls.values()))
+        for controller in controllers:
+            controller.request_interrupt()
+        return controllers
 
     async def pause_task(self, task_id: str) -> TaskCenterOperationSnapshot:
         controller = self._task_controls.get(task_id)

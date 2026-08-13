@@ -228,6 +228,11 @@ function activateWorkspace(name) {
   }
 }
 
+const initialWorkspace = new URLSearchParams(window.location.search).get("workspace");
+if (workspaceTabs.some((tab) => tab.dataset.workspace === initialWorkspace)) {
+  activateWorkspace(initialWorkspace);
+}
+
 for (const tab of workspaceTabs) {
   tab.addEventListener("click", () => activateWorkspace(tab.dataset.workspace));
   tab.addEventListener("keydown", (event) => {

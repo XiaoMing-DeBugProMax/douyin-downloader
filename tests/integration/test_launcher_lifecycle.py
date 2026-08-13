@@ -25,6 +25,8 @@ from douyin_downloader.launcher import (
 )
 from douyin_downloader.runtime import RuntimeInfo, RuntimeStore
 from douyin_downloader.session import SessionManager
+from douyin_downloader.web.app import create_app
+from douyin_downloader.web.routes import AppServices
 
 
 def _simultaneous_main_worker(
@@ -287,6 +289,114 @@ def test_duplicate_invocation_only_wakes_existing_instance(
         assert launched.headers["location"] == "/"
     finally:
         running_server.stop()
+
+
+def test_running_server_controls_active_archive_through_managed_loopback_api(
+    runtime_store: RuntimeStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ControlledArchive:
+        def __init__(self) -> None:
+            self.active = True
+            self.pause_calls = 0
+            self.waiting_pause_calls = 0
+            self.interrupt_calls = 0
+            self.waiting_interrupt_calls = 0
+
+        def has_active_tasks(self) -> bool:
+            return self.active
+
+        async def pause_all(self) -> None:
+            self.waiting_pause_calls += 1
+            await asyncio.Event().wait()
+
+        def request_pause_all(self) -> None:
+            self.pause_calls += 1
+
+        async def interrupt_all(self) -> None:
+            self.waiting_interrupt_calls += 1
+            await asyncio.Event().wait()
+
+        def request_interrupt_all(self) -> None:
+            self.interrupt_calls += 1
+            self.active = False
+
+    archive = ControlledArchive()
+    media_client = httpx.AsyncClient()
+    services = AppServices(
+        parse_service=SimpleNamespace(),  # type: ignore[arg-type]
+        media_client=media_client,
+        managed_archive=archive,  # type: ignore[arg-type]
+    )
+
+    def app_factory(**kwargs: object):
+        return create_app(
+            services=services,
+            session_manager=kwargs["session_manager"],  # type: ignore[arg-type]
+            expected_port=kwargs["expected_port"],  # type: ignore[arg-type]
+        )
+
+    monkeypatch.setattr(launcher_module, "create_app", app_factory)
+    running = LocalServer(runtime_store).start()
+    try:
+        assert running.has_active_tasks() is True
+        running.pause_all()
+        assert archive.pause_calls == 1
+        assert archive.waiting_pause_calls == 0
+        assert running.has_active_tasks() is True
+
+        running.interrupt_all()
+        assert archive.interrupt_calls == 1
+        assert archive.waiting_interrupt_calls == 0
+        assert running.has_active_tasks() is False
+    finally:
+        running.stop()
+        asyncio.run(media_client.aclose())
+
+
+def test_task_center_launch_token_redirect_preserves_requested_workspace(
+    runtime_store: RuntimeStore,
+) -> None:
+    running = LocalServer(runtime_store).start()
+    try:
+        launch_token = running.sessions.issue_launch_token()
+        response = httpx.get(
+            launcher_module._launch_url(
+                running.base_url,
+                launch_token,
+                workspace="tasks",
+            ),
+            timeout=1,
+            trust_env=False,
+            follow_redirects=False,
+        )
+
+        assert response.status_code == 303
+        assert response.headers["location"] == "/?workspace=tasks"
+    finally:
+        running.stop()
+
+
+def test_internal_task_controls_reject_missing_management_token(
+    runtime_store: RuntimeStore,
+) -> None:
+    running = LocalServer(runtime_store).start()
+    try:
+        for method, path in (
+            ("GET", "/api/internal/tasks/active"),
+            ("POST", "/api/internal/tasks/pause-all"),
+            ("POST", "/api/internal/tasks/interrupt-all"),
+        ):
+            response = httpx.request(
+                method,
+                f"{running.base_url}{path}",
+                timeout=1,
+                trust_env=False,
+                follow_redirects=False,
+            )
+            assert response.status_code == 403
+    finally:
+        running.stop()
 
 
 def test_close_during_blocked_guest_registration_cleans_all_runtime_resources(

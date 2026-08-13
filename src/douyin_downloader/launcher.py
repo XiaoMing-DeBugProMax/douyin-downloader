@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import queue
 import socket
 import threading
 import time
@@ -8,14 +9,16 @@ import tkinter as tk
 import webbrowser
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from tkinter import messagebox
-from typing import Protocol
+from typing import Literal, Protocol
 from urllib.parse import urlencode
 
 import httpx
 import uvicorn
 
 from douyin_downloader.logging_config import configure_logging, log_operation
+from douyin_downloader.resources import app_icon_path
 from douyin_downloader.runtime import RuntimeInfo, RuntimeStore, WindowsInstanceMutex
 from douyin_downloader.session import SessionManager
 from douyin_downloader.web.app import create_app
@@ -29,6 +32,8 @@ DUPLICATE_WAIT_SECONDS = 7.0
 BrowserOpen = Callable[[str], object]
 StartNewInstance = Callable[[], int]
 ErrorDialog = Callable[[str, str], object]
+CloseChoice = Literal["tray", "stop", "cancel"]
+ClosePrompt = Callable[[tk.Tk], CloseChoice]
 
 
 class ServerStarter(Protocol):
@@ -37,6 +42,58 @@ class ServerStarter(Protocol):
 
 class WindowRunner(Protocol):
     def run(self) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class TrayActions:
+    reopen: Callable[[], None]
+    open_tasks: Callable[[], None]
+    pause_all: Callable[[], None]
+    stop: Callable[[], None]
+
+
+class TrayController(Protocol):
+    def start(self, actions: TrayActions) -> None: ...
+
+    def stop(self) -> None: ...
+
+
+class _TrayIcon(Protocol):
+    visible: bool
+
+    def stop(self) -> None: ...
+
+
+class WindowsTray:
+    def __init__(self, icon_path: Path | None = None) -> None:
+        self._icon_path = icon_path or app_icon_path()
+        self._icon: _TrayIcon | None = None
+
+    def start(self, actions: TrayActions) -> None:
+        if self._icon is not None:
+            return
+        from PIL import Image
+        from pystray import Icon, Menu, MenuItem  # type: ignore[import-untyped]
+
+        with Image.open(self._icon_path) as source:
+            image = source.copy()
+        menu = Menu(
+            MenuItem("重新打开", lambda *_: actions.reopen(), default=True),
+            MenuItem("打开任务中心", lambda *_: actions.open_tasks()),
+            MenuItem("暂停全部", lambda *_: actions.pause_all()),
+            MenuItem("停止应用", lambda *_: actions.stop()),
+        )
+        icon = Icon("douyin-local-downloader", image, "抖音视频下载", menu)
+        icon.run_detached()
+        self._icon = icon
+
+    def stop(self) -> None:
+        icon = self._icon
+        if icon is None:
+            return
+        self._icon = None
+        icon.visible = False
+        icon.stop()
 
 
 ServerFactory = Callable[[RuntimeStore], ServerStarter]
@@ -61,6 +118,28 @@ class RunningServer:
     runtime_store: RuntimeStore
     _stop_lock: threading.Lock = field(default_factory=threading.Lock)
     _stopped: bool = False
+
+    def has_active_tasks(self) -> bool:
+        response = self._management_request("GET", "/api/internal/tasks/active")
+        return response.json().get("active") is True
+
+    def pause_all(self) -> None:
+        self._management_request("POST", "/api/internal/tasks/pause-all")
+
+    def interrupt_all(self) -> None:
+        self._management_request("POST", "/api/internal/tasks/interrupt-all")
+
+    def _management_request(self, method: str, path: str) -> httpx.Response:
+        response = httpx.request(
+            method,
+            f"{self.base_url}{path}",
+            headers={"x-management-token": self.sessions.management_token},
+            timeout=STOP_TIMEOUT_SECONDS,
+            trust_env=False,
+            follow_redirects=False,
+        )
+        response.raise_for_status()
+        return response
 
     def stop(self) -> None:
         with self._stop_lock:
@@ -191,16 +270,23 @@ class ControlWindow:
         *,
         browser_open: BrowserOpen = webbrowser.open,
         root: tk.Tk | None = None,
+        close_prompt: ClosePrompt | None = None,
+        tray: TrayController | None = None,
     ) -> None:
         self._running_server = running_server
         self._browser_open = browser_open
         self._root = root if root is not None else tk.Tk()
+        self._close_prompt = close_prompt or prompt_active_close
+        self._tray = tray or WindowsTray()
         self._closed = False
+        self._in_tray = False
+        self._tray_actions: queue.SimpleQueue[Callable[[], None]] = queue.SimpleQueue()
 
         self._root.title("抖音视频下载")
         self._root.geometry("380x200")
         self._root.resizable(False, False)
-        self._root.protocol("WM_DELETE_WINDOW", self.stop_and_exit)
+        self._root.protocol("WM_DELETE_WINDOW", self.request_close)
+        self._root.after(50, self._drain_tray_actions)
 
         frame = tk.Frame(self._root, padx=24, pady=20)
         frame.pack(fill="both", expand=True)
@@ -225,13 +311,81 @@ class ControlWindow:
     def reopen_browser(self) -> None:
         open_running_browser(self._running_server, self._browser_open)
 
+    def request_close(self) -> None:
+        if self._closed:
+            return
+        if not self._running_server.has_active_tasks():
+            self.stop_and_exit()
+            return
+        choice = self._close_prompt(self._root)
+        if choice == "cancel":
+            return
+        if choice == "stop":
+            self.stop_and_exit()
+            return
+        self._root.withdraw()
+        try:
+            self._tray.start(
+                TrayActions(
+                    reopen=lambda: self._dispatch(self._reopen_from_tray),
+                    open_tasks=lambda: self._dispatch(self._open_tasks_from_tray),
+                    pause_all=lambda: self._dispatch(self._pause_all_from_tray),
+                    stop=lambda: self._dispatch(self.stop_and_exit),
+                )
+            )
+        except (OSError, RuntimeError):
+            self._root.deiconify()
+            self._root.lift()
+            return
+        self._in_tray = True
+
+    def _dispatch(self, action: Callable[[], None]) -> None:
+        self._tray_actions.put(action)
+
+    def _drain_tray_actions(self) -> None:
+        while True:
+            try:
+                action = self._tray_actions.get_nowait()
+            except queue.Empty:
+                break
+            action()
+        if not self._closed:
+            self._root.after(50, self._drain_tray_actions)
+
+    def _reopen_from_tray(self) -> None:
+        self._leave_tray()
+        self._root.deiconify()
+        self._root.lift()
+
+    def _open_tasks_from_tray(self) -> None:
+        open_running_browser(
+            self._running_server,
+            self._browser_open,
+            workspace="tasks",
+        )
+
+    def _pause_all_from_tray(self) -> None:
+        self._running_server.pause_all()
+
+    def _leave_tray(self) -> None:
+        if not self._in_tray:
+            return
+        self._in_tray = False
+        self._tray.stop()
+
     def stop_and_exit(self) -> None:
         if self._closed:
             return
         self._closed = True
         try:
+            try:
+                if self._running_server.has_active_tasks():
+                    self._running_server.interrupt_all()
+            except (OSError, httpx.HTTPError):
+                pass
             self._running_server.stop()
         finally:
+            self._leave_tray()
             self._root.destroy()
 
     def run(self) -> None:
@@ -294,13 +448,63 @@ def _wait_for_existing_or_mutex_ownership(
     raise TimeoutError("existing instance did not publish runtime state")
 
 
-def open_running_browser(running_server: RunningServer, browser_open: BrowserOpen) -> None:
+def open_running_browser(
+    running_server: RunningServer,
+    browser_open: BrowserOpen,
+    *,
+    workspace: str | None = None,
+) -> None:
     launch_token = running_server.sessions.issue_launch_token()
-    browser_open(_launch_url(running_server.base_url, launch_token))
+    browser_open(_launch_url(running_server.base_url, launch_token, workspace=workspace))
 
 
-def _launch_url(base_url: str, launch_token: str) -> str:
-    return f"{base_url}/?{urlencode({'launch_token': launch_token})}"
+def _launch_url(
+    base_url: str,
+    launch_token: str,
+    *,
+    workspace: str | None = None,
+) -> str:
+    query = {"launch_token": launch_token}
+    if workspace is not None:
+        query["workspace"] = workspace
+    return f"{base_url}/?{urlencode(query)}"
+
+
+def prompt_active_close(root: tk.Tk) -> CloseChoice:
+    result: list[CloseChoice] = []
+    dialog = tk.Toplevel(root)
+    dialog.title("活动归档仍在运行")
+    dialog.resizable(False, False)
+    dialog.transient(root)
+    dialog.grab_set()
+    dialog.protocol("WM_DELETE_WINDOW", lambda: choose("cancel"))
+
+    def choose(choice: CloseChoice) -> None:
+        result.append(choice)
+        dialog.destroy()
+
+    frame = tk.Frame(dialog, padx=24, pady=20)
+    frame.pack(fill="both", expand=True)
+    tk.Label(frame, text="仍有活动归档，请选择关闭方式。", wraplength=360).pack(
+        pady=(0, 16)
+    )
+    tk.Button(
+        frame,
+        text="最小化到托盘并继续",
+        command=lambda: choose("tray"),
+        width=22,
+    ).pack(fill="x", pady=3)
+    tk.Button(
+        frame,
+        text="停止任务并退出",
+        command=lambda: choose("stop"),
+        width=22,
+    ).pack(fill="x", pady=3)
+    tk.Button(frame, text="取消", command=lambda: choose("cancel"), width=22).pack(
+        fill="x", pady=3
+    )
+    dialog.wait_window()
+    return result[0] if result else "cancel"
 
 
 def main(
