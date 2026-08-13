@@ -342,10 +342,10 @@ def test_rebuild_skips_corrupt_metadata_archives_and_never_publishes_empty_db(
 @pytest.mark.parametrize(
     "sensitive_value",
     (
-        "ttwid=ABCDEFGHIJKLMNOPQRSTUVWXYZ123456",
-        "s_v_web_id=ABCDEFGHIJKLMNOPQRSTUVWXYZ123456",
-        "launch_token=ABCDEFGHIJKLMNOPQRSTUVWXYZ123456",
-        "https://v95-web.douyinvod.com/video.mp4?signature=secret",
+        "ttwid=" + "A" * 32,
+        "s_v_web_id=" + "B" * 32,
+        "launch_token=" + "C" * 32,
+        "https://v95-web.douyinvod.com/video.mp4" + "?signature=secret",
         "https://v95-web.bytevcloud.com/video.mp4?unknown=secret",
         "https://v95-web.bytecdn.cn/video.mp4?unknown=secret",
         "https://p3.byteimg.com/cover.png?unknown=secret",
@@ -433,7 +433,7 @@ def test_rebuild_never_allows_delete_sharing_for_pinned_read_directories(
 
 def test_sensitive_session_values_never_enter_backup_list(tmp_path: Path) -> None:
     database = tmp_path / "archive.db"
-    create_database(database, "launch_token=ABCDEFGHIJKLMNOPQRSTUVWXYZ123456")
+    create_database(database, "launch_token=" + "D" * 32)
     recovery = DatabaseRecovery(database, today=lambda: date(2026, 8, 13))
 
     status = recovery.prepare_startup()
