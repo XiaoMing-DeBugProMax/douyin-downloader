@@ -2,6 +2,8 @@
 param(
     [switch] $Check,
 
+    [switch] $Repair,
+
     [string] $Python
 )
 
@@ -9,8 +11,7 @@ $ErrorActionPreference = 'Stop'
 
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $verifyScript = Join-Path $PSScriptRoot 'verify.ps1'
-$venvRoot = Join-Path $projectRoot '.venv'
-$venvPython = Join-Path $venvRoot 'Scripts\python.exe'
+$powerShell = Join-Path $PSHOME 'powershell.exe'
 
 function Stop-Bootstrap {
     param(
@@ -26,7 +27,7 @@ function Stop-Bootstrap {
 
 if ($Check) {
     Write-Output 'BOOTSTRAP_MODE=check'
-    & powershell.exe `
+    & $powerShell `
         -NoProfile `
         -ExecutionPolicy Bypass `
         -File $verifyScript `
@@ -37,6 +38,25 @@ if ($Check) {
     Write-Output 'BOOTSTRAP_RESULT=ready'
     exit 0
 }
+
+$gitCommand = Get-Command git.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($null -eq $gitCommand) {
+    Stop-Bootstrap -Code 'GIT_NOT_FOUND' -Message 'Git is required to locate the shared environment.'
+}
+$commonDirectoryValue = (& $gitCommand.Source -C $projectRoot rev-parse --git-common-dir 2>&1 |
+    Out-String).Trim()
+if ($LASTEXITCODE -ne 0) {
+    Stop-Bootstrap -Code 'GIT_COMMON_DIR_FAILED' -Message $commonDirectoryValue
+}
+$commonDirectory = if ([System.IO.Path]::IsPathRooted($commonDirectoryValue)) {
+    [System.IO.Path]::GetFullPath($commonDirectoryValue)
+}
+else {
+    [System.IO.Path]::GetFullPath((Join-Path $projectRoot $commonDirectoryValue))
+}
+$environmentRoot = Split-Path -Parent $commonDirectory
+$venvRoot = Join-Path $environmentRoot '.venv'
+$venvPython = Join-Path $venvRoot 'Scripts\python.exe'
 
 $basePython = $Python
 if ([string]::IsNullOrWhiteSpace($basePython)) {
@@ -66,7 +86,7 @@ try {
 }
 catch {
     $message = $_.Exception.Message
-    if ($message -match 'Access is denied|拒绝访问') {
+    if ($message -match 'Access is denied') {
         Stop-Bootstrap `
             -Code 'PYTHON_EXECUTION_DENIED' `
             -Message "Python exists but cannot run in the current execution boundary: $basePython"
@@ -90,7 +110,37 @@ Write-Output "BOOTSTRAP_BASE_PYTHON=$basePython"
 Write-Output "BOOTSTRAP_PYTHON_VERSION=$baseVersion"
 Write-Output "BOOTSTRAP_VENV=$venvRoot"
 
-if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
+$rebuildVenv = -not (Test-Path -LiteralPath $venvPython -PathType Leaf)
+if (-not $rebuildVenv) {
+    try {
+        $venvProbe = (& $venvPython -c 'import sys; print(''.''.join(map(str, sys.version_info[:3])))' 2>&1 |
+            Out-String).Trim()
+        $venvProbeExitCode = $LASTEXITCODE
+    }
+    catch {
+        $venvProbe = $_.Exception.Message
+        $venvProbeExitCode = 1
+    }
+    if ($venvProbeExitCode -eq 0) {
+        try {
+            & $venvPython -m pip --version *> $null
+            $venvProbeExitCode = $LASTEXITCODE
+        }
+        catch {
+            $venvProbeExitCode = 1
+        }
+    }
+    if ($venvProbeExitCode -ne 0 -or -not $venvProbe.StartsWith('3.12.')) {
+        if (-not $Repair) {
+            Stop-Bootstrap `
+                -Code 'VENV_REPAIR_REQUIRED' `
+                -Message "The existing environment is unusable. Re-run with -Repair: $venvRoot"
+        }
+        $rebuildVenv = $true
+    }
+}
+
+if ($rebuildVenv) {
     & $basePython -m venv --clear $venvRoot
     if ($LASTEXITCODE -ne 0) {
         exit $LASTEXITCODE
@@ -108,7 +158,7 @@ finally {
     Pop-Location
 }
 
-& powershell.exe `
+& $powerShell `
     -NoProfile `
     -ExecutionPolicy Bypass `
     -File $verifyScript `

@@ -14,7 +14,6 @@ $ErrorActionPreference = 'Stop'
 
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $sourceRoot = (Resolve-Path (Join-Path $projectRoot 'src')).Path
-$python = Join-Path $projectRoot '.venv\Scripts\python.exe'
 
 function Stop-Verification {
     param(
@@ -37,9 +36,34 @@ function Invoke-Python {
     }
 }
 
+$gitCommand = Get-Command git.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($null -eq $gitCommand) {
+    Stop-Verification -Code 'GIT_NOT_FOUND' -Message 'Git is required to locate the shared environment.'
+}
+$commonDirectoryValue = (& $gitCommand.Source -C $projectRoot rev-parse --git-common-dir 2>&1 |
+    Out-String).Trim()
+if ($LASTEXITCODE -ne 0) {
+    Stop-Verification -Code 'GIT_COMMON_DIR_FAILED' -Message $commonDirectoryValue
+}
+$commonDirectory = if ([System.IO.Path]::IsPathRooted($commonDirectoryValue)) {
+    [System.IO.Path]::GetFullPath($commonDirectoryValue)
+}
+else {
+    [System.IO.Path]::GetFullPath((Join-Path $projectRoot $commonDirectoryValue))
+}
+$environmentRoot = Split-Path -Parent $commonDirectory
+$venvRoot = Join-Path $environmentRoot '.venv'
+$python = Join-Path $venvRoot 'Scripts\python.exe'
+
 if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
+    $code = if (Test-Path -LiteralPath $venvRoot -PathType Container) {
+        'VENV_INCOMPLETE'
+    }
+    else {
+        'VENV_MISSING'
+    }
     Stop-Verification `
-        -Code 'VENV_MISSING' `
+        -Code $code `
         -Message "Project virtual environment is missing or incomplete: $python"
 }
 
@@ -49,17 +73,27 @@ try {
 }
 catch {
     $message = $_.Exception.Message
-    if ($message -match 'Access is denied|拒绝访问|Unable to create process') {
+    if ($message -match 'Access is denied|Unable to create process') {
         Stop-Verification `
             -Code 'PYTHON_EXECUTION_DENIED' `
             -Message "Python exists but cannot run in the current execution boundary: $python"
+    }
+    if ($message -match 'No Python at|cannot find') {
+        Stop-Verification -Code 'VENV_INCOMPLETE' -Message $message
     }
     Stop-Verification -Code 'PYTHON_UNAVAILABLE' -Message $message
 }
 
 if ($LASTEXITCODE -ne 0) {
+    $code = 'PYTHON_UNAVAILABLE'
+    if ($version -match 'Access is denied|Unable to create process') {
+        $code = 'PYTHON_EXECUTION_DENIED'
+    }
+    if ($version -match 'No Python at|cannot find') {
+        $code = 'VENV_INCOMPLETE'
+    }
     Stop-Verification `
-        -Code 'PYTHON_UNAVAILABLE' `
+        -Code $code `
         -Message "Python exited with code ${LASTEXITCODE}: $version" `
         -ExitCode $LASTEXITCODE
 }
@@ -121,6 +155,7 @@ if (-not $modulePath.StartsWith($sourcePrefix, [System.StringComparison]::Ordina
 }
 
 Write-Output "VERIFY_PROJECT_ROOT=$projectRoot"
+Write-Output "VERIFY_ENVIRONMENT_ROOT=$environmentRoot"
 Write-Output "VERIFY_PYTHON=$python"
 Write-Output "VERIFY_PYTHON_VERSION=$version"
 Write-Output "VERIFY_SOURCE_ROOT=$sourceRoot"
