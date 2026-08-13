@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -85,6 +86,8 @@ def test_packaging_manifest_requires_audited_ffmpeg_and_compliance_material() ->
     assert "NOTICE.md" in spec
     assert "provision_ffmpeg.py" in build
     assert "--output" in build
+    assert "DOUYIN_BUILT_EXE" in build
+    assert "test_packaged_runtime.py" in build
 
 
 def test_system_tray_runtime_and_windows_backend_are_packaged() -> None:
@@ -96,25 +99,35 @@ def test_system_tray_runtime_and_windows_backend_are_packaged() -> None:
     assert '"pystray._win32"' in manifest
 
 
-def test_current_package_contains_only_required_media_tools_when_available() -> None:
-    project_root = Path(__file__).parents[2]
-    artifacts = tuple((project_root / "dist").glob("*.exe"))
-    if not artifacts:
-        pytest.skip("current packaged executable is not available")
-    artifact = artifacts[0]
-    packaging_inputs = (
-        project_root / "douyin_downloader.spec",
-        project_root / "scripts" / "provision_ffmpeg.py",
-    )
-    if artifact.stat().st_mtime < max(path.stat().st_mtime for path in packaging_inputs):
-        pytest.skip("current packaged executable predates the packaging inputs")
+def test_current_package_contains_required_resources_and_no_forbidden_config() -> None:
+    artifact_value = os.environ.get("DOUYIN_BUILT_EXE")
+    if artifact_value is None:
+        pytest.skip("built executable was not explicitly selected")
+    artifact = Path(artifact_value)
+    assert artifact.is_file()
     archive = CArchiveReader(str(artifact))
     names = {name.replace("\\", "/").casefold() for name in archive.toc}
 
+    for static_name in STATIC_NAMES:
+        assert f"douyin_downloader/web/static/{static_name}" in names
+    assert "assets/app-icon.ico" in names
+    assert "assets/app-icon.svg" in names
     assert "ffmpeg/ffmpeg.exe" in names
     assert "ffmpeg/ffprobe.exe" in names
     assert "ffmpeg/ffplay.exe" not in names
     assert "third-party/ffmpeg/audit.json" in names
     assert "third-party/ffmpeg/manifest.json" in names
     assert "third-party/ffmpeg/notice.md" in names
+    forbidden_names = {
+        "test.yaml",
+        "conf.yaml",
+        "cookies.txt",
+        "credentials.json",
+        ".env",
+    }
+    assert not {
+        name
+        for name in names
+        if name.rsplit("/", maxsplit=1)[-1] in forbidden_names
+    }
     assert "third-party/ffmpeg/licenses/license.txt" in names

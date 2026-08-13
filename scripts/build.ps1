@@ -40,8 +40,17 @@ try {
         throw "PyInstaller did not create the expected executable."
     }
     Invoke-Python @((Join-Path $PSScriptRoot 'check_sensitive.py'), '--artifact', $exe)
+    $env:DOUYIN_BUILT_EXE = $exe
+    Invoke-Python @(
+        '-m',
+        'pytest',
+        'tests/integration/test_packaged_resources.py::test_current_package_contains_required_resources_and_no_forbidden_config',
+        'tests/integration/test_packaged_runtime.py',
+        '-q'
+    )
     Get-FileHash -LiteralPath $exe -Algorithm SHA256
 }
 finally {
+    Remove-Item Env:DOUYIN_BUILT_EXE -ErrorAction SilentlyContinue
     Pop-Location
 }

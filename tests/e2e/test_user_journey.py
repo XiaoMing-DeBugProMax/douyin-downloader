@@ -109,6 +109,20 @@ def test_database_recovery_workspace_restores_or_rebuilds_with_clear_limits(
     expect(page.locator("#recovery-help")).to_contain_text("任务历史可能无法完整恢复")
 
 
+def test_batch_workspace_is_an_explicit_non_interactive_future_capability(
+    page: Page,
+    local_app_url: str,
+) -> None:
+    page.goto(local_app_url)
+
+    page.get_by_role("tab", name="批量下载", exact=True).click()
+
+    batch = page.locator("#batch-workspace")
+    expect(batch).to_be_visible()
+    expect(batch).to_contain_text("当前不接受来源链接")
+    expect(batch.locator("input, textarea, form, button")).to_have_count(0)
+
+
 def test_navigation_failures_never_expose_launch_tokens(page: Page, local_app_url: str) -> None:
     sentinel = "SENTINEL-LAUNCH-TOKEN-MUST-NOT-LEAK"
     parsed = urlsplit(local_app_url)
