@@ -5,6 +5,8 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from douyin_downloader.archive import ManagedArchive
+from douyin_downloader.database_recovery import DatabaseRecoveryStatus
+from douyin_downloader.domain import AppError
 from douyin_downloader.f2_adapter import F2VideoParser
 from douyin_downloader.launcher import main
 from douyin_downloader.settings import SettingsModule
@@ -76,6 +78,34 @@ async def test_settings_database_failure_does_not_remove_quick_download_services
         app_dir = tmp_path
 
     monkeypatch.setattr(app_module, "RuntimeStore", TemporaryRuntimeStore)
+    app = create_app(testing=True)
+
+    async with app.router.lifespan_context(app):
+        assert app.state.services.settings is None
+        assert app.state.services.managed_archive is None
+        assert app.state.services.parse_service is not None
+        assert app.state.services.database_recovery.status().state == "recovery_required"
+    assert not (tmp_path / "archive.db").exists()
+    assert len(tuple(tmp_path.glob("archive.corrupt-*.db"))) == 1  # noqa: ASYNC240
+
+
+@pytest.mark.asyncio
+async def test_database_backup_failure_does_not_remove_quick_download_services(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class TemporaryRuntimeStore:
+        app_dir = tmp_path
+
+    class FailingRecovery:
+        def __init__(self, database_path: Path) -> None:
+            self.database_path = database_path
+
+        def prepare_startup(self) -> DatabaseRecoveryStatus:
+            raise AppError("DATABASE_BACKUP_FAILED", "数据库备份校验失败。", 500)
+
+    monkeypatch.setattr(app_module, "RuntimeStore", TemporaryRuntimeStore)
+    monkeypatch.setattr(app_module, "DatabaseRecovery", FailingRecovery)
     app = create_app(testing=True)
 
     async with app.router.lifespan_context(app):

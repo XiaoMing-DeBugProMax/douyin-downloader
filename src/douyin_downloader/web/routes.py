@@ -17,6 +17,7 @@ from douyin_downloader.archive import (
     TaskCenterOperationSnapshot,
     WorkArchiveSnapshot,
 )
+from douyin_downloader.database_recovery import DatabaseRecoveryStatus
 from douyin_downloader.domain import AppError
 from douyin_downloader.media import UpstreamStream, open_first_available, safe_video_filename
 from douyin_downloader.parse_service import ParseService
@@ -89,6 +90,14 @@ class DirectoryChooser(Protocol):
     def choose_directory(self) -> Path | None: ...
 
 
+class DatabaseRecoveryModule(Protocol):
+    def status(self) -> DatabaseRecoveryStatus: ...
+
+    def restore(self, backup_name: str) -> DatabaseRecoveryStatus: ...
+
+    def rebuild_from_metadata(self, root: Path) -> DatabaseRecoveryStatus: ...
+
+
 class SettingsModuleInterface(Protocol):
     def current(self) -> CurrentSettings: ...
 
@@ -107,6 +116,7 @@ class AppServices:
     archive_library: ArchiveLibraryModule | None = None
     settings: SettingsModuleInterface | None = None
     directory_chooser: DirectoryChooser | None = None
+    database_recovery: DatabaseRecoveryModule | None = None
 
 
 class ParseRequest(BaseModel):
@@ -219,6 +229,27 @@ class SettingsResponse(BaseModel):
     retry_limit: int
 
 
+class RestoreDatabaseRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    backup_name: str = Field(min_length=1, max_length=200)
+
+
+class RecoveryBackupResponse(BaseModel):
+    name: str
+    local_date: str
+    kind: str
+
+
+class RecoveryStatusResponse(BaseModel):
+    state: str
+    backups: list[RecoveryBackupResponse]
+    quarantined: bool
+    history_recovery: str
+    rebuilt_archives: int
+    restart_required: bool
+
+
 class TaskErrorResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -326,6 +357,35 @@ def _settings_response(settings: CurrentSettings) -> SettingsResponse:
         ),
         download_concurrency=settings.download_concurrency,
         retry_limit=settings.retry_limit,
+    )
+
+
+def _database_recovery(request: Request) -> DatabaseRecoveryModule:
+    recovery = _services(request).database_recovery
+    if recovery is None:
+        raise AppError("DATABASE_RECOVERY_UNAVAILABLE", "数据库恢复暂时不可用。", 503)
+    return recovery
+
+
+def _recovery_response(
+    status: DatabaseRecoveryStatus,
+    *,
+    restart_required: bool = False,
+) -> RecoveryStatusResponse:
+    return RecoveryStatusResponse(
+        state=status.state,
+        backups=[
+            RecoveryBackupResponse(
+                name=backup.name,
+                local_date=backup.local_date.isoformat(),
+                kind=backup.kind,
+            )
+            for backup in status.backups
+        ],
+        quarantined=status.quarantined_path is not None,
+        history_recovery=status.history_recovery,
+        rebuilt_archives=status.rebuilt_archives,
+        restart_required=restart_required,
     )
 
 
@@ -597,6 +657,48 @@ def build_router() -> APIRouter:
     async def get_settings(request: Request) -> SettingsResponse:
         current = await asyncio.to_thread(_settings_module(request).current)
         return _settings_response(current)
+
+    @router.get(
+        "/api/recovery",
+        response_model=RecoveryStatusResponse,
+        dependencies=[Depends(require_local_session)],
+    )
+    async def get_recovery_status(request: Request) -> RecoveryStatusResponse:
+        status = await asyncio.to_thread(_database_recovery(request).status)
+        return _recovery_response(status)
+
+    @router.post(
+        "/api/recovery/restore",
+        response_model=RecoveryStatusResponse,
+        dependencies=[Depends(require_local_session), Depends(require_same_origin)],
+    )
+    async def restore_database(
+        payload: RestoreDatabaseRequest,
+        request: Request,
+    ) -> RecoveryStatusResponse:
+        status = await asyncio.to_thread(
+            _database_recovery(request).restore,
+            payload.backup_name,
+        )
+        return _recovery_response(status, restart_required=True)
+
+    @router.post(
+        "/api/recovery/rebuild",
+        response_model=RecoveryStatusResponse,
+        dependencies=[Depends(require_local_session), Depends(require_same_origin)],
+    )
+    async def rebuild_database(request: Request) -> RecoveryStatusResponse:
+        services = _services(request)
+        if services.directory_chooser is None:
+            raise AppError("DATABASE_RECOVERY_UNAVAILABLE", "数据库恢复暂时不可用。", 503)
+        selected = await asyncio.to_thread(services.directory_chooser.choose_directory)
+        if selected is None:
+            raise AppError("ARCHIVE_SELECTION_CANCELLED", "已取消选择归档目录。", 409)
+        status = await asyncio.to_thread(
+            _database_recovery(request).rebuild_from_metadata,
+            selected,
+        )
+        return _recovery_response(status, restart_required=True)
 
     @router.put(
         "/api/settings",

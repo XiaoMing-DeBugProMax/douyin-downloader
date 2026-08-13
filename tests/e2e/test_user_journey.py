@@ -56,6 +56,59 @@ def parse_video(page: Page, local_app_url: str) -> None:
     page.locator("#result").wait_for(state="visible")
 
 
+def test_database_recovery_workspace_restores_or_rebuilds_with_clear_limits(
+    page: Page,
+    local_app_url: str,
+) -> None:
+    actions: list[str] = []
+    status = {
+        "state": "recovery_required",
+        "backups": [
+            {
+                "name": "archive.daily-2026-08-13.bak",
+                "local_date": "2026-08-13",
+                "kind": "daily",
+            }
+        ],
+        "quarantined": True,
+        "history_recovery": "complete",
+        "rebuilt_archives": 0,
+        "restart_required": False,
+    }
+
+    def recovery_route(route: Route) -> None:
+        if route.request.method == "GET":
+            route.fulfill(status=200, json=status)
+            return
+        actions.append(route.request.url.rsplit("/", 1)[-1])
+        route.fulfill(status=200, json={**status, "state": "healthy", "restart_required": True})
+
+    page.route("**/api/recovery**", recovery_route)
+    page.goto(local_app_url)
+    page.locator("#tab-settings").click()
+
+    expect(page.locator("#recovery-state")).to_contain_text("已隔离")
+    expect(page.locator("#recovery-backup")).to_have_value(
+        "archive.daily-2026-08-13.bak"
+    )
+    expect(page.locator("#recovery-restore")).to_be_enabled()
+    expect(page.locator("#recovery-rebuild")).to_be_hidden()
+
+    page.on("dialog", lambda dialog: dialog.accept())
+    page.locator("#recovery-restore").click()
+    expect(page.locator("#recovery-status")).to_contain_text("重启应用")
+    assert actions == ["restore"]
+
+    no_backup = {**status, "backups": []}
+    page.unroute("**/api/recovery**")
+    page.route("**/api/recovery", lambda route: route.fulfill(status=200, json=no_backup))
+    page.reload()
+    page.locator("#tab-settings").click()
+    expect(page.locator("#recovery-restore")).to_be_disabled()
+    expect(page.locator("#recovery-rebuild")).to_be_visible()
+    expect(page.locator("#recovery-help")).to_contain_text("任务历史可能无法完整恢复")
+
+
 def test_navigation_failures_never_expose_launch_tokens(page: Page, local_app_url: str) -> None:
     sentinel = "SENTINEL-LAUNCH-TOKEN-MUST-NOT-LEAK"
     parsed = urlsplit(local_app_url)

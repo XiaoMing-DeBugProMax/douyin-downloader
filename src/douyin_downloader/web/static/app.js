@@ -39,6 +39,12 @@ const settingsRetry = document.querySelector("#settings-retry");
 const settingsSave = document.querySelector("#settings-save");
 const settingsStatus = document.querySelector("#settings-status");
 const settingsError = document.querySelector("#settings-error");
+const recoveryState = document.querySelector("#recovery-state");
+const recoveryBackup = document.querySelector("#recovery-backup");
+const recoveryRestore = document.querySelector("#recovery-restore");
+const recoveryRebuild = document.querySelector("#recovery-rebuild");
+const recoveryStatus = document.querySelector("#recovery-status");
+const recoveryError = document.querySelector("#recovery-error");
 const tasksWorkspace = document.querySelector("#tasks-workspace");
 const tasksRefresh = document.querySelector("#tasks-refresh");
 const tasksStatus = document.querySelector("#tasks-status");
@@ -74,6 +80,7 @@ let currentArchiveState = "not_archived";
 let currentAudioOutcome = "not_requested";
 let currentDescriptionOutcome = "not_requested";
 let settingsLoaded = false;
+let recoveryLoaded = false;
 let tasksLoading = false;
 let tasksRefreshTimer = null;
 let pendingCancelTaskId = null;
@@ -208,7 +215,10 @@ function activateWorkspace(name) {
   for (const panel of workspacePanels) {
     panel.hidden = panel.id !== `${name}-workspace`;
   }
-  if (name === "settings") loadSettings();
+  if (name === "settings") {
+    loadSettings();
+    loadRecovery();
+  }
   if (name === "library") loadLibrary(pendingLibraryFocus);
   if (name === "tasks") {
     loadTasks();
@@ -796,6 +806,87 @@ async function loadSettings(force = false) {
     showSettingsError(UNKNOWN_ERROR);
   }
 }
+
+function renderRecovery(payload) {
+  recoveryBackup.replaceChildren();
+  for (const backup of payload.backups) {
+    const option = document.createElement("option");
+    option.value = backup.name;
+    option.textContent = `${backup.local_date} · ${backup.kind === "migration" ? "迁移前" : "每日"}`;
+    recoveryBackup.append(option);
+  }
+  const needsRecovery = payload.state === "recovery_required";
+  recoveryState.textContent = needsRecovery
+    ? payload.quarantined
+      ? "数据库异常，原文件已隔离；请选择有效备份恢复。"
+      : "数据库需要恢复。"
+    : "数据库状态正常。";
+  recoveryBackup.disabled = !needsRecovery || payload.backups.length === 0;
+  recoveryRestore.disabled = recoveryBackup.disabled;
+  recoveryRebuild.hidden = !needsRecovery || payload.backups.length !== 0;
+  if (payload.history_recovery === "incomplete") {
+    recoveryStatus.textContent = `已重建 ${payload.rebuilt_archives} 个档案索引，任务历史未完整恢复；请重启应用。`;
+  } else if (payload.restart_required) {
+    recoveryStatus.textContent = "数据库已恢复并通过完整性校验，请重启应用。";
+  }
+}
+
+async function loadRecovery(force = false) {
+  if (recoveryLoaded && !force) return;
+  try {
+    const response = await fetch("/api/recovery");
+    if (!response.ok) {
+      recoveryError.textContent = await responseErrorMessage(response);
+      return;
+    }
+    renderRecovery(await response.json());
+    recoveryLoaded = true;
+  } catch (_) {
+    recoveryError.textContent = UNKNOWN_ERROR;
+  }
+}
+
+recoveryRestore.addEventListener("click", async () => {
+  if (!recoveryBackup.value) return;
+  if (!window.confirm("将使用所选备份恢复数据库。恢复完成后需要重启应用，是否继续？")) return;
+  recoveryRestore.disabled = true;
+  recoveryError.textContent = "";
+  try {
+    const response = await fetch("/api/recovery/restore", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ backup_name: recoveryBackup.value }),
+    });
+    if (!response.ok) {
+      recoveryError.textContent = await responseErrorMessage(response);
+      recoveryRestore.disabled = false;
+      return;
+    }
+    renderRecovery(await response.json());
+  } catch (_) {
+    recoveryError.textContent = UNKNOWN_ERROR;
+    recoveryRestore.disabled = false;
+  }
+});
+
+recoveryRebuild.addEventListener("click", async () => {
+  if (!window.confirm("请选择原归档根目录。重建只恢复作品、档案和成果索引，任务历史可能不完整。")) return;
+  recoveryRebuild.disabled = true;
+  recoveryError.textContent = "";
+  try {
+    const response = await fetch("/api/recovery/rebuild", { method: "POST" });
+    if (!response.ok) {
+      const failure = await responseError(response);
+      if (failure.code !== "ARCHIVE_SELECTION_CANCELLED") recoveryError.textContent = failure.message;
+      recoveryRebuild.disabled = false;
+      return;
+    }
+    renderRecovery(await response.json());
+  } catch (_) {
+    recoveryError.textContent = UNKNOWN_ERROR;
+    recoveryRebuild.disabled = false;
+  }
+});
 
 settingsRootSelect.addEventListener("click", async () => {
   settingsRootSelect.disabled = true;

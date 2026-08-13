@@ -256,6 +256,30 @@
           </div>
           <button id="settings-save" class="button button-primary" type="submit">保存设置</button>
         </form>
+
+        <section class="settings-panel recovery-panel" aria-labelledby="recovery-title">
+          <div>
+            <p class="eyebrow">DATABASE RECOVERY</p>
+            <h2 id="recovery-title">数据库备份与恢复</h2>
+            <p id="recovery-state">正在检查数据库状态…</p>
+          </div>
+          <div class="settings-field">
+            <label for="recovery-backup">已校验的可恢复备份</label>
+            <select id="recovery-backup" disabled></select>
+            <p>应用每天首次启动及结构迁移前备份数据库，只保留最近 7 份每日备份；媒体文件不进入备份。</p>
+          </div>
+          <p id="recovery-help" class="recovery-help">
+            没有有效备份时，可选择原归档根目录扫描已校验的元数据与成果来重建档案索引；任务历史可能无法完整恢复。
+          </p>
+          <div class="recovery-actions">
+            <button id="recovery-restore" class="button button-secondary" type="button" disabled>恢复所选备份</button>
+            <button id="recovery-rebuild" class="button button-secondary" type="button" hidden>从归档目录重建</button>
+          </div>
+          <div class="settings-feedback">
+            <p id="recovery-status" role="status" aria-live="polite"></p>
+            <p id="recovery-error" role="alert"></p>
+          </div>
+        </section>
       </section>
     </main>
 

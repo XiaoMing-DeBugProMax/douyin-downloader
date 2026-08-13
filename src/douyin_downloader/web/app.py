@@ -15,6 +15,7 @@ from douyin_downloader.archive import (
     ManagedArchive,
     WindowsDirectoryChooser,
 )
+from douyin_downloader.database_recovery import DatabaseRecovery
 from douyin_downloader.domain import AppError
 from douyin_downloader.f2_adapter import F2VideoParser, F2WorkAccess
 from douyin_downloader.library import LocalArchiveLibrary
@@ -41,6 +42,10 @@ async def _application_lifespan(app: FastAPI) -> AsyncIterator[None]:
     work_access = F2WorkAccess()
     try:
         database_path = RuntimeStore().app_dir / "archive.db"
+        database_recovery = DatabaseRecovery(database_path)
+        recovery_status = database_recovery.prepare_startup()
+        if recovery_status.state != "healthy":
+            raise sqlite3.DatabaseError("database recovery required")
         settings = SettingsModule(database_path)
         settings.current()
         managed = ManagedArchive(
@@ -50,10 +55,17 @@ async def _application_lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
         managed_archive: ManagedArchive | None = managed
         archive_library = LocalArchiveLibrary(managed)
+    except AppError:
+        settings = None
+        managed_archive = None
+        archive_library = None
+        database_recovery = None
     except (OSError, RuntimeError, sqlite3.Error):
         settings = None
         managed_archive = None
         archive_library = None
+        if "database_recovery" not in locals():
+            database_recovery = None
     app.state.services = AppServices(
         parse_service=ParseService(
             ShareResolver(client),
@@ -65,6 +77,7 @@ async def _application_lifespan(app: FastAPI) -> AsyncIterator[None]:
         archive_library=archive_library,
         settings=settings,
         directory_chooser=WindowsDirectoryChooser(),
+        database_recovery=database_recovery,
     )
     try:
         yield

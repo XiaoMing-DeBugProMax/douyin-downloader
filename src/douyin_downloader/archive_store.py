@@ -80,6 +80,10 @@ class ArchiveStore:
     def __init__(self, database_path: Path) -> None:
         self._database_path = database_path
 
+    def initialize(self) -> None:
+        connection = self._connect()
+        connection.close()
+
     def load_archive(self, aweme_id: str) -> StoredArchive | None:
         if not self._database_path.is_file():
             return None

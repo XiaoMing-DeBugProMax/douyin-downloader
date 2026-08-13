@@ -3,6 +3,8 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+from douyin_downloader.database_safety import database_is_safe_and_valid
+
 _OPERATION_SNAPSHOT_MIGRATIONS = {
     "naming_template": (
         "ALTER TABLE archive_operations ADD COLUMN naming_template "
@@ -265,6 +267,8 @@ def _backup_before_migration(
             backup.commit()
         finally:
             backup.close()
+        if not database_is_safe_and_valid(part_path):
+            raise sqlite3.DatabaseError("pre-migration backup failed validation")
         part_path.replace(backup_path)
     except BaseException:
         part_path.unlink(missing_ok=True)
