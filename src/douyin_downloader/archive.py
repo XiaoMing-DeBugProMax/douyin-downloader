@@ -6,8 +6,8 @@ import secrets
 import threading
 import time
 import weakref
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
@@ -20,14 +20,17 @@ from douyin_downloader.archive_adapters import (
     FolderOpener,
     HttpMediaAccess,
     MediaAccess,
-    RecycleBin,
     RemoteArtifact,
     RemoteResumeRequest,
     WindowsDirectoryChooser,
     WindowsFolderOpener,
 )
 from douyin_downloader.archive_artifacts import ArtifactRecord, validate_metadata
-from douyin_downloader.archive_paths import pin_work_directory, work_directory
+from douyin_downloader.archive_paths import (
+    PinnedWorkDirectory,
+    pin_work_directory,
+    work_directory,
+)
 from douyin_downloader.archive_pipeline import (
     ArchiveArtifactPipeline,
     PreparedArchive,
@@ -310,8 +313,7 @@ class _TaskProgressRecorder:
             self._speed_bytes_per_second = self._completed_bytes / elapsed
             self._eta_seconds = (
                 math.ceil(
-                    max(total_bytes - self._completed_bytes, 0)
-                    / self._speed_bytes_per_second
+                    max(total_bytes - self._completed_bytes, 0) / self._speed_bytes_per_second
                 )
                 if total_bytes is not None and self._speed_bytes_per_second > 0
                 else None
@@ -440,8 +442,7 @@ class ManagedArchive:
         if existing is not None:
             effective_profile = ArchiveProfile(
                 include_audio=(
-                    existing.stored.settings.profile.include_audio
-                    or settings.profile.include_audio
+                    existing.stored.settings.profile.include_audio or settings.profile.include_audio
                 ),
                 include_description=(
                     existing.stored.settings.profile.include_description
@@ -502,8 +503,7 @@ class ManagedArchive:
                 progress = _TaskProgressRecorder(
                     self._store,
                     ids,
-                    int("video" not in valid_artifacts)
-                    + int("cover" not in valid_artifacts),
+                    int("video" not in valid_artifacts) + int("cover" not in valid_artifacts),
                     controller,
                 )
                 try:
@@ -528,10 +528,7 @@ class ManagedArchive:
                     ) as output_directory:
                         base_name = settings.artifact_base_name(resolved)
                         registered_artifacts: dict[str, ArtifactRecord] = (
-                            {
-                                artifact.kind: artifact
-                                for artifact in existing.stored.artifacts
-                            }
+                            {artifact.kind: artifact for artifact in existing.stored.artifacts}
                             if existing is not None
                             else {}
                         )
@@ -632,95 +629,90 @@ class ManagedArchive:
     def registered_archive_ids(self) -> tuple[str, ...]:
         return self._store.list_archive_ids()
 
-    def relocate_registered_archive(
+    @contextmanager
+    def hold_registered_archive(self, aweme_id: str) -> Iterator[None]:
+        _validate_aweme_id(aweme_id)
+        with self._integrity_lock(aweme_id):
+            yield
+
+    def validate_registered_location(
         self,
         aweme_id: str,
         archive_root: Path,
     ) -> WorkArchiveSnapshot:
         _validate_aweme_id(aweme_id)
-        with self._integrity_lock(aweme_id):
-            stored = self._store.load_archive(aweme_id)
-            if stored is None:
-                raise AppError(
-                    "ARCHIVE_NOT_FOUND",
-                    "没有找到该作品的本地档案。",
-                    404,
-                )
-            if not archive_root.is_absolute() or not archive_root.is_dir():
-                raise AppError(
-                    "ARCHIVE_RELOCATION_INVALID",
-                    "所选位置不是可用的本地档案根目录。",
-                    409,
-                )
-            root = archive_root.resolve(strict=True)
-            candidate = replace(
-                stored,
-                root=root,
-                settings=replace(stored.settings, archive_root=root),
+        stored = self._store.load_archive(aweme_id)
+        if stored is None:
+            raise AppError(
+                "ARCHIVE_NOT_FOUND",
+                "没有找到该作品的本地档案。",
+                404,
             )
-            try:
-                with pin_work_directory(
-                    root,
-                    candidate.relative_directory,
-                    create=False,
-                ) as output_directory:
-                    valid_artifacts = self._artifact_pipeline.audit(
-                        output_directory,
-                        candidate.aweme_id,
-                        candidate.artifacts,
-                    )
-            except AppError as error:
-                raise AppError(
-                    "ARCHIVE_RELOCATION_INVALID",
-                    "所选位置未通过作品身份、文件完整性或路径安全校验。",
-                    409,
-                ) from error
-            expected_artifacts = {"video", "cover", "metadata"}
-            if candidate.settings.profile.include_audio:
-                expected_artifacts.add("audio")
-            if candidate.settings.profile.include_description:
-                expected_artifacts.add("description")
-            if set(valid_artifacts) != expected_artifacts:
-                raise AppError(
-                    "ARCHIVE_RELOCATION_INVALID",
-                    "所选位置的档案文件不完整或已损坏。",
-                    409,
-                )
-            self._store.update_archive_root(aweme_id, root)
-            self._store.set_archive_status(aweme_id, "archived")
-            return _work_archive_snapshot(
-                _AuditedArchive(candidate, "archived", valid_artifacts)
+        if not archive_root.is_absolute() or not archive_root.is_dir():
+            raise AppError(
+                "ARCHIVE_RELOCATION_INVALID",
+                "所选位置不是可用的本地档案根目录。",
+                409,
             )
+        root = archive_root.resolve(strict=True)
+        candidate = replace(
+            stored,
+            root=root,
+            settings=replace(stored.settings, archive_root=root),
+        )
+        try:
+            with pin_work_directory(
+                root,
+                candidate.relative_directory,
+                create=False,
+            ) as output_directory:
+                valid_artifacts = self._artifact_pipeline.audit(
+                    output_directory,
+                    candidate.aweme_id,
+                    candidate.artifacts,
+                )
+        except AppError as error:
+            raise AppError(
+                "ARCHIVE_RELOCATION_INVALID",
+                "所选位置未通过作品身份、文件完整性或路径安全校验。",
+                409,
+            ) from error
+        expected_artifacts = {"video", "cover", "metadata"}
+        if candidate.settings.profile.include_audio:
+            expected_artifacts.add("audio")
+        if candidate.settings.profile.include_description:
+            expected_artifacts.add("description")
+        if set(valid_artifacts) != expected_artifacts:
+            raise AppError(
+                "ARCHIVE_RELOCATION_INVALID",
+                "所选位置的档案文件不完整或已损坏。",
+                409,
+            )
+        return _work_archive_snapshot(_AuditedArchive(candidate, "archived", valid_artifacts))
 
-    def delete_registered_archive(
-        self,
-        aweme_id: str,
-        recycle_bin: RecycleBin,
-    ) -> None:
+    def update_registered_location(self, aweme_id: str, archive_root: Path) -> None:
         _validate_aweme_id(aweme_id)
-        with self._integrity_lock(aweme_id):
-            stored = self._store.load_archive(aweme_id)
-            if stored is None:
-                raise AppError(
-                    "ARCHIVE_NOT_FOUND",
-                    "没有找到该作品的本地档案。",
-                    404,
-                )
-            try:
-                with pin_work_directory(
-                    stored.root,
-                    stored.relative_directory,
-                    create=False,
-                    share_delete=True,
-                ) as output_directory:
-                    recycle_bin.move_to_recycle_bin(output_directory)
-            except (AppError, OSError) as error:
-                raise AppError(
-                    "ARCHIVE_RECYCLE_FAILED",
-                    "无法将档案移入回收站，文件与档案记录均已保留。",
-                    409,
-                ) from error
-            self._store.delete_archive(aweme_id)
+        stored = self._store.load_archive(aweme_id)
+        if stored is None:
+            raise AppError("ARCHIVE_NOT_FOUND", "没有找到该作品的本地档案。", 404)
+        self._store.update_archive_root(aweme_id, archive_root)
+        self._store.set_archive_status(aweme_id, "archived")
+
+    def pin_registered_directory(self, aweme_id: str) -> PinnedWorkDirectory:
+        _validate_aweme_id(aweme_id)
+        stored = self._store.load_archive(aweme_id)
+        if stored is None:
+            raise AppError("ARCHIVE_NOT_FOUND", "没有找到该作品的本地档案。", 404)
+        return pin_work_directory(
+            stored.root,
+            stored.relative_directory,
+            create=False,
+            share_delete=True,
+        )
+
+    def remove_registered_archive(self, aweme_id: str) -> None:
+        _validate_aweme_id(aweme_id)
+        self._store.delete_archive(aweme_id)
 
     async def rearchive_registered(
         self,
@@ -754,8 +746,7 @@ class ManagedArchive:
 
     def list_task_operations(self) -> tuple[TaskCenterOperationSnapshot, ...]:
         return tuple(
-            _task_center_snapshot(operation)
-            for operation in self._store.list_task_operations()
+            _task_center_snapshot(operation) for operation in self._store.list_task_operations()
         )
 
     async def pause_task(self, task_id: str) -> TaskCenterOperationSnapshot:
@@ -781,9 +772,7 @@ class ManagedArchive:
         if operation is None:
             raise AppError("TASK_NOT_FOUND", "没有找到该任务记录。", 404)
         unavailable_message = (
-            "该任务当前不能继续。"
-            if mode is _TaskRestartMode.CONTINUE
-            else "该任务当前不能重试。"
+            "该任务当前不能继续。" if mode is _TaskRestartMode.CONTINUE else "该任务当前不能重试。"
         )
         allowed = (
             operation.task.lifecycle == "interrupted"
@@ -997,13 +986,9 @@ def _archive_snapshot(
 
 
 def _work_archive_snapshot(existing: _AuditedArchive) -> WorkArchiveSnapshot:
-    integrity_by_kind = {
-        artifact.kind: "valid" for artifact in existing.valid_artifacts.values()
-    }
+    integrity_by_kind = {artifact.kind: "valid" for artifact in existing.valid_artifacts.values()}
     if existing.status == "location_unavailable":
-        integrity_by_kind = {
-            artifact.kind: "unknown" for artifact in existing.stored.artifacts
-        }
+        integrity_by_kind = {artifact.kind: "unknown" for artifact in existing.stored.artifacts}
     return WorkArchiveSnapshot(
         aweme_id=existing.stored.aweme_id,
         author=existing.stored.author,
@@ -1087,9 +1072,7 @@ def _task_center_snapshot(
             )
         )
     total_items = sum(source.task.progress.total_items for source in source_snapshots)
-    completed_items = sum(
-        source.task.progress.completed_items for source in source_snapshots
-    )
+    completed_items = sum(source.task.progress.completed_items for source in source_snapshots)
     return TaskCenterOperationSnapshot(
         task=task(
             operation.task,

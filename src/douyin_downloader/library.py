@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Protocol
 
@@ -8,11 +9,14 @@ from douyin_downloader.archive import (
     WorkArchiveSnapshot,
 )
 from douyin_downloader.archive_adapters import RecycleBin, WindowsRecycleBin
+from douyin_downloader.archive_paths import PinnedWorkDirectory
 from douyin_downloader.domain import AppError
 from douyin_downloader.settings import ArchiveProfile
 
 
 class ManagedArchiveGateway(Protocol):
+    def hold_registered_archive(self, aweme_id: str) -> AbstractContextManager[None]: ...
+
     def registered_archive_ids(self) -> tuple[str, ...]: ...
 
     def inspect_registered_archive(
@@ -28,11 +32,15 @@ class ManagedArchiveGateway(Protocol):
         force: bool = False,
     ) -> ArchiveOperationSnapshot: ...
 
-    def relocate_registered_archive(
+    def validate_registered_location(
         self, aweme_id: str, archive_root: Path
     ) -> WorkArchiveSnapshot: ...
 
-    def delete_registered_archive(self, aweme_id: str, recycle_bin: RecycleBin) -> None: ...
+    def update_registered_location(self, aweme_id: str, archive_root: Path) -> None: ...
+
+    def pin_registered_directory(self, aweme_id: str) -> PinnedWorkDirectory: ...
+
+    def remove_registered_archive(self, aweme_id: str) -> None: ...
 
 
 class LocalArchiveLibrary:
@@ -104,8 +112,12 @@ class LocalArchiveLibrary:
         )
 
     def relocate(self, aweme_id: str, archive_root: Path) -> WorkArchiveSnapshot:
-        self._required_work(aweme_id)
-        return self._managed_archive.relocate_registered_archive(aweme_id, archive_root)
+        with self._managed_archive.hold_registered_archive(aweme_id):
+            candidate = self._managed_archive.validate_registered_location(
+                aweme_id, archive_root
+            )
+            self._managed_archive.update_registered_location(aweme_id, candidate.root)
+            return candidate
 
     def delete(self, aweme_id: str, *, confirm_recycle: bool) -> None:
         if not confirm_recycle:
@@ -114,8 +126,19 @@ class LocalArchiveLibrary:
                 "删除本地档案前必须明确确认移入回收站。",
                 409,
             )
-        self._required_work(aweme_id)
-        self._managed_archive.delete_registered_archive(aweme_id, self._recycle_bin)
+        with self._managed_archive.hold_registered_archive(aweme_id):
+            try:
+                with self._managed_archive.pin_registered_directory(
+                    aweme_id
+                ) as directory:
+                    self._recycle_bin.move_to_recycle_bin(directory)
+            except (AppError, OSError) as error:
+                raise AppError(
+                    "ARCHIVE_RECYCLE_FAILED",
+                    "无法将档案移入回收站，文件与档案记录均已保留。",
+                    409,
+                ) from error
+            self._managed_archive.remove_registered_archive(aweme_id)
 
     def _required_work(self, aweme_id: str) -> WorkArchiveSnapshot:
         item = self.get_work(aweme_id)

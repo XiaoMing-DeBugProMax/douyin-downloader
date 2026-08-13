@@ -172,6 +172,9 @@ class RecycleBin(Protocol):
 class WindowsRecycleBin:
     """Move one validated directory to the Windows Recycle Bin."""
 
+    def __init__(self, shell_operation: object | None = None) -> None:
+        self._shell_operation = shell_operation
+
     def move_to_recycle_bin(self, path: Path) -> None:
         if os.name != "nt":
             raise OSError("recycling archive folders requires Windows")
@@ -192,7 +195,10 @@ class WindowsRecycleBin:
         operation.wFunc = 3  # FO_DELETE
         operation.pFrom = f"{path}\0\0"
         operation.fFlags = 0x0040 | 0x0010 | 0x0004 | 0x0400
-        result = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(operation))
+        shell_operation = self._shell_operation
+        if shell_operation is None:
+            shell_operation = ctypes.windll.shell32.SHFileOperationW
+        result = shell_operation(ctypes.byref(operation))  # type: ignore[operator]
         if result != 0 or operation.fAnyOperationsAborted:
             raise OSError(f"Windows Recycle Bin operation failed: {result}")
 
