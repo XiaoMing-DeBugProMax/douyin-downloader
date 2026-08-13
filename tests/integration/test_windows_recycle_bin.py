@@ -6,6 +6,17 @@ import pytest
 from douyin_downloader.archive_adapters import WindowsRecycleBin
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows Recycle Bin integration")
+def test_windows_recycle_bin_moves_temporary_work_directory(tmp_path: Path) -> None:
+    directory = tmp_path / "issue-11-recycle-bin-uat"
+    directory.mkdir()
+    (directory / "marker.txt").write_text("issue-11", encoding="utf-8")
+
+    WindowsRecycleBin().move_to_recycle_bin(directory)
+
+    assert not directory.exists()
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows Shell API contract")
 def test_windows_recycle_bin_requests_undoable_directory_delete(tmp_path: Path) -> None:
     directory = tmp_path / "work"
