@@ -675,7 +675,11 @@ class ManagedArchive:
                     "所选位置未通过作品身份、文件完整性或路径安全校验。",
                     409,
                 ) from error
-            expected_artifacts = {artifact.kind for artifact in candidate.artifacts}
+            expected_artifacts = {"video", "cover", "metadata"}
+            if candidate.settings.profile.include_audio:
+                expected_artifacts.add("audio")
+            if candidate.settings.profile.include_description:
+                expected_artifacts.add("description")
             if set(valid_artifacts) != expected_artifacts:
                 raise AppError(
                     "ARCHIVE_RELOCATION_INVALID",

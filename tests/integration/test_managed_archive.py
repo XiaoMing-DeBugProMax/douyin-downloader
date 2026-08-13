@@ -980,6 +980,39 @@ async def test_library_rejects_corrupt_relocation_without_changing_record(
 
 
 @pytest.mark.asyncio
+async def test_library_rejects_relocation_with_missing_artifact_registration(
+    tmp_path: Path,
+) -> None:
+    original_root = tmp_path / "original"
+    original_root.mkdir()
+    database = tmp_path / "archive.db"
+    managed = ManagedArchive(
+        database_path=database,
+        work_access=StaticWorkAccess(),
+        media_access=StaticMediaAccess(valid_mp4()),
+    )
+    completed = await managed.archive_single(
+        SingleArchiveRequest("7429378937383308594", original_root)
+    )
+    candidate_root = tmp_path / "candidate"
+    candidate_root.mkdir()
+    shutil.copytree(
+        original_root / completed.archive_item.relative_directory,
+        candidate_root / completed.archive_item.relative_directory,
+    )
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "DELETE FROM archive_artifacts WHERE aweme_id=? AND kind='cover'",
+            ("7429378937383308594",),
+        )
+
+    with pytest.raises(AppError) as raised:
+        LocalArchiveLibrary(managed).relocate("7429378937383308594", candidate_root)
+
+    assert raised.value.code == "ARCHIVE_RELOCATION_INVALID"
+
+
+@pytest.mark.asyncio
 async def test_library_deletes_record_only_after_recycle_succeeds(
     tmp_path: Path,
 ) -> None:
