@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from douyin_downloader import archive_paths
 from douyin_downloader.archive_store import ArchiveStore
 from douyin_downloader.database_recovery import DatabaseRecovery
 from douyin_downloader.domain import AppError
@@ -178,6 +179,24 @@ def test_restore_accepts_only_verified_backup_and_rechecks_restored_database(
     assert raised.value.code == "DATABASE_BACKUP_INVALID"
 
 
+def test_missing_database_with_valid_backup_enters_recovery_instead_of_bootstrapping(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "archive.db"
+    create_database(database)
+    recovery = DatabaseRecovery(database, today=lambda: date(2026, 8, 13))
+    recovery.prepare_startup()
+    database.unlink()
+
+    restarted = DatabaseRecovery(database).prepare_startup()
+
+    assert restarted.state == "recovery_required"
+    assert [backup.name for backup in restarted.backups] == [
+        "archive.daily-2026-08-13.bak"
+    ]
+    assert not database.exists()
+
+
 def test_restore_refuses_to_overwrite_a_live_database(tmp_path: Path) -> None:
     database = tmp_path / "archive.db"
     create_database(database)
@@ -190,12 +209,40 @@ def test_restore_refuses_to_overwrite_a_live_database(tmp_path: Path) -> None:
     assert raised.value.code == "DATABASE_RESTORE_TARGET_EXISTS"
 
 
-def write_rebuildable_archive(root: Path, *, corrupt_video: bool = False) -> Path:
+def test_rebuild_is_available_only_when_no_valid_backup_exists(tmp_path: Path) -> None:
+    database = tmp_path / "archive.db"
+    create_database(database)
+    recovery = DatabaseRecovery(database, today=lambda: date(2026, 8, 13))
+    recovery.prepare_startup()
+    database.unlink()
+    root = tmp_path / "library"
+    root.mkdir()
+    write_rebuildable_archive(root)
+
+    with pytest.raises(AppError) as raised:
+        recovery.rebuild_from_metadata(root)
+
+    assert raised.value.code == "DATABASE_REBUILD_BACKUP_AVAILABLE"
+    assert not database.exists()
+
+
+def write_rebuildable_archive(
+    root: Path,
+    *,
+    corrupt_video: bool = False,
+    description: str = "safe archive",
+    nested_video: bool = False,
+) -> Path:
     aweme_id = "7429378937383308594"
     work_directory = root / "author-stable" / "2024" / f"work-{aweme_id}"
     work_directory.mkdir(parents=True)
-    video = work_directory / f"{aweme_id}.mp4"
+    video = (
+        work_directory / "nested" / f"{aweme_id}.mp4"
+        if nested_video
+        else work_directory / f"{aweme_id}.mp4"
+    )
     cover = work_directory / f"{aweme_id}.cover.png"
+    video.parent.mkdir(parents=True, exist_ok=True)
     video.write_bytes(b"video-bytes")
     cover.write_bytes(b"cover-bytes")
 
@@ -203,7 +250,7 @@ def write_rebuildable_archive(root: Path, *, corrupt_video: bool = False) -> Pat
         payload = path.read_bytes()
         return {
             "kind": kind,
-            "path": path.name,
+            "path": path.relative_to(work_directory).as_posix(),
             "size_bytes": len(payload),
             "mime_type": mime_type,
             "sha256": hashlib.sha256(payload).hexdigest(),
@@ -219,7 +266,7 @@ def write_rebuildable_archive(root: Path, *, corrupt_video: bool = False) -> Pat
                     "aweme_id": aweme_id,
                     "content_type": "video",
                     "public_url": f"https://www.douyin.com/video/{aweme_id}",
-                    "description": "safe archive",
+                    "description": description,
                     "tags": ["archive"],
                     "published_at": 1720000000,
                     "duration_ms": 15000,
@@ -289,4 +336,64 @@ def test_rebuild_skips_corrupt_metadata_archives_and_never_publishes_empty_db(
         DatabaseRecovery(database).rebuild_from_metadata(root)
 
     assert raised.value.code == "DATABASE_REBUILD_EMPTY"
+    assert not database.exists()
+
+
+@pytest.mark.parametrize(
+    "sensitive_value",
+    (
+        "ttwid=ABCDEFGHIJKLMNOPQRSTUVWXYZ123456",
+        "s_v_web_id=ABCDEFGHIJKLMNOPQRSTUVWXYZ123456",
+        "launch_token=ABCDEFGHIJKLMNOPQRSTUVWXYZ123456",
+        "https://v95-web.douyinvod.com/video.mp4?signature=secret",
+    ),
+)
+def test_rebuild_rejects_sensitive_metadata_values(
+    tmp_path: Path,
+    sensitive_value: str,
+) -> None:
+    database = tmp_path / "archive.db"
+    root = tmp_path / "library"
+    root.mkdir()
+    write_rebuildable_archive(root, description=sensitive_value)
+
+    with pytest.raises(AppError) as raised:
+        DatabaseRecovery(database).rebuild_from_metadata(root)
+
+    assert raised.value.code == "DATABASE_REBUILD_EMPTY"
+    assert not database.exists()
+
+
+def test_rebuild_rejects_an_intermediate_reparse_artifact_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "archive.db"
+    root = tmp_path / "library"
+    root.mkdir()
+    metadata = write_rebuildable_archive(root, nested_video=True)
+    nested = metadata.parent / "nested"
+    original = archive_paths.is_reparse_point
+    monkeypatch.setattr(
+        archive_paths,
+        "is_reparse_point",
+        lambda path: path == nested or original(path),
+    )
+
+    with pytest.raises(AppError) as raised:
+        DatabaseRecovery(database).rebuild_from_metadata(root)
+
+    assert raised.value.code == "DATABASE_REBUILD_EMPTY"
+    assert not database.exists()
+
+
+def test_sensitive_session_values_never_enter_backup_list(tmp_path: Path) -> None:
+    database = tmp_path / "archive.db"
+    create_database(database, "launch_token=ABCDEFGHIJKLMNOPQRSTUVWXYZ123456")
+    recovery = DatabaseRecovery(database, today=lambda: date(2026, 8, 13))
+
+    status = recovery.prepare_startup()
+
+    assert status.state == "recovery_required"
+    assert status.backups == ()
     assert not database.exists()

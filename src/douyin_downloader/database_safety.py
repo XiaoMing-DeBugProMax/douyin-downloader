@@ -7,8 +7,17 @@ SENSITIVE_MARKERS = (
     b"authorization:",
     b"cookie:",
     b"set-cookie:",
+    b"ttwid=",
+    b"s_v_web_id=",
+    b"launch_token",
     b"douyinvod.com",
     b"douyinpic.com",
+    b"?signature=",
+    b"&signature=",
+    b"?x-bogus=",
+    b"&x-bogus=",
+    b"?x-gorgon=",
+    b"&x-gorgon=",
 )
 
 

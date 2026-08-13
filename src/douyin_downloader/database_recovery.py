@@ -55,10 +55,15 @@ class DatabaseRecovery:
     def prepare_startup(self) -> DatabaseRecoveryStatus:
         if not self._database_path.exists():
             quarantined = self._latest_quarantined_database()
-            state = "recovery_required" if quarantined is not None else "healthy"
+            backups = self.list_valid_backups()
+            state = (
+                "recovery_required"
+                if quarantined is not None or backups
+                else "healthy"
+            )
             self._status = DatabaseRecoveryStatus(
                 state,
-                self.list_valid_backups(),
+                backups,
                 quarantined,
             )
             return self._status
@@ -147,6 +152,12 @@ class DatabaseRecovery:
         return self._status
 
     def rebuild_from_metadata(self, archive_root: Path) -> DatabaseRecoveryStatus:
+        if self.list_valid_backups():
+            raise AppError(
+                "DATABASE_REBUILD_BACKUP_AVAILABLE",
+                "仍有有效数据库备份，请优先恢复备份。",
+                409,
+            )
         if (
             not archive_root.is_absolute()
             or not archive_root.is_dir()
@@ -330,9 +341,14 @@ def _validated_rebuild_item(
 ) -> tuple[ArchiveMetadata, Path, tuple[tuple[str, str, int, str, str], ...]] | None:
     try:
         relative_directory = metadata_path.parent.relative_to(root)
-        with pin_work_directory(root, relative_directory, create=False) as directory:
+        with pin_work_directory(
+            root,
+            relative_directory,
+            create=False,
+            share_delete=True,
+        ) as directory:
             pinned_metadata = directory / metadata_path.name
-            if is_reparse_point(pinned_metadata) or not _file_is_sensitive_safe(
+            if is_reparse_point(pinned_metadata) or file_contains_sensitive_marker(
                 pinned_metadata
             ):
                 return None
@@ -342,14 +358,21 @@ def _validated_rebuild_item(
             document = validate_metadata(pinned_metadata, aweme_id)
             artifacts: list[tuple[str, str, int, str, str]] = []
             for artifact in document.artifacts:
-                path = directory / artifact.path
-                if (
-                    is_reparse_point(path)
-                    or not path.is_file()
-                    or file_contains_sensitive_marker(path)
-                ):
-                    return None
-                payload = path.read_bytes()
+                relative_artifact = Path(artifact.path)
+                with pin_work_directory(
+                    directory,
+                    relative_artifact.parent,
+                    create=False,
+                    share_delete=True,
+                ) as artifact_directory:
+                    path = artifact_directory / relative_artifact.name
+                    if (
+                        is_reparse_point(path)
+                        or not path.is_file()
+                        or file_contains_sensitive_marker(path)
+                    ):
+                        return None
+                    payload = path.read_bytes()
                 if (
                     len(payload) != artifact.size_bytes
                     or hashlib.sha256(payload).hexdigest() != artifact.sha256
@@ -377,7 +400,3 @@ def _validated_rebuild_item(
             return document, relative_directory, tuple(artifacts)
     except (OSError, AppError, ValueError):
         return None
-
-
-def _file_is_sensitive_safe(path: Path) -> bool:
-    return not file_contains_sensitive_marker(path)
